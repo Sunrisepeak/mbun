@@ -5,6 +5,14 @@
 
 ## 2026-08-01
 
+- W85 fresh Bun `node:os`/`string_decoder` probe（5 jobs）先测得 **3 green + 1 all-skipped、
+  147 passed、2 failed、150 ran、3035 expects**。两条 `string_decoder` 失败实际共享
+  Buffer allocator 上限：Bun dialect 仍拒绝 `2**31` 以上 buffer，child 在进入 decoder 前退出。
+  Issue [#51](https://github.com/Sunrisepeak/mbun/issues/51) 的最小修复由 `03b22da` 落地：
+  Bun 64-bit 采用 `MAX_LENGTH=2**32`、`MAX_STRING_LENGTH=2**31-1`，Node dialect 保持原值，
+  并同步 `Buffer.alloc*`/`concat` 与 module constants；release build **60.13 秒**。修复后
+  W85 为 **4 green + 1 all-skipped、149 passed、0 failed、150 ran、3038 expects**，
+  `string_decoder` **95/95**，`node:os` **52/52**。未跑全量 corpus。
 - W84 fresh Bun Node-path continuation（5 jobs、复用当前 Linux binary、无构建）新增 **5/5
   files green、88 passed、0 failed、89 ran、382 expects**：`browserify` **52/52**、
   `matches-glob` **31/31**、`path` 基础属性、15704 长路径保护和 zero-length strings 均绿。

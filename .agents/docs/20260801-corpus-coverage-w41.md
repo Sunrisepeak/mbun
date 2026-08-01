@@ -32,6 +32,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | 2 | Node test-v8 | 11 | 0 green, 11 fail | park; profiler/queryObjects/startup snapshot ownership |
 | W83 | Bun/Node path | 5 Bun + 1 Node guard | pre 4/5 Bun green; post 5/5 Bun green; Node 1/1 | issue #50; dialect-only error-text fix |
 | W84 | Bun Node-path continuation | 5 | 5/5 green; 88 passed / 0 failed / 89 ran | retain as green path coverage; no source owner |
+| W85 | Bun os/string_decoder | 5 | pre 3 green + 1 skipped; post 4 green + 1 skipped; 149 passed / 0 failed / 150 ran | issue #51; dialect-aware Buffer ceiling |
 
 ## Delivered slice
 
@@ -972,6 +973,38 @@ surface on Linux:
 - This wave found no single runtime owner and required no source change or
   issue. No upstream fixture changes and no full corpus were performed; the
   next route remains a fresh near-green Node/Bun leaf with 3–5 bounded workers.
+
+### W85 Bun Node API probe and Buffer ceiling fix
+
+- The fresh five-file probe used **5 bounded jobs**. Before the fix it measured
+  **3 green files, 1 all-skipped file, 147 passed, 2 failed, 150 ran, 3035
+  expects**: `node:os` was **52/52**, `path.posix` and `path.win32` existence
+  guards were **1/1** each, and the platform-specific relative-path file was
+  all-skipped. `string_decoder` reached **93 passed / 2 failed / 95 ran**.
+- Both failures were the same owner, not decoder logic: the child smoke tried
+  `Buffer.allocUnsafe(2**31)` and `Buffer.allocUnsafe(2**31 + 16)`, but the Bun
+  dialect still applied `0x7fffffff`, so the child exited before
+  `StringDecoder.write()` or `.text()` could exercise their large-buffer
+  guards. Direct reproduction returned `ERR_OUT_OF_RANGE` at the allocator
+  boundary.
+- Issue [#51](https://github.com/Sunrisepeak/mbun/issues/51) led to commit
+  `03b22da`. The completion partition now selects Bun's 64-bit
+  `K_MAX_LENGTH = 0x100000000` and `MAX_STRING_LENGTH = 0x7fffffff`, updates
+  `Buffer.alloc*`, `Buffer.concat`, and the public module constants, and keeps
+  the Node dialect's previous values unchanged. The retry build passed in
+  **60.13 seconds**. A first attempt that edited the oversized `process_web`
+  raw payload hit GCC16's constexpr string-length limit; that change was
+  removed, keeping the final patch in the existing buffer completion owner.
+- After the fix W85 measured **4 green files, 1 all-skipped file, 149 passed,
+  0 failed, 150 ran, 3038 expects**. `string_decoder` is now **95/95** and
+  `node:os` remains **52/52**. A separate Node direct guard still reports
+  `MAX_LENGTH=2147483647`, `MAX_STRING_LENGTH=536870888`, and rejects
+  `allocUnsafe(2**31)`, so the dialect boundary was verified without a large
+  Node allocation. No upstream fixture changes and no full corpus were
+  performed.
+- Resource checkpoint after the build and bounded child runs: approximately
+  **42 GiB available memory, 54 MiB free swap, and 20 GiB free disk**. No
+  workspace-wide build or parallel build storm was started.
 
 ### W59 Node buffer leaf sample
 
