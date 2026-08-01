@@ -5,6 +5,12 @@
 
 ## 2026-08-01
 
+- `#44` 新增 Node 方言 `buffer.transcode` 模块导出，覆盖 Node corpus 使用的
+  utf8/latin1/ascii/utf16le/ucs2 编码转换，并将 latin1/ascii 不可表示字符替换为
+  `?`；Bun 方言仍保持 `buffer.transcode` 与 `Buffer.transcode` 为 `undefined`。
+  root release build **60.12 秒**；focused `test-icu-transcode.js` **1/1 pass**，
+  目标文件加 10 个 Buffer/Node guards **11/11 files pass**。五文件 fresh probe
+  由 **1/5** 提升为 **2/5 pass**，其余三个 URL 文件为独立 owner；未跑全量 corpus。
 - `#43` 修复 Node `Buffer.prototype.fill` 的三个同入口 contract：hex 填充值现在
   拒绝奇数长度/非法字符并返回 `ERR_INVALID_ARG_VALUE`，非字符串 encoding 返回
   `ERR_INVALID_ARG_TYPE`，伪造 `length` 与 TypedArray 实长不一致时返回

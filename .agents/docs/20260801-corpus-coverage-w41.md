@@ -572,6 +572,25 @@ surface on Linux:
   全量 corpus。当前资源约 **44 GiB available memory、43 MiB swap free、20 GiB
   free disk**，继续暂停 broad build，仅保留 bounded lane。
 
+### W61 Node buffer.transcode owner
+
+- Fresh Linux bounded probe before implementation used five jobs over four Node
+  candidates plus the existing Buffer.fill guard: **1/5 files pass**. The
+  target `test-icu-transcode.js` failed immediately because `buffer.transcode`
+  was not exposed; the three URL files failed independent formatting/error
+  contracts and stayed outside this owner.
+- Issue [#44](https://github.com/Sunrisepeak/mbun/issues/44) adds the Node-only
+  `buffer.transcode` module export in
+  `modules/jsc/src/builtins/node_buffer_extra.cppm`. It accepts Buffer and
+  Uint8Array input, covers the corpus's utf8/latin1/ascii/utf16le/ucs2 aliases,
+  maps unrepresentable latin1/ascii code points to `?`, and preserves Bun's
+  existing undefined exports.
+- The focused acceptance file passed **1/1**. The target plus ten Buffer/Node
+  guards passed **11/11 files** with three jobs. The original five-file probe
+  moved to **2/5 files pass**; the three URL failures remain independent.
+  Bun-dialect smoke kept both transcode exports `undefined`. Root release build
+  passed in **60.12 seconds**. No full corpus or workspace-wide build was run.
+
 ### W59 Node buffer leaf sample
 
 - W59 使用 Node corpus runner 的默认 bounded profile、**3 jobs**。首批五个文件为

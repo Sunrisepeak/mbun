@@ -1378,6 +1378,35 @@ inline constexpr std::string_view kNodeBufferExtraJS = R"JS(
     // given byte values. ref: node lib/buffer.js Buffer.of.
     BufferW.of = function of(...items) { return newFrom(items); };
 
+    // node:buffer.transcode: the ICU-backed Node export is deliberately
+    // module-only. Bun keeps its existing not-implemented surface, while Node
+    // needs the four text encodings exercised by test-icu-transcode.
+    const transcodeEncoding = (encoding) => {
+      if (typeof encoding !== "string") return undefined;
+      switch (encoding.toLowerCase()) {
+        case "utf8": case "utf-8": return "utf8";
+        case "latin1": case "binary": return "latin1";
+        case "ascii": return "ascii";
+        case "utf16le": case "utf-16le": case "ucs2": case "ucs-2": return "utf16le";
+        default: return undefined;
+      }
+    };
+    const transcodeError = () => new Error("Unable to transcode Buffer [U_ILLEGAL_ARGUMENT_ERROR]");
+    const bufferTranscode = function transcode(source, fromEncoding, toEncoding) {
+      if (!isU8(source)) throw errArgInstance("source", "Buffer or Uint8Array", source);
+      const from = transcodeEncoding(fromEncoding);
+      const to = transcodeEncoding(toEncoding);
+      if (from === undefined || to === undefined) throw transcodeError();
+      let text = BufferW.from(source).toString(from);
+      if (to === "latin1" || to === "ascii") {
+        const max = to === "ascii" ? 0x7f : 0xff;
+        let replaced = "";
+        for (const ch of text) replaced += ch.codePointAt(0) <= max ? ch : "?";
+        text = replaced;
+      }
+      return BufferW.from(text, to);
+    };
+
     // Buffer.compare(buf1, buf2): node type-checks both args (process_web's
     // static coerced a non-Buffer via Buffer.from and never threw).
     BufferW.compare = function compare(buf1, buf2) {
@@ -1443,6 +1472,7 @@ inline constexpr std::string_view kNodeBufferExtraJS = R"JS(
       const mod = M["buffer"] || M["node:buffer"];
       if (mod) {
         mod.Buffer = BufferW;
+        if (G.__mbunDialect === "node") mod.transcode = bufferTranscode;
         mod.isAscii = isAscii;
         mod.isUtf8 = isUtf8;
         mod.SlowBuffer = SlowBuffer;
