@@ -247,6 +247,25 @@ the observed Linux limits; the coordinator owns the only root build.
 | W297 | Bun fetch/blob/timer ownership probe | 5 | 3/5 green; 24 passed / 1 failed / 25 ran / 54 expects; 1 runner timeout; no build | retain three Blob guards; park fetch-gzip timeout and setInterval cancellation owners |
 | W298 | Node path/os continuation leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five path/os guards; no source owner |
 | W299 | Bun Blob/stream/event/body leaf probe | 5 | 5/5 green; 47 passed / 0 failed / 50 ran / 119 expects; 0 timeout; no build | retain all five Bun/Deno guards; no source owner |
+| W300 | Node util/styleText/os/url leaves | 5 | 4/5 pass; 1 skip; 0 fail; 0 timeout; no build | retain util sleep, hex styleText, URL deprecation, and userinfo guards; record regular styleText as a TTY harness skip |
+
+## W300 Node util/styleText/os/url leaf probe
+
+The bounded five-job Node selector covered internal sleep argument validation,
+regular and hex `util.styleText`, URL deprecation behavior, and an `os.userInfo`
+getter-error guard. It measured **4/5 file-level passes**, **1 skip**, **0
+failures**, and **0 runner timeouts**. Per-file durations were **406–959 ms**.
+
+`test-util-sleep.js`, `test-util-styletext-hex.js`,
+`test-url-parse-deprecation.js`, and
+`test-os-userinfo-handles-getter-errors.js` passed. The regular
+`test-util-styletext.js` file was skipped because the Linux runner could not
+create a TTY file descriptor; this is a harness/environment skip, not a source
+failure. There were no source or upstream-fixture changes.
+
+The selector used the bounded five-job Node runner with a 30-second per-file
+timeout. No full corpus, build, or workspace-wide test was run; the Node
+runner reports file-level status only.
 
 ## W299 Bun Blob/stream/event/body leaf probe
 
