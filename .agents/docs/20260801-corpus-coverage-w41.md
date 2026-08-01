@@ -292,6 +292,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W342 | Bun Linux regression/parser/filesystem leaves | 5 | 4/5 green; 11 passed / 3 failed / 14 ran / 48 expects; 0 timeout; no build; 5 fresh | retain module-extensions, WebSocket-cookie, Dirent, and console-format guards; park HTML-entrypoint parser/build owner |
 | W343 | Node readline/TTY leaves | 5 | 4/5 pass; 1 fail; 0 timeout; no build; 5 fresh | retain CSI, keypress, stdin-end, and stdin-pipe guards; park TTY backwards-API forwarding owner |
 | W344 | Bun Linux loader/build/network/REPL leaves | 5 | 5/5 green; 8 passed / 0 failed / 8 ran / 21 expects; 0 timeout; no build; 5 fresh | retain DCE syntax, tsconfig paths, deferred node import, CONNECT pipelining, and REPL startup guards; no source owner |
+| W345 | Node readline continuation leaves | 5 | 4/5 pass; 1 fail; 0 timeout; no build; 5 fresh; TERM=xterm rerun | retain no-trailing-newline, recursive-write, raw-mode, and cursor-position guards; park Unicode line-separator owner |
 
 ## W305 Bun/Deno Event/Performance/URL/crypto leaf probe
 
@@ -1125,6 +1126,30 @@ HTTP CONNECT head delivery, and REPL startup without package-resolution
 output. No source or upstream-fixture changes, full corpus, or workspace-wide
 build were made. After the run, resources showed about **47 GiB available
 memory**, **600 KiB free swap**, and **16 GiB free disk at 99% usage**.
+Temporary runner output is cleaned immediately and the next wave remains
+resource-gated.
+
+## W345 Node readline continuation leaves
+
+The bounded five-job Node selector covered five fresh readline files after
+filename/stem and narrow semantic-owner review:
+`test-readline-interface-no-trailing-newline.js`,
+`test-readline-interface-recursive-writes.js`,
+`test-readline-line-separators.js`, `test-readline-set-raw-mode.js`, and
+`test-readline-position.js`. The default environment marked three terminal
+files skipped because `TERM=dumb`; the same selector was rerun with
+`TERM=xterm` and is the authoritative result. That bounded rerun measured
+**4/5 file-level passes**, **1 failure**, **0 runner timeouts**, and
+**198–349 ms** per file. The Node runner reports file-level status only; no
+assertion-level pass total is inferred.
+
+The no-trailing-newline, recursive-write, raw-mode lifecycle, and Unicode
+cursor-position guards passed and are retained. The line-separator file failed
+because U+2028 and U+2029 remained embedded in the final line instead of being
+split into separate lines. This is parked as one Unicode line-separator owner;
+no source or upstream-fixture change was made. No full corpus or
+workspace-wide build was run. After the rerun, resources showed about **47 GiB
+available memory**, **1 MiB free swap**, and **16 GiB free disk at 99% usage**.
 Temporary runner output is cleaned immediately and the next wave remains
 resource-gated.
 
