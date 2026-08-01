@@ -5,12 +5,14 @@
 
 ## 2026-08-01
 
-- W57 fresh Bun built-in probes（默认 **4G/512、3 jobs**，无构建）新增 9 个绿色文件：
+- W57 fresh Bun built-in probes（默认 **4G/512、3 jobs**，无构建）新增 13 个绿色文件：
   `ini` **62/62**、`JSONC` **43/43**、`JSONL` **269/269**、Markdown heading IDs
   **17/17**，以及 cookie 四文件 **124/124**、cron parse **24/24**；合计新增绿色
-  文件 **9/10**、**576/591 tests passed**、**15 failed**、**5479 expects**。唯一红文件
-  `md/gfm-compat.test.ts` 为 **47/62**，失败拆成 table 解析/列数/转义、autolink
-  特殊字符、单波浪线删除线和实体尾缀多个 owner，停车不混修。未跑全量 corpus。
+  文件 **9/10**、**576/591 tests passed**、**15 failed**、**5479 expects**。第三批
+  util probe 再新增 base64url **5/5**、escapeHTML **10/10**、escapeRegExp **2/2**、
+  which **5/5**；其余 `stripANSI` 为 **284/296**，12 failed。三批合计 **13/15 files
+  green、882/909 tests passed、27 failed、7451 expects**。GFM 与 stripANSI 的失败
+  都拆成多个 owner，停车不混修。未跑全量 corpus。
 - `d8d8082`（issue #42）修复 Bun.Glob 路径边界兼容：复用平台 path policy，在
   pattern、目录下降、`directory_entry` status/iterator 的 `ENAMETOOLONG` 路径上保留
   Bun 错误信号，同时修正 only-files fast path 的 `absolute` 输出。新增 glob scan

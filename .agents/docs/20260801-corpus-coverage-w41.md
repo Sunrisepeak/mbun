@@ -584,9 +584,13 @@ surface on Linux:
   failed、667 expects**。两批合计 **10 files、576/591 tests passed、15 failed、5479
   expects**，其中 **9/10 files green**；失败全部来自 GFM，cookie/cron/ini/JSON/heading
   结果可作为下一轮 guard 或已交付覆盖数据。
-- 结论：GFM 是多 owner Markdown cluster，暂时停车；下一任务继续从 fresh bounded
-  measurement 选单一 Bun/Node near-green row，不因 9 个 green 文件而 speculative
-  改动 parser。
+- 第三批 util probe 使用同一 profile 测得 base64url **5/5**、escapeHTML **10/10**、
+  escapeRegExp **2/2**、which **5/5**；`stripANSI` 为 **284/296**，12 failed。失败
+  分成 malformed CSI/OSC/C1、Unicode/C1 边界和 large-input 性能断言多个 owner。
+- 三批独立选集合计 **15 files、882/909 tests passed、27 failed、7451 expects**，其中
+  **13/15 files green**。结论：GFM 与 stripANSI 都停车；下一任务继续从 fresh
+  bounded measurement 选单一 Bun/Node near-green row，不因绿色叶子文件而
+  speculative 改动 parser 或 ANSI scanner。
 
 ### W56 Bun.Glob path-boundary owner
 
