@@ -252,6 +252,26 @@ the observed Linux limits; the coordinator owns the only root build.
 | W302 | Node URL continuation leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five URL parse/format/brand guards; no source owner |
 | W303 | Bun/Deno Fetch/URL API leaves | 5 | 5/5 green; 80 passed / 0 failed / 85 ran / 245 expects; 0 timeout; no build | retain all five Fetch/URL guards; no source owner |
 | W304 | Node events/path continuation leaves | 5 | 4/5 pass; 1 fail; 0 timeout; no build | retain AbortListener, getEventListeners, relative, and zero-length path guards; park uncaughtException stack rendering owner |
+| W305 | Bun/Deno Event/Performance/URL/crypto leaves | 5 | 4/5 green; 63 passed / 0 failed / 68 ran / 287 expects; 1 all-skipped; 0 timeout; no build | retain four green guards; record Deno V8 error file as an all-skipped corpus entry |
+
+## W305 Bun/Deno Event/Performance/URL/crypto leaf probe
+
+The bounded five-job Bun selector covered Deno Event, Performance, URL,
+crypto-random, and V8 error leaves. It measured **4/5 green files**, **63
+passed / 0 failed / 68 ran / 287 expects**, **1 all-skipped file**, and **0
+runner timeouts**. Per-file durations were **250–400 ms**.
+
+`random.test.ts` measured **10 passed / 0 failed / 10 ran / 11 expects**;
+`event.test.ts` measured **8 / 0 / 10 / 32**;
+`performance.test.ts` measured **13 / 0 / 13 / 44**; and
+`url.test.ts` measured **32 / 0 / 33 / 200**. These four guards are retained
+as green coverage. `v8/error.test.ts` ran two tests and both were skipped by
+the corpus, with no failures; it is recorded as an environment/ability skip,
+not a source owner. There were no source or upstream-fixture changes.
+
+The selector used the bounded five-job Bun runner with a 30-second per-file
+timeout, the existing coordinator binary, and missing Node modules allowed.
+No full corpus, build, or workspace-wide test was run.
 
 ## W304 Node events/path continuation leaf probe
 
