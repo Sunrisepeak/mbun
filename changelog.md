@@ -16,6 +16,10 @@
   release build **60.24 秒**；focused URL inspect **1/1 pass**，含 transcode、URL
   inspect、URL parsing、URL setters、Buffer.fill 的五文件候选集为 **3/5 pass**，
   后两个 URL 文件仍是独立 owner；未跑全量 corpus。
+- W63 URL custom-parsing triage 停车：临时 Node message-normalization 实验把首个
+  mismatch 推进到 **9 个 invalid URL no-throw**，证明底层 parser acceptance 与
+  error wording 是同一多 owner cluster；实验已回退、无 source commit、无 green
+  claim。诊断 root build **60.76 秒**，focused 文件仍 red，未跑全量 corpus。
 - `#43` 修复 Node `Buffer.prototype.fill` 的三个同入口 contract：hex 填充值现在
   拒绝奇数长度/非法字符并返回 `ERR_INVALID_ARG_VALUE`，非字符串 encoding 返回
   `ERR_INVALID_ARG_TYPE`，伪造 `length` 与 TypedArray 实长不一致时返回

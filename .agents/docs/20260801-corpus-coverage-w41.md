@@ -608,6 +608,20 @@ surface on Linux:
   independent owners. Root release build passed in **60.24 seconds**. No full
   corpus or workspace-wide build was run.
 
+### W63 Node URL custom-parsing triage parked
+
+- The remaining W61/W62 URL candidate was measured as a message mismatch:
+  native URL errors exposed input/base details instead of Node's `Invalid URL`.
+  A diagnostic-only Node wrapper normalized that message, but the focused file
+  then revealed **9 invalid inputs accepted by the native parser**, so the
+  candidate is a parser-algorithm cluster rather than a safe message-only owner.
+- The experiment was reverted with **no source commit** and no green claim.
+  URL custom setters remain a separate lone-surrogate Unicode owner. The
+  transcode, URL inspect, and Buffer.fill green slices stay closed.
+- The diagnostic root build passed in **60.76 seconds**; the bounded focused
+  run remained red. No full corpus or workspace-wide build was performed, and
+  no new issue was mixed into the parser cluster.
+
 ### W59 Node buffer leaf sample
 
 - W59 使用 Node corpus runner 的默认 bounded profile、**3 jobs**。首批五个文件为
