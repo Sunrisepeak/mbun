@@ -167,6 +167,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W217 | Node assert owner-split leaves | 3 | 0/3 pass; 3 fail; 0 timeout; no build | park assert.Assert constructor, Error cause deep-equality message/stack, and TypedArray/ArrayBuffer deepEqual semantics as separate owners |
 | W218 | Node console plain-script leaves | 3 | 3/3 pass; 0 fail; 0 timeout; no build | retain console replacement/recovery, primitive throw output, and inspect-toString guards; no source owner |
 | W219 | Node Buffer plain-script leaves | 3 | 3/3 pass; 0 fail; 0 timeout; no build | retain isUtf8 validation, byteLength encoding/type boundaries, and compare offset/range guards; no source owner |
+| W220 | Bun stack/stdio/HTTP leaves | 3 | 21 passed / 29 failed / 50 ran / 114 expects; 0 runner timeout; no build | retain HTTP proxy-style normal paths; park CR/LF host validation, stdio write-after-end pipe/file state, and stack/frame/internal-hook/lazy-error owners |
 
 ## W133 Bun.Terminal green cluster
 
@@ -201,6 +202,29 @@ tests; it was corrected to repository-root-relative paths before the measured
 probe. No source or upstream fixture change was made. The final selector used
 the existing coordinator binary through `tools/integration/node_corpus_runner.py`
 with three bounded jobs and a 30-second per-file timeout. No full corpus or
+workspace-wide test was run; the selector and raw runner output were removed
+after recording the result.
+
+## W220 Bun stack/stdio/HTTP owner split
+
+The bounded three-job selector covered V8-style stack/call-frame behavior,
+stdio write-after-end lifecycle, and HTTP proxy-style absolute URLs plus
+invalid-host validation. It reached **21 passed / 29 failed / 50 ran / 114
+expects / 0 runner timeouts**; per-file durations were 582–5645ms. One stack
+subtest reported its own 5-second test timeout, but the bounded runner itself
+did not time out.
+
+The HTTP file was **2/3**: normal proxy-style request paths passed, while the
+CR/LF host case returned no `ERR_INVALID_CHAR`. The stdio file was **0/4**:
+pipe-backed writes did not transition to Node's post-end error state, and
+file-backed runs ended before producing the expected report. The stack file was
+**19/43**; failures split across stack/frame formatting, unavailable internal
+testing hooks, async/sourceURL/stack-limit metadata, and lazy error-info/error
+handling. These owners remain separate; no source or fixture change was made.
+
+The selector used the existing coordinator binary through
+`tools/integration/bun_corpus_runner.py` with three bounded jobs, a 30-second
+per-file timeout, and missing Node modules allowed. No full corpus or
 workspace-wide test was run; the selector and raw runner output were removed
 after recording the result.
 
