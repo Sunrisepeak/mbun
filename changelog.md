@@ -5,6 +5,12 @@
 
 ## 2026-08-02
 
+- W395 Node TLS close callback ordering source fix：raw transport 升级为 TLS 后无 error destroy 的
+  `close` 现在跨过当前 check phase，再于下一 immediate phase 发出，符合 Node close callbacks
+  晚于当前 `setImmediate` 的顺序。focused close-order 文件从 **1/1 failure** 到 **1/1 pass**；
+  五文件 TLS selector 从 W394 的 **4/5 pass、1 fail** 提升到 **5/5 pass、0 fail、0 timeout**；
+  Bun fake-timer 五文件回归 **5/5 green、8 passed、0 failed、8 ran、10 expects**；serial release
+  build **59.09s**。未修改 upstream fixture、未跑全量 corpus。
 - W394 Node TLS close_notify/RST teardown source fix：`tls.Server` 已发送本地 close_notify 后，
   client 立即 `destroy()` 产生的 server-side `ECONNRESET`/pending close-notify `EPIPE` 不再被误报
   为 read failure；未发送本地 shutdown 的 reset 仍保留为 error。focused keepAlive/noDelay 文件从

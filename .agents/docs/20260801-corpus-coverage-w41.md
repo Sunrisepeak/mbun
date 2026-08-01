@@ -341,6 +341,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W392 | Node `PerformanceObserver` forced-GC entry source fix | 5 | target 1/1 pass; performance selector 5/5 pass, 0 fail, 0 timeout; Bun fake-timer regression 5/5 green, 8 passed / 0 failed / 8 ran / 10 expects; serial release build 58.98s | publish a forced major-GC entry after the real `Bun.gc(true)` path and accept `gc` observation; no upstream fixture change |
 | W393 | Node TLS `allowHalfOpen` transport source fix | 5 | pre 2/5 pass + 3 fail; target 1/1 pass; post selector 3/5 pass + 2 fail, 0 timeout; Bun fake-timer regression 5/5 green, 8 passed / 0 failed / 8 ran / 10 expects; serial release build 57.70s | propagate `tls.connect({ allowHalfOpen })` to its hidden transport; park keepAlive/noDelay teardown and raw TLS close-order owners separately |
 | W394 | Node TLS close_notify/RST teardown source fix | 5 | target pre 1/1 fail; post target 1/1 pass; five-file TLS selector 4/5 pass + 1 fail, 0 timeout; Bun fake-timer regression 5/5 green, 8 passed / 0 failed / 8 ran / 10 expects; two serial release builds 57.35s + 57.43s | classify RST/EPIPE after local TLS shutdown as EOF while preserving unsignalled reset errors; park raw TLS close-order owner separately |
+| W395 | Node TLS close callback ordering source fix | 5 | target pre 1/1 fail; post target 1/1 pass; five-file TLS selector 5/5 pass, 0 fail, 0 timeout; Bun fake-timer regression 5/5 green, 8 passed / 0 failed / 8 ran / 10 expects; serial release build 59.09s | defer no-error TLS transport close through two immediate phases so close callbacks follow the current check phase |
 
 ## W305 Bun/Deno Event/Performance/URL/crypto leaf probe
 
@@ -1837,6 +1838,25 @@ milestone-order owners remain. The five-file Bun fake-timer regression stayed
 **5/5 green, 8 passed, 0 failed, 8 ran, 10 expects** after the serialized release
 build (**59.06s**). No upstream fixture changed and no full corpus/workspace-wide
 test ran.
+
+## W395 Node TLS close callback ordering source fix
+
+The final W375 TLS failure was an event-order contract: after a raw transport
+was upgraded into TLS and destroyed without an error, its `close` event fired
+before a user `setImmediate()` callback. Node emits socket close callbacks after
+the current check phase.
+
+`js_net.cppm` now gives no-error TLS transport teardown two immediate phases:
+the first lets immediates already queued in the current check phase run, and
+the second emits `close` in the following phase. Error teardown and non-TLS
+socket paths are unchanged.
+
+The focused close-order file moved from **1/1 failure** to **1/1 pass**. The
+five-file TLS selector moved from **4/5 pass, 1 fail** to **5/5 pass, 0 fail,
+0 timeout**. The five-file Bun fake-timer regression remained **5/5 green, 8
+passed, 0 failed, 8 ran, 10 expects**. The serialized release build took
+**59.09s**. No upstream fixture changed and no full corpus/workspace-wide test
+ran.
 
 ## W394 Node TLS close_notify/RST teardown source fix
 

@@ -1720,7 +1720,13 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
           emitOn("close", !!err);
         };
         if (deferErr && G.process && typeof G.process.nextTick === "function") G.process.nextTick(emitErrClose);
-        else G.queueMicrotask(emitErrClose);
+        else if (!err && this._tls && typeof G.setImmediate === "function") {
+          // Node emits TLS/socket close callbacks after the current check
+          // phase. Two immediates model that boundary: the first lets user
+          // setImmediate callbacks already queued in this turn run, and the
+          // second emits close in the following phase.
+          G.setImmediate(() => G.setImmediate(emitErrClose));
+        } else G.queueMicrotask(emitErrClose);
       }
       return this;
     }
