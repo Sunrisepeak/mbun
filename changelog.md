@@ -5,6 +5,10 @@
 
 ## 2026-08-01
 
+- W102 fresh Node `node:module` introspection/lookup probe（5 jobs、复用 W101 binary、无构建）测得 **4/5 files pass、1
+  failed**：module version、`Module._stat`、builtin list、relative lookup 全绿；multi-extensions 依赖可变的
+  `require.extensions` custom loader，而当前 CJS loader 已明确将该集成列为 deferred，停车不混修。未修改上游
+  fixture，未跑全量 corpus。
 - W101 issue [#56](https://github.com/Sunrisepeak/mbun/issues/56) 修复 Node CLI preload 的 `Module.runMain` 入口钩子：
   pre-fix 五文件 module-loader probe 为 **3/5 pass、1 skipped、1 failed**，根因是 preload 已执行但 native
   entry 直接评估主文件，导致 `runMain` monkey-patch 不可观察；`f296040` 让 Node 方言且存在 preload 时经过

@@ -49,6 +49,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W99 | Bun fs/streams/spawn/DNS/URL leaves | 5 + DNS isolated rerun | initial 4/5 green; 108 passed / 1 failed / 109 ran / 355 expects; DNS isolated 1/1 green with 69/69 | retain four stable leaves; DNS public-answer variance is external, no source owner |
 | W100 | Node fs/promises FileHandle leaves | 5 | 5/5 files pass; no build | retain five green leaves; no source owner |
 | W101 | Node module loader / CLI entry leaves | 5 | pre-fix 3/5 pass + 1 skipped + 1 fail; post-fix 4/5 pass + 1 skipped; W100 regression 5/5 pass | issue #56; preserve `Module.runMain()` as the Node preload entry hook |
+| W102 | Node module introspection / lookup leaves | 5 | 4/5 files pass; 1 fail; no build | retain four green leaves; park `require.extensions` custom-loader integration |
 
 ## W96 delivered slice
 
@@ -182,6 +183,22 @@ Evidence from the fresh coordinator build:
 
 No upstream fixture changed, no full corpus/workspace-wide test was run, and
 the temporary selectors/output were cleaned after verification.
+
+## W102 Node module introspection and lookup leaves
+
+W102 used five bounded jobs and the W101 coordinator binary without a build.
+The selected leaves covered `process.config` module-version metadata,
+`Module._stat`, builtin-module listing, relative lookup priority, and multi-part
+extension resolution. The result was **4/5 files pass** and **1 failed**.
+
+The four green leaves are retained. The only failure is the multi-extension
+fixture, which installs mutable `require.extensions` handlers. The current
+`node:module` implementation documents custom `require.extensions` loader
+integration as deferred native CJS-loader work, so this remains parked without
+an issue or speculative source change.
+
+No upstream fixture changed, no build or full corpus/workspace-wide test was
+run, and the temporary selector/output were cleaned after verification.
 
 ## Delivered slice
 
