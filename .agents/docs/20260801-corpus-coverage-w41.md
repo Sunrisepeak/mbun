@@ -833,6 +833,22 @@ surface on Linux:
 - No upstream fixture changes, no full corpus, and no workspace-wide build
   were performed.
 
+### W76 Node assert leaf probe and ahead-of-reference matrix
+
+- A fresh five-file Node assert probe used **5 bounded jobs** and reused the
+  current Linux binary; no source change or build was needed. Four files were
+  green and the fifth was `ahead-of-reference`: **275 passed, 22 failed, 297
+  ran, 451 expects**.
+- `assert-doesNotMatch` (**3/3**), `assert-match` (**3/3**), `assert-promise`
+  (**12/12**), and `assert.spec` (**28/28**) were green. `deep-equal` reached
+  **229/251**; all 22 failures are upstream `test.failing` cases where mbun
+  passes a case Bun currently expects to fail, spanning prototypes, own
+  properties, RegExp state, and collection/typed-array semantics. The runner
+  therefore classified it `ahead-of-reference`, not green.
+- No upstream fixture changes, no full corpus, and no workspace-wide build
+  were performed. Keep the four assertion guards and leave the multi-semantic
+  deep-equality matrix split for a later measured owner.
+
 ### W59 Node buffer leaf sample
 
 - W59 使用 Node corpus runner 的默认 bounded profile、**3 jobs**。首批五个文件为

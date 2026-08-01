@@ -5,6 +5,11 @@
 
 ## 2026-08-01
 
+- W76 fresh Node assert leaf probe（5 jobs、复用当前 Linux binary、无构建）测得 **4 green +
+  1 ahead-of-reference、275 passed、22 failed、297 ran、451 expects**。doesNotMatch、match、
+  promise、assert spec 四个文件全绿；`deep-equal` 的 22 个失败均为上游 `test.failing` 且
+  mbun 实际通过，涉及 prototype/own-property/RegExp/collection 等多语义矩阵，未误计为
+  green，未混修。未修改上游 fixture，未跑全量 corpus。
 - W75 fresh Bun util leaf probe（5 jobs、复用当前 Linux binary、无构建）新增 **5/5 files
   green、13 passed、0 failed、13 ran、24 expects**：file exists、Bun.concat、error-code
   mirror、error-name preservation 和 file-type detection 全绿。未修改上游 fixture，未跑
