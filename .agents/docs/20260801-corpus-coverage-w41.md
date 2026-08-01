@@ -261,6 +261,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W311 | Bun util low-coupling green cluster | 5 | 5/5 green; 12 passed / 0 failed / 12 ran / 438 expects; 0 timeout; no build | retain all five Bun util guards; no source owner |
 | W312 | Bun util error/file/unsafe/report/fuzzy leaves | 5 | 3/5 green; 9 passed / 155 failed / 164 ran / 30 expects; 0 timeout; no build | retain error-name, file-type, unsafe; park Promise.resolve intrinsic and split reportError owners |
 | W313 | Node console/process/path guard leaves | 5 | 4/5 pass; 1 fail; 0 timeout; no build | retain four process/path guards; park console.dir revoked-Proxy inspection owner |
+| W314 | Bun util mmap/hash/CSRF/file/concat leaves | 5 | 4/5 green; 50 passed / 8 failed / 58 ran / 200 expects; 0 timeout; no build | retain four green util guards; park missing Bun.mmap API owner |
 
 ## W305 Bun/Deno Event/Performance/URL/crypto leaf probe
 
@@ -464,6 +465,25 @@ inspection/error-handling owner; no mixed process or path patch was attempted.
 There were no source or upstream-fixture changes, no full corpus, and no
 workspace-wide build. After the run, resources showed about **44 GiB
 available memory**, about **1.3 MiB free swap**, and about **17 GiB free disk at
+99% usage**. Temporary runner output is cleaned immediately and the next wave
+remains resource-gated.
+
+## W314 Bun util mmap/hash/CSRF/file/concat leaf probe
+
+The bounded five-job Bun selector covered five previously unrecorded util
+files: `mmap`, `hash`, `csrf`, `bun-file-exists`, and `concat`. It measured
+**4/5 green files**, **50 passed / 8 failed / 58 ran / 200 expects**, **0
+skips**, and **0 runner timeouts**. Per-file durations were **200–401 ms**.
+
+The retained green files were `bun-file-exists.test.js` at **1 / 0 / 1 / 7**;
+`concat.test.js` at **5 / 0 / 5 / 5**; `csrf.test.ts` at **24 / 0 / 24 / 48**;
+and `hash.test.js` at **20 / 0 / 20 / 136**. `mmap.test.js` reached **0 / 8 /
+8 / 4** because `Bun.mmap` is not available; all eight failures are the same
+missing-API owner, including its option-validation cases.
+
+There were no source or upstream-fixture changes, no full corpus, and no
+workspace-wide build. After the run, resources showed about **44 GiB
+available memory**, about **1.4 MiB free swap**, and about **17 GiB free disk at
 99% usage**. Temporary runner output is cleaned immediately and the next wave
 remains resource-gated.
 
