@@ -234,6 +234,29 @@ the observed Linux limits; the coordinator owns the only root build.
 | W284 | Bun HTTP timeout/cork/TLS leaves | 3 | 3/3 green; 16 passed / 0 failed / 16 ran / 46 expects; 0 timeout; no build | retain timeout lifecycle, nested-cork isolation, and TLS identity guards; no source owner |
 | W285 | Node circular-loader/require-error leaves | 5 | 4/5 pass; 1 fail; 0 timeout; no build | retain circular warning/symlink, invalid-package, and Unicode-path leaves; park JSON parse filename diagnostic owner |
 | W286 | Node require boundary leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain node-prefix/cache, NUL, exception-reload, empty-main, and deleted-directory resolution guards; no source owner |
+| W287 | Bun util inspect/fs metadata leaves | 5 | 4/5 green; 61 passed / 1 failed / 62 ran / 130 expects; 0 timeout; no build | retain Bun/custom inspect, birthtime, and cp symlink guards; park proxy inspect trap owner |
+
+## W287 Bun util inspect/fs metadata leaf probe
+
+The bounded **five-job** Bun selector covered `bun-inspect.test.ts`,
+`custom-inspect.test.js`, `util-inspect-proxy.test.js`,
+`fs-birthtime-linux.test.ts`, and `cp-symlink-target.test.ts`. It measured
+**4/5 files green**, **61 passed / 1 failed / 62 ran / 130 expects**, and **0
+runner timeouts**. Per-file durations were 234–287ms under the bounded
+4G/512-task resource profile.
+
+`bun-inspect.test.ts` passed **12/12 tests / 19 expects**;
+`custom-inspect.test.js` passed **42/42 / 91 expects**;
+`fs-birthtime-linux.test.ts` passed **5/5 / 20 expects**; and
+`cp-symlink-target.test.ts` passed **2/2** with no additional `expect()` calls
+reported. The single `util-inspect-proxy.test.js` test failed immediately when
+inspection triggered the proxy's `getPrototypeOf` trap. This is a narrow
+proxy-inspection owner; no source or upstream fixture change was made.
+
+The selector reused the coordinator binary through
+`tools/integration/bun_corpus_runner.py` with **five bounded jobs**, a
+30-second per-file timeout, and missing Node modules allowed. No full corpus,
+build, or workspace-wide test was run.
 
 ## W286 Node require boundary leaf probe
 
