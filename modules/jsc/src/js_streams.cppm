@@ -1386,11 +1386,11 @@ constexpr std::string_view kStreamsJS_part2 = R"JS(
     values(options) { return acquireReadableStreamAsyncIterator(this, options); }
     [Symbol.asyncIterator](options) { return acquireReadableStreamAsyncIterator(this, options); }
     // Bun extensions: direct consumers on the stream itself.
-    text() { const e = consumerUsableError(this); return e ? Promise.reject(e) : consumeStart(this).then(consumeText); }
-    json() { const e = consumerUsableError(this); return e ? Promise.reject(e) : consumeStart(this).then(consumeText).then((t) => JSON.parse(t)); }
-    bytes() { const e = consumerUsableError(this); return e ? Promise.reject(e) : consumeStart(this).then(consumeBytes); }
-    arrayBuffer() { const e = consumerUsableError(this); return e ? Promise.reject(e) : consumeStart(this).then(consumeBytes).then((u8) => u8.buffer); }
-    blob() { const e = consumerUsableError(this); const t = this.__mbunBlobType || ""; return e ? Promise.reject(e) : consumeStart(this).then(consumeArray).then((chunks) => new G.Blob(chunks, { type: t })); }
+    text() { assertReadableStreamReceiver(this); const e = consumerUsableError(this); return e ? Promise.reject(e) : consumeStart(this).then(consumeText); }
+    json() { assertReadableStreamReceiver(this); const e = consumerUsableError(this); return e ? Promise.reject(e) : consumeStart(this).then(consumeText).then((t) => JSON.parse(t)); }
+    bytes() { assertReadableStreamReceiver(this); const e = consumerUsableError(this); return e ? Promise.reject(e) : consumeStart(this).then(consumeBytes); }
+    arrayBuffer() { assertReadableStreamReceiver(this); const e = consumerUsableError(this); return e ? Promise.reject(e) : consumeStart(this).then(consumeBytes).then((u8) => u8.buffer); }
+    blob() { assertReadableStreamReceiver(this); const e = consumerUsableError(this); const t = this.__mbunBlobType || ""; return e ? Promise.reject(e) : consumeStart(this).then(consumeArray).then((chunks) => new G.Blob(chunks, { type: t })); }
     // ReadableStream.from(iterable) — streams spec / node
     // internal/webstreams/readablestream.js readableStreamFromIterable().
     // The two validation errors are observable (test-webstream-readable-from):
@@ -2102,6 +2102,12 @@ constexpr std::string_view kStreamsJS_part2 = R"JS(
     if (stream._disturbed) { const e = new Error("ReadableStream has already been used"); e.code = "ERR_BODY_ALREADY_USED"; return e; }
     return null;
   }
+  const assertReadableStreamReceiver = (stream) => {
+    if (isReadableStream(stream)) return;
+    const e = new TypeError('Value of "this" must be of type ReadableStream');
+    e.code = "ERR_INVALID_THIS";
+    throw e;
+  };
   function validateQueuedChunksSync(stream) {
     const c = stream._readableStreamController;
     if (c === undefined || c._queue === undefined) return;
