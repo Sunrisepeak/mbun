@@ -760,6 +760,29 @@ surface on Linux:
 - No full corpus or workspace-wide build was started. Keep the three green
   HTTP guards and select the next fresh one-owner row.
 
+### W72 Bun child-process leaf probe and IPC owner
+
+- A fresh five-file Bun-native probe used **5 bounded jobs** and reused the
+  current Linux binary; no source change or build was needed. The sample was
+  `child_process_send_cb`, child-process stdio, child-process exec,
+  `child-process-rlimit-nofile`, and `child_process_ipc`.
+- The runner measured **4 green files, 20 passed, 1 failed, 21 ran, 44
+  expects**. `child_process_send_cb` (**1/1**), `child-process-stdio`
+  (**7/7**), `child-process-exec` (**11/11**), and
+  `child-process-rlimit-nofile` (**1/1**) were green.
+- `child_process_ipc` is a narrow compatibility failure: its fixture passes
+  an unlistened `net.Server` (`_fd === -1`) to `child.send()`. Node returns
+  `true`, invokes the callback with `null`, and does not report a handle error;
+  mbun emits an extra `uncaughtException ERR_INVALID_HANDLE_TYPE` before the
+  expected five output lines. A focused Node probe confirmed the reference
+  behavior. Issue [#48](https://github.com/Sunrisepeak/mbun/issues/48) tracks
+  the smallest branch: treat this no-descriptor server as a plain message,
+  while retaining rejection for genuinely unsupported handles.
+- No fix was attempted in this wave and the upstream fixture remains
+  read-only. No full corpus or workspace-wide build was started; the next
+  implementation checkpoint must add a focused red/green runtime guard and
+  preserve the existing fd-passing path.
+
 ### W59 Node buffer leaf sample
 
 - W59 使用 Node corpus runner 的默认 bounded profile、**3 jobs**。首批五个文件为
