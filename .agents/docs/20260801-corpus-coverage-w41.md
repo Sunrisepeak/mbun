@@ -87,6 +87,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W137 | Node path pure-contract leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five path leaves; no source owner |
 | W138 | Node os pure-contract leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five os leaves; no source owner |
 | W139 | Bun Web Abort leaves | 3 | 3/3 green; 15 passed / 0 failed / 15 ran / 27 expects; 0 timeout; no build | retain all three abort leaves; no source owner |
+| W140 | Bun Web timers basic leaves | 4 | 4/4 green; 12 passed / 0 failed / 12 ran / 58 expects; 0 timeout; no build | retain all four timer leaves; no source owner |
 
 ## W133 Bun.Terminal green cluster
 
@@ -191,6 +192,19 @@ The bounded three-job selector covered the base Abort contract, AbortController
 GC reason handling, and AbortSignal event-listener leak behavior. All **3/3
 files were green**, reaching **15 passed / 0 failed / 15 ran / 27 expects** with
 no timeout. Per-file durations were 298–800ms.
+
+No source or upstream fixture change was made. The selector used the existing
+coordinator binary through `tools/integration/bun_corpus_runner.py` with three
+bounded jobs, a 30-second per-file timeout, and missing Node modules allowed.
+No full corpus or workspace-wide test was run; the selector and raw runner
+output were removed after recording the result.
+
+## W140 Bun Web timers green cluster
+
+The bounded three-job selector covered `setImmediate`, the adjacent
+`setImmediate2` contract, performance timing, and performance entries. All
+**4/4 files were green**, reaching **12 passed / 0 failed / 12 ran / 58
+expects** with no timeout. Per-file durations were 166ms–1.709s.
 
 No source or upstream fixture change was made. The selector used the existing
 coordinator binary through `tools/integration/bun_corpus_runner.py` with three
