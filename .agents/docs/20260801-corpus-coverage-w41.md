@@ -89,6 +89,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W139 | Bun Web Abort leaves | 3 | 3/3 green; 15 passed / 0 failed / 15 ran / 27 expects; 0 timeout; no build | retain all three abort leaves; no source owner |
 | W140 | Bun Web timers basic leaves | 4 | 4/4 green; 12 passed / 0 failed / 12 ran / 58 expects; 0 timeout; no build | retain all four timer leaves; no source owner |
 | W141 | Node events basic leaves | 5 | 3/5 pass; 2 fail; 0 timeout; no build | retain CustomEvent/list/listener-count; park AbortSignal max-listener default and events.once error-code owners |
+| W142 | Node string_decoder leaves | 3 | 2/3 pass; 1 fail; 0 timeout; no build | retain end/fuzz; park StringDecoder.prototype.write invalid-this brand owner |
 
 ## W133 Bun.Terminal green cluster
 
@@ -226,6 +227,24 @@ the default maximum for an AbortSignal as **10** where Node expects **0**.
 `test-events-once.js` reaches the invalid-argument error path but the thrown
 error has no `ERR_INVALID_ARG_TYPE` code. Neither is folded into the other or
 patched speculatively.
+
+No source or upstream fixture change was made. The selector used the existing
+coordinator binary through `tools/integration/node_corpus_runner.py` with
+three bounded jobs and a 30-second per-file timeout. No full corpus or
+workspace-wide test was run; the selector and raw runner output were removed
+after recording the result.
+
+## W142 Node string_decoder owner split
+
+The bounded three-job selector covered StringDecoder end behavior, randomized
+byte fuzzing, and the main contract file. It reached **2/3 files passed**, with
+**1 failure and 0 timeouts**; per-file durations were 200–349ms.
+
+`test-string-decoder-end.js` and `test-string-decoder-fuzz.js` passed. The main
+file failed only when `StringDecoder.prototype.write` was invoked without a
+decoder instance: Node requires an `ERR_INVALID_THIS` error, while the current
+runtime did not throw. This is a single private-brand/invalid-this owner and is
+parked without a speculative source change or issue.
 
 No source or upstream fixture change was made. The selector used the existing
 coordinator binary through `tools/integration/node_corpus_runner.py` with
