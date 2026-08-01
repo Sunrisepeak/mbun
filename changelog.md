@@ -5,6 +5,11 @@
 
 ## 2026-08-01
 
+- W65 fresh Bun URL API leaf probe（5 jobs、复用当前 Linux binary、无构建）新增 **5/5
+  files green、135 passed、0 failed、137 ran、130 expects**：`url-parse-query`、
+  `url-format`、`url-format-whatwg`、`url-domain-ascii-unicode`、
+  `url-canParse-whatwg`。这是增量覆盖数据，不代表整个 URL subtree 或已停车的
+  parser cluster；未跑全量 corpus。
 - `#47` 修复 Node URL setter 的 WebIDL `USVString` 边界：`href`、`protocol`、
   `username`、`password`、`host`、`hostname`、`port`、`pathname`、`search`、
   `hash` 现在先执行 JavaScript `ToString`，拒绝 Symbol，并将 lone surrogate

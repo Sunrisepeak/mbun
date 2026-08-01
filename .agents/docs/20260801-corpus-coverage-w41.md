@@ -641,6 +641,20 @@ surface on Linux:
   workspace-wide build was started; resource policy remains serialized builds
   plus 3–5 bounded test lanes.
 
+### W65 Bun URL API leaf coverage
+
+- A fresh five-file Bun-native probe used **5 bounded jobs** and reused the
+  current Linux binary; no source change or build was needed. The selected
+  leaves were `url-parse-query`, `url-format`, `url-format-whatwg`,
+  `url-domain-ascii-unicode`, and `url-canParse-whatwg`.
+- All **5/5 files** were green: **135 passed, 0 failed, 137 ran, 130
+  expects**. Two framework-level skips are included in the ran/pass total as
+  reported by the Bun runner; no test failure or timeout occurred.
+- This is additive Bun coverage data, not a claim about the parked URL parser
+  cluster or the complete URL subtree. No full corpus or workspace-wide build
+  was started; the next route remains a fresh one-owner Node/Bun near-green
+  measurement under the 3–5 lane resource policy.
+
 ### W59 Node buffer leaf sample
 
 - W59 使用 Node corpus runner 的默认 bounded profile、**3 jobs**。首批五个文件为
