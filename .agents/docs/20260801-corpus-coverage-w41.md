@@ -124,6 +124,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W174 | Node stream error/end leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five invalid-chunk/finished/end leaves; no source owner |
 | W175 | Node stream state/event leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five Readable/Writable state leaves; no source owner |
 | W176 | Node stream/Web strategy leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five Web termination/strategy/HWM leaves; no source owner |
+| W177 | Node stream encoding/buffer leaves | 5 | 4/5 pass; 1 fail; 0 timeout; no build | retain four green HWM/encoding/buffer leaves; park stream-wrap callback owner |
 
 ## W133 Bun.Terminal green cluster
 
@@ -736,6 +737,20 @@ The bounded three-job selector covered ReadableStream termination through Web
 bridges, Readable strategy options, Writable default encoding, and the global
 stream high-water-mark setting. All **5/5 files passed**, with **0 failures and
 0 timeouts**. Per-file durations were 165–333ms.
+
+No source or upstream fixture change was made. The selector used the existing
+coordinator binary through `tools/integration/node_corpus_runner.py` with
+three bounded jobs and a 30-second per-file timeout. No full corpus or
+workspace-wide test was run; the selector and raw runner output were removed
+after recording the result.
+
+## W177 Node stream encoding/buffer owner split
+
+The bounded three-job selector covered Readable HWM zero, default encoding,
+wrapped encoding, Writable buffer clearing, and null writes. It reached **4/5
+files passed**, with **1 failure and 0 timeouts**. The four HWM/default-encoding/
+buffer leaves stayed green. `stream-wrap-encoding` failed only on expected
+callback counts and is parked as a separate stream-wrap callback owner.
 
 No source or upstream fixture change was made. The selector used the existing
 coordinator binary through `tools/integration/node_corpus_runner.py` with
