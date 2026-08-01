@@ -176,6 +176,8 @@ the observed Linux limits; the coordinator owns the only root build.
 | W226 | Node crypto leaves | 3 | 3/3 pass; 0 fail; 0 timeout; no build | retain cipher encoding validation, getCipherInfo lookup/type/range, and RSA-OAEP empty-payload guards; no source owner |
 | W227 | Node crypto leaves | 3 | 2/3 pass; 1 fail; 0 timeout; no build | retain HKDF and KeyObject brand-check leaves; park randomFill offset/size type validation owner |
 | W228 | Node crypto/WebCrypto leaves | 3 | 3/3 pass; 0 fail; 0 timeout; no build | retain KeyObject own-key, AES-GCM empty-payload, and short-tag rejection guards; no source owner |
+| W229 | Bun Node URL/path leaves | 3 | 3/3 green; 4 passed / 0 failed / 5 ran / 2 expects; 0 timeout; no build | retain path parse/format and zero-length guards plus legacy URL query-object prototype guard; one URL TODO remains; no source owner |
+| W230 | Bun Node path/URL leaves | 3 | 3/3 green; 8 passed / 0 failed / 8 ran / 0 expects; 0 timeout; no build | retain basename/extname platform cases and WHATWG URL format; no source owner |
 
 ## W133 Bun.Terminal green cluster
 
@@ -282,6 +284,31 @@ upstream files are plain scripts, so file-level clean exit is authoritative.
 No source or fixture change was made, and no full corpus or workspace-wide test
 was run; the selector and raw runner output were removed after recording the
 result.
+
+## W230 Bun Node path/URL green cluster
+
+The bounded three-job Bun selector covered `path.basename` platform/Win32/POSIX
+cases, `path.extname` general/Win32/POSIX cases, and WHATWG `url.format`. All
+**3/3 files were green**, reaching **8 passed / 0 failed / 8 ran / 0 expects**;
+there were no timeouts and each file completed in about 200ms.
+
+No source or upstream fixture change was made, and no full corpus or
+workspace-wide test was run; the selector and raw runner output were removed
+after recording the result.
+
+## W229 Bun Node URL/path green cluster
+
+The final bounded three-job Bun selector covered `path.parse`/`path.format`,
+zero-length path strings, and the legacy `url.parse` query-object prototype
+guard. All **3/3 files were green**, reaching **4 passed / 0 failed / 5 ran / 2
+expects** with no timeout; per-file durations were 202–302ms. The URL file
+retained one upstream TODO and no failure.
+
+An initial querystring candidate was excluded because the Bun runner correctly
+classified the plain script as `no-tests`; it is not counted as coverage. No
+source or upstream fixture change was made, and no full corpus or workspace-wide
+test was run; the selector and raw runner output were removed after recording
+the result.
 
 ## W228 Node crypto/WebCrypto green cluster
 

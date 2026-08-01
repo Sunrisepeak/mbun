@@ -5,6 +5,8 @@
 
 ## 2026-08-01
 
+- W230 fresh Bun Node path/URL leaf probe（3 jobs、复用现有 coordinator binary、无构建）**3/3 files green、8 passed、0 failed、8 ran、0 expects、0 timeout**：path.basename 4/4、path.extname 3/3、WHATWG url.format 1/1 全部 clean-exit，单文件约 200ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W229 fresh Bun Node URL/path leaf probe（3 jobs、复用现有 coordinator binary、无构建）**3/3 files green、4 passed、0 failed、5 ran、2 expects、0 timeout**：path.parse/format、zero-length path、legacy url.parse query-object guard clean-exit；URL 文件保留 1 个 upstream TODO。首个 querystring 候选因 Bun runner 正确判定 no-tests 而排除。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W228 fresh Node crypto/WebCrypto leaf probe（3 jobs、复用现有 coordinator binary、无构建）**3/3 files pass、0 fail、0 timeout**：KeyObject own-key guard、AES-GCM empty-payload round-trip、short-tag `OperationError` rejection 全部 clean-exit；Node runner 按 file-level 计数，单文件耗时 199–200ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W227 fresh Node crypto leaf probe（3 jobs、复用现有 coordinator binary、无构建）**2/3 files pass、1 fail、0 timeout**：HKDF 与 KeyObject brand-check clean-exit；randomFill 在字符串 offset 校验断言处失败，收敛为 crypto.randomFill* offset/size type-validation owner。Node runner 按 file-level 计数，单文件耗时 198–300ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W226 fresh Node crypto leaf probe（3 jobs、复用现有 coordinator binary、无构建）**3/3 files pass、0 fail、0 timeout**：cipher encoding validation、getCipherInfo lookup/type/range、RSA-OAEP empty payload 全部 clean-exit；Node runner 按 file-level 计数，单文件耗时 231–233ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
