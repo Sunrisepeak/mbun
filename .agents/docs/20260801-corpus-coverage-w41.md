@@ -39,6 +39,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W89 | Bun Node-inspector probe | 5 | 4/5 green; 34 passed / 27 failed / 64 ran / 131 expects | park inspector-profiler behind missing inspector/profiler subsystem |
 | W90 | Bun Node-fs/child_process leaves | 5 | corrected probe: 4/5 green; 39 passed / 12 failed / 56 ran / 107 expects | retain four green leaves; park fs/promises multi-owner failures |
 | W91 | Bun Node-net leaves | 5 | 3/5 green; 5 passed / 1 failed / 7 ran / 15 expects; one no-tests stress fixture | retain three green net leaves; park autoSelectFamily liveness |
+| W92 | Bun/Node fs/promises AbortError owner | 5 Bun + 3 Node guards | Bun target 24 passed / 5 failed / 34 ran; 4 Bun guards green; Node 2/3 pass | issue #52; focused message fix landed, remaining fs/promises owners parked |
 
 ## Delivered slice
 
@@ -1107,6 +1108,28 @@ surface on Linux:
   attempt-timer lifecycle to patch narrowly, so this remains a net liveness
   boundary with no speculative issue or source change. No upstream fixture
   changes, full corpus, or workspace-wide build were performed.
+
+### W92 fs/promises AbortError message fix
+
+- W90's red `fs/promises` row was reduced to one owner: the live
+  `fsAbortErr()` helper emitted `The operation was aborted` without Node's
+  terminal period. Issue [#52](https://github.com/Sunrisepeak/mbun/issues/52)
+  captured the red contract; commit `84f7d59` changes only that message and
+  preserves `name`, `code`, and `cause`.
+- A fresh release build completed under the serialized build lock. The focused
+  Bun rerun used **5 bounded jobs**: `fs/promises` moved from **17 passed / 12
+  failed / 34 ran** to **24 passed / 5 failed / 34 ran**, and the four W90
+  child_process/fs guards remained green. Aggregate focused result: **4/5
+  files green, 46 passed, 5 failed, 56 ran, 114 expects**.
+- The seven AbortError message/shape cases all turned green. The five remaining
+  failures are independent async-stack, internal-stream-loader,
+  FileHandle-lifetime, and async-iterator abort-assertion owners; no mixed
+  follow-up was attempted. Direct smoke reports the corrected message in both
+  Node and Bun dialects with `AbortError` and `ABORT_ERR`.
+- Node's bounded guard passed the two FileHandle abort files; the third
+  readFile file remains red only at its unrelated zero-byte-liar child fixture
+  assertion. No upstream fixture changes, full corpus, or workspace-wide build
+  were performed.
 
 ### W59 Node buffer leaf sample
 

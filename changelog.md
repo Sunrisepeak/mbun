@@ -5,6 +5,13 @@
 
 ## 2026-08-01
 
+- W92 issue [#52](https://github.com/Sunrisepeak/mbun/issues/52) 修复 `fs/promises` AbortError
+  message owner：W90 的 **17 passed / 12 failed / 34 ran** 经 fresh build 后变为 **24 passed / 5 failed /
+  34 ran**，四个 child_process/fs guards 仍全绿；Bun focused aggregate 为 **4/5 files green、46 passed、
+  5 failed、56 ran、114 expects**。仅在 `fsAbortErr()` 补 Node 要求的末尾句号，Node/Bun direct smoke
+  均为 `AbortError`、`ABORT_ERR`、`The operation was aborted.`；剩余失败跨 async stack、internal loader、
+  FileHandle 生命周期和 async-iterator abort assertion，未混修。Node guard 2/3 pass，剩余一项为独立
+  zero-byte-liar fixture assertion。
 - W91 fresh Bun Node-net leaf probe（5 jobs、复用 W85 binary、无构建）测得 **3/5 files green、5 passed、
   1 failed、7 ran、15 expects**：`double-connect` **1/1**、allowHalfOpen **2/2**、socket reconnect
   **2/2**。`handle-leak` 为 no-tests stress entrypoint 但实际完成 100,000 次连接；
