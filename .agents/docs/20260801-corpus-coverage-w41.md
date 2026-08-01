@@ -80,6 +80,20 @@ the observed Linux limits; the coordinator owns the only root build.
 | W130 | Node REPL focused leaves | 3 | 1/3 pass; 1 fail; 1 timeout at 30s; no build; direct probe reproduced shared RegExp owner | issue #65; retain multiline navigation, park REPL/autolibs behind RegExp.$N static getter binding |
 | W131 | Node VM/URL/WHATWG leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five green leaves; no source owner |
 | W132 | Node VM/WHATWG streams/URL leaves | 5 | 3/5 pass; 2 fail; 0 timeout; no build | issues #66/#67; retain VM ownpropertynames, URLSearchParams entries, WritableStream close; park VM readonly wording and TextDecoderStream invalid receivers |
+| W133 | Bun.Terminal native leaves | 3 | 3/3 green; 129 passed / 0 failed / 130 ran / 334 expects; no build | retain all three terminal leaves; no source owner |
+
+## W133 Bun.Terminal green cluster
+
+The bounded three-job selector covered the core terminal contract, explicit
+POSIX/Windows platform gaps, and terminal subprocess integration. All **3/3
+files were green**, reaching **129 passed / 0 failed / 130 ran / 334 expects**.
+Per-file durations were 1.233–3.694s, with no timeout.
+
+No source or upstream fixture change was made. The selector used the existing
+coordinator binary through `tools/integration/bun_corpus_runner.py` with three
+bounded jobs, a 30-second per-file timeout, and missing Node modules allowed.
+No full corpus or workspace-wide test was run; the selector and raw runner
+output were removed after recording the result.
 
 ## W132 Node VM and WebStreams owner split
 
