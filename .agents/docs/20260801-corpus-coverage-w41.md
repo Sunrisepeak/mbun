@@ -38,6 +38,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W88 | Bun Node-fs directory/Stats leaves | 5 | 5/5 green; 52 passed / 0 failed / 55 ran / 138 expects | fresh confirmation of narrow fs leaves; no source owner |
 | W89 | Bun Node-inspector probe | 5 | 4/5 green; 34 passed / 27 failed / 64 ran / 131 expects | park inspector-profiler behind missing inspector/profiler subsystem |
 | W90 | Bun Node-fs/child_process leaves | 5 | corrected probe: 4/5 green; 39 passed / 12 failed / 56 ran / 107 expects | retain four green leaves; park fs/promises multi-owner failures |
+| W91 | Bun Node-net leaves | 5 | 3/5 green; 5 passed / 1 failed / 7 ran / 15 expects; one no-tests stress fixture | retain three green net leaves; park autoSelectFamily liveness |
 
 ## Delivered slice
 
@@ -1090,6 +1091,22 @@ surface on Linux:
   does not expose one safe live owner for this mixed row, so no issue or patch
   was opened. No upstream fixture changes, full corpus, or workspace-wide
   build were performed; temporary selector and output data were removed.
+
+### W91 Bun Node-net leaf probe
+
+- A fresh five-file Bun net probe reused the W85 binary with **5 bounded jobs**
+  and no build. It measured **3 green files, 5 passed, 1 failed, 7 ran, 15
+  expects**; one additional file was classified `no-tests`.
+- `double-connect` was **1/1**, `node-net-allowHalfOpen` **2/2**, and
+  `socket-reconnect-live` **2/2**. The `handle-leak` fixture is a stress
+  entrypoint rather than a Bun test file; it completed its 100,000-connection
+  leak exercise but is not counted as green coverage.
+- `connect-autoselectfamily-stale-timer` skipped its macOS-only case and timed
+  out the Linux destroy-while-pending case after **5 seconds**. The fixture
+  never reached its `OK` marker; the source path has no bounded Happy-Eyeballs
+  attempt-timer lifecycle to patch narrowly, so this remains a net liveness
+  boundary with no speculative issue or source change. No upstream fixture
+  changes, full corpus, or workspace-wide build were performed.
 
 ### W59 Node buffer leaf sample
 

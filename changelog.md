@@ -5,6 +5,10 @@
 
 ## 2026-08-01
 
+- W91 fresh Bun Node-net leaf probe（5 jobs、复用 W85 binary、无构建）测得 **3/5 files green、5 passed、
+  1 failed、7 ran、15 expects**：`double-connect` **1/1**、allowHalfOpen **2/2**、socket reconnect
+  **2/2**。`handle-leak` 为 no-tests stress entrypoint 但实际完成 100,000 次连接；
+  autoSelectFamily destroy-pending Linux case 5 秒超时，属于 net liveness boundary，未做猜测性修复。
 - W90 fresh Bun Node-fs/child_process leaf probe（5 jobs、复用 W85 binary、无构建）先纠正一次 selector
   拼写错误后，以真实 `fs/promises.test.js` 重跑；权威结果为 **4/5 files green、39 passed、12 failed、
   56 ran、107 expects**。`child-process-exec` **11/11**、rlimit **1/1**、stdio **7/7**、Linux
