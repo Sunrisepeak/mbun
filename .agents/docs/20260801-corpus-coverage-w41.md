@@ -62,6 +62,30 @@ the observed Linux limits; the coordinator owns the only root build.
 | W112 | Node child_process adjacent contract leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five green leaves; park IPC backlog/handle and signal-race owners |
 | W113 | Node process environment/runtime leaves | 5 | 4/5 pass; 1 fail; 0 timeout; TZ failure reproduced at 1 job / 60s | issue #59; retain four green leaves, park existing-Date timezone cache invalidation |
 | W114 | Node streams writable/readable basic leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five green leaves; no source owner |
+| W115 | Node streams event-order/pipe leaves | 5 | 4/5 pass; 1 fail; 0 timeout; TickObject failure reproduced at 1 job / 60s | issue #60; retain four green leaves, park callback-less Writable tick scheduling |
+
+## W115 streams owner triage
+
+The bounded three-job selector covered `test-stream-readable-no-unneeded-readable.js`,
+`test-stream-pipe-unpipe-streams.js`, `test-stream-destroy-event-order.js`,
+`test-stream-writable-samecb-singletick.js`, and `test-stream-readable-aborted.js`.
+Four files passed; the only failure was `test-stream-writable-samecb-singletick.js`.
+Per-file durations were 165–235 ms, with no timeout. A one-job/60-second
+isolated rerun reproduced the same failure.
+
+The failure is `Mismatched noop function calls. Expected exactly 1, actual 0`.
+Node creates one `TickObject` for the callback-less `Console`/`Writable` write
+sequence. mbun's direct `process.nextTick()` probe and a `Writable.write()` with
+an explicit user callback both report `TickObject`; only the callback-less
+Console path omits it. The owner is therefore the synchronous
+`node_stream_writable.cppm` after-write path, whose `afterWriteTick` condition
+does not cover a no-op user callback. This is separate from async_hooks
+registration.
+
+Issue [#60](https://github.com/Sunrisepeak/mbun/issues/60) records the sanitized
+reproduction and owner. No source or upstream fixture change was made; four
+green streams leaves are retained, and no full corpus or workspace-wide test
+was run.
 
 ## W113 process feature triage
 

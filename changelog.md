@@ -5,6 +5,7 @@
 
 ## 2026-08-01
 
+- W115 fresh Node streams event-order/pipe probe（3 jobs、复用 W108 fresh binary、无构建）**4/5 files pass、1 fail、0 timeout**：readable no-unneeded、pipe/unpipe、destroy event order、readable aborted 通过；`test-stream-writable-samecb-singletick.js` 在 1 job/60s 隔离复测仍失败。对照确认 `process.nextTick` 和显式 callback 的 Writable 写入能产生 `TickObject`，只有 callback-less Console/Writable 路径缺少内部 tick；issue [#60](https://github.com/Sunrisepeak/mbun/issues/60) 已创建。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W114 fresh Node streams writable/readable basic probe（3 jobs、复用 W108 fresh binary、无构建）**5/5 files pass、0 fail、0 timeout**：writable finished、重复 end、invalid chunk、write callback error、readable state 全部通过；单文件耗时 166–183ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W113 fresh Node process environment/runtime probe（3 jobs、复用 W108 fresh binary、无构建）**4/5 files pass、1 fail、0 timeout**：allowed flags、execve 参数校验、thread CPU usage、no-deprecation 通过；`test-process-env-tz.js` 在 1 job/60s 隔离复测仍失败。根因收敛为同一 `Date` 实例首次 `toString()` 后的 JSC 本地 Gregorian 缓存只按毫秒复用，TZ 名称更新但 offset 仍旧；issue [#59](https://github.com/Sunrisepeak/mbun/issues/59) 已创建。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W112 fresh Node child_process adjacent-contract probe（3 jobs、复用 W108 fresh binary、无构建）**5/5 files pass、0 fail、0 timeout**：`execFile`、exec 环境、stdio 形状、IPC 参数类型错误、kill 生命周期全部通过；单文件耗时 231–666ms。未修改 source/fixture，IPC backlog/handle 和 signal-race owners 未混入，未跑全量 corpus/workspace-wide test。
