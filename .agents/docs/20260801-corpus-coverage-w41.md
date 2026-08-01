@@ -143,6 +143,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W193 | Bun low-coupling stream/source-map/system leaves | 5 | 3/5 green; 323 passed / 12 failed / 604 ran / 2302 expects; 0 timeout; no build | retain direct-readable, libuv error-name, histogram; park source-map path/UTF-8 and internal-source-map owners separately |
 | W194 | Bun JSC/resolve/transpiler leaves | 5 | 3/5 green; 39 passed / 73 failed / 130 ran / 286 expects; 0 timeout; no build | retain native-constructor, string-noAtomize, bun-lock; park REPL transform and bytecode/type-export owners separately |
 | W195 | Bun resolver import/meta leaves | 5 | 1/5 green; 42 passed / 28 failed / 70 ran / 82 expects; 0 timeout; no build | retain import-meta-resolve; park import.meta path, empty-module shape, and CJS __esModule owners separately |
+| W196 | Node Readable readiness/encoding leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five readable/resume/encoding leaves; no source owner |
 
 ## W133 Bun.Terminal green cluster
 
@@ -1044,6 +1045,19 @@ no mixed fix was attempted.
 The selector used the existing coordinator binary through
 `tools/integration/bun_corpus_runner.py` with three bounded jobs, a 30-second
 per-file timeout, and missing Node modules allowed. No full corpus or
+workspace-wide test was run; the selector and raw runner output were removed
+after recording the result.
+
+## W196 Node Readable readiness/encoding green cluster
+
+The bounded three-job selector covered readable-then-resume, reading-more
+state, resume high-water-mark behavior, scheduled resume, and setting encoding
+over existing buffers. All **5/5 files passed**, with **0 failures and 0
+timeouts**. Per-file durations were 165–200ms.
+
+No source or upstream fixture change was made. The selector used the existing
+coordinator binary through `tools/integration/node_corpus_runner.py` with
+three bounded jobs and a 30-second per-file timeout. No full corpus or
 workspace-wide test was run; the selector and raw runner output were removed
 after recording the result.
 
