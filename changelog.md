@@ -5,6 +5,7 @@
 
 ## 2026-08-01
 
+- W201 fresh Node pipe continuation probe（3 jobs、复用现有 coordinator binary、无构建）**5/5 files pass、0 fail、0 timeout**：deadlock、manual-resume、needDrain、object-mode bridge、without-listenerCount 全部通过；单文件耗时 165–281ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W200 fresh Node pipe/backpressure probe（3 jobs、复用现有 coordinator binary、无构建）**5/5 files pass、0 fail、0 timeout**：after-end、await-drain、manual-resume、push-while-write、cleanup-pause 全部通过；单文件耗时 166–185ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W199 fresh Node Duplex/destroy/finalization probe（3 jobs、复用现有 coordinator binary、无构建）**5/5 files pass、0 fail、0 timeout**：Duplex destroy、readable end、base Duplex、stream destroy、finished default path 全部通过；单文件耗时 198–265ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W198 fresh Node Duplex probe（3 jobs、复用现有 coordinator binary、无构建）**5/5 files pass、0 fail、0 timeout**：Duplex from、props、readable/writable、writable-finished、end 全部通过；单文件耗时 165–283ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
