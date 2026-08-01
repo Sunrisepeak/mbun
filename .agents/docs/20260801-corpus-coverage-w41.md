@@ -33,6 +33,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W83 | Bun/Node path | 5 Bun + 1 Node guard | pre 4/5 Bun green; post 5/5 Bun green; Node 1/1 | issue #50; dialect-only error-text fix |
 | W84 | Bun Node-path continuation | 5 | 5/5 green; 88 passed / 0 failed / 89 ran | retain as green path coverage; no source owner |
 | W85 | Bun os/string_decoder | 5 | pre 3 green + 1 skipped; post 4 green + 1 skipped; 149 passed / 0 failed / 150 ran | issue #51; dialect-aware Buffer ceiling |
+| W86 | Bun Buffer completion guards | 5 | 4/5 green; 25 passed / 6 failed / 31 ran | park concat multi-owner; preserve four green guards |
 
 ## Delivered slice
 
@@ -1005,6 +1006,21 @@ surface on Linux:
 - Resource checkpoint after the build and bounded child runs: approximately
   **42 GiB available memory, 54 MiB free swap, and 20 GiB free disk**. No
   workspace-wide build or parallel build storm was started.
+
+### W86 Buffer completion regression guard
+
+- A focused five-file Bun guard reused the W85 binary with **5 bounded jobs**
+  and no build. It measured **4 green files, 25 passed, 6 failed, 31 ran, 46
+  expects**. `buffer-compare-bounds` (**13/13**),
+  `buffer-from-encoding-leak` (**2/2**), `buffer-inspectmaxbytes` (**1/1**),
+  and `buffer-utf16` (**1/1**) stayed green.
+- `buffer-concat` reached **8/14**. Its six failures are not one #51 ceiling
+  contract: they span the large-concat OOM error shape, resizable-buffer
+  post-getter sizing, and detached TypedArray/ArrayBuffer propagation in
+  `Bun.concatArrayBuffers`. The row is parked as a native concat/lifetime
+  cluster; no source patch or new issue was opened.
+- This is a guard result, not a new full Buffer-suite score. No upstream
+  fixture changes, no full corpus, and no workspace-wide build were performed.
 
 ### W59 Node buffer leaf sample
 

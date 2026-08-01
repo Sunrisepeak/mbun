@@ -5,6 +5,10 @@
 
 ## 2026-08-01
 
+- W86 Buffer completion regression guard（5 jobs、复用 W85 binary、无构建）测得 **4 green
+  files、25 passed、6 failed、31 ran、46 expects**。compare-bounds、from-encoding-leak、
+  inspectmaxbytes、utf16 全绿；`buffer-concat` 的 6 个失败跨 OOM 错误形状、resizable shrink
+  和 detach 传播，属多个 native concat owner，未与 #51 混修，未跑全量 corpus。
 - W85 fresh Bun `node:os`/`string_decoder` probe（5 jobs）先测得 **3 green + 1 all-skipped、
   147 passed、2 failed、150 ran、3035 expects**。两条 `string_decoder` 失败实际共享
   Buffer allocator 上限：Bun dialect 仍拒绝 `2**31` 以上 buffer，child 在进入 decoder 前退出。
