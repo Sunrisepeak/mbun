@@ -239,6 +239,31 @@ the observed Linux limits; the coordinator owns the only root build.
 | W289 | Node resolver/extension/symlink leaves | 5 | 3/5 pass; 2 fail; 0 timeout; no build | retain symlinked-peer, invalid-main, and relative-path guards; park extension-over-directory and require.resolve fixture lookup owners |
 | W290 | Node module metadata/extension leaves | 5 | 4/5 pass; 1 fail; 0 timeout; no build | retain module children/stat/version and extension-main guards; merge same-filename-as-dir into the W289 extension-over-directory precedence owner |
 | W291 | Bun Base64/Buffer/console/encoding leaves | 5 | 5/5 green; 38 passed / 0 failed / 40 ran / 118 expects; 0 timeout; no build | retain all five Bun guards; no source owner |
+| W292 | Bun console/performance/HTTP leaf probe | 5 | 4/5 green; 30 passed / 4 failed / 34 ran / 66 expects; 0 runner timeout; no build | retain four green guards; park malformed HTTP trailer validation/liveness owner |
+
+## W292 Bun console/performance/HTTP leaf probe
+
+The bounded five-job Bun selector covered Console, Performance, Buffer URL,
+clearImmediate GC, and HTTP transfer-encoding leaves. It measured **4/5 green
+files**, **30 passed / 4 failed / 34 ran / 66 expects**, and **0 runner-level
+timeouts**. Per-file durations were **200–6727 ms**.
+
+`buffer-resolveObjectURL.test.ts` measured **3 passed / 0 failed / 3 ran / 12
+expects**; `console.test.ts` measured **7 / 0 / 7 / 10**;
+`clearImmediate-gc.test.ts` measured **1 / 0 / 1 / 3**; and
+`performance.test.js` measured **7 / 0 / 7 / 12**. The HTTP
+`node-http-transfer-encoding.test.ts` file measured **12 passed / 4 failed /
+16 ran / 29 expects** in 6727 ms.
+
+The four HTTP failures were concentrated in malformed trailer validation and
+liveness: bare-LF/CTL trailer handling, client-error delivery, and the
+configured trailer-size boundary. Two cases reported an internal test timeout,
+but the file stayed within the runner's 30-second limit. This is one focused
+HTTP trailer owner; there were no source or upstream-fixture changes.
+
+The selector used the bounded five-job Bun runner with a 30-second per-file
+timeout, the existing coordinator binary, and missing Node modules allowed.
+No full corpus, build, or workspace-wide test was run.
 
 ## W291 Bun Base64/Buffer/console/encoding leaf probe
 
