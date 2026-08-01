@@ -5,6 +5,7 @@
 
 ## 2026-08-01
 
+- W210 fresh Node dgram UDP lifecycle probe（3 jobs、复用现有 coordinator binary、无构建）**5/5 files pass、0 fail、0 timeout**：address、asyncDispose、default bind address、AbortSignal close 与 send bytes-length 全部通过；单文件耗时 165–247ms。未发现 source owner，未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W209 fresh Bun Node Buffer/DOM/crypto probe（3 jobs、复用现有 coordinator binary、无构建）**5/5 files green、17 passed、0 failed、17 ran、74 expects、0 timeout**：Buffer Symbol.toPrimitive、resolveObjectURL、Node DOMException、crypto invalid-this 与 HKDF callback/key-object 全部通过；单文件耗时 165–300ms。未发现 source owner，未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W208 fresh Node events lifecycle probe（3 jobs、复用现有 coordinator binary、无构建）**2/4 files pass、2 fail、0 timeout**：addAbortListener 与静态 getEventListeners 通过；事件 async-iterator 停在 invalid-argument `ERR_INVALID_ARG_TYPE` code，uncaught-exception stack 停在首行 stack-shape owner；单文件耗时 233–332ms。未修改 source/fixture，原始日志未发布，未跑全量 corpus/workspace-wide test。
 - W207 fresh Node diagnostics_channel probe（3 jobs、复用现有 coordinator binary、无构建）**5/5 files pass、0 fail、0 timeout**：has-subscribers、object-channel pub/sub、named pub/sub、symbol-named 与 sync-unsubscribe 全部通过；单文件耗时 168–252ms。未发现 source owner，未修改 source/fixture，未跑全量 corpus/workspace-wide test。
