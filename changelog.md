@@ -5,6 +5,10 @@
 
 ## 2026-08-01
 
+- W84 fresh Bun Node-path continuation（5 jobs、复用当前 Linux binary、无构建）新增 **5/5
+  files green、88 passed、0 failed、89 ran、382 expects**：`browserify` **52/52**、
+  `matches-glob` **31/31**、`path` 基础属性、15704 长路径保护和 zero-length strings 均绿。
+  未修改上游 fixture，未跑全量 corpus；继续保持 3–5 worker 与低 swap/disk 策略。
 - W83 fresh Bun Node-path probe（5 jobs）先测得 **4/5 files green、15 passed、1 failed、16 ran、9
   expects**；唯一失败是 `path.format(null)` 的 Bun 方言错误文案。Issue [#50](https://github.com/Sunrisepeak/mbun/issues/50)
   的最小修复由 `7f6af93` 落地：Bun dialect 保留 `property + typeof` 文案，Node dialect 保留

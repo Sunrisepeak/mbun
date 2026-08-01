@@ -31,6 +31,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | 2 | Node test-util | 12 | 0 green, 12 fail | keep only low-risk isolated APIs |
 | 2 | Node test-v8 | 11 | 0 green, 11 fail | park; profiler/queryObjects/startup snapshot ownership |
 | W83 | Bun/Node path | 5 Bun + 1 Node guard | pre 4/5 Bun green; post 5/5 Bun green; Node 1/1 | issue #50; dialect-only error-text fix |
+| W84 | Bun Node-path continuation | 5 | 5/5 green; 88 passed / 0 failed / 89 ran | retain as green path coverage; no source owner |
 
 ## Delivered slice
 
@@ -957,6 +958,20 @@ surface on Linux:
   memory, 48 MiB free swap, and 20 GiB free disk**. The run stayed within the
   serialized build lock and five-job bounded runner; no workspace-wide build
   was started.
+
+### W84 Bun Node-path continuation
+
+- A fresh five-file Bun path probe used **5 bounded jobs**, reused the existing
+  Linux binary, and did not build. It measured **5/5 files green, 88 passed,
+  0 failed, 89 ran, 382 expects**.
+- The high-value `browserify` compatibility file was **52/52** and
+  `matches-glob` was **31/31**. The same probe also covered path base
+  properties, the long-path join guard, and zero-length strings; one skipped
+  case in the path-property file is reflected by **88 passed / 89 ran**, not
+  silently counted as a pass.
+- This wave found no single runtime owner and required no source change or
+  issue. No upstream fixture changes and no full corpus were performed; the
+  next route remains a fresh near-green Node/Bun leaf with 3–5 bounded workers.
 
 ### W59 Node buffer leaf sample
 
