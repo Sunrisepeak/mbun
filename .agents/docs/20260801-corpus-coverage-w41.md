@@ -572,6 +572,17 @@ surface on Linux:
   全量 corpus。当前资源约 **44 GiB available memory、43 MiB swap free、20 GiB
   free disk**，继续暂停 broad build，仅保留 bounded lane。
 
+### W58 JSON5/YAML parser sample
+
+- W58 复用已有 fresh binary，默认 **4G/512、3 jobs**，无构建、无全量 corpus。三个
+  parser 文件全绿：JSON5 扩展 **321/321**、JSON5 官方 suite **113/113**、YAML
+  block-scalar matrix **1084/1084**。`import-attributes` 为 **3/12**，9 个失败
+  跨无扩展 JS/TS loader、JSON/JSONC/TOML/YAML loader、tsconfig JSONC 识别以及
+  wasm/不存在模块处理，不能归并为一个安全 owner。
+- W58 合计 **4 files、1521/1530 tests passed、9 failed、1809 expects、3/4 files
+  green**。JSON5/YAML 结果作为新的高收益绿色覆盖记录；import-attributes 停车，
+  下一任务仍需 fresh bounded measurement 证明单 owner 后再建 issue。
+
 ### W57 fresh Bun built-in probes
 
 - W57 使用默认 **4G/512、3 jobs**，无构建、无全量 corpus。第一批五文件为
@@ -641,10 +652,11 @@ surface on Linux:
    identified.
 3. Keep test-v8 profiler/queryObjects and broad VM wording changes parked until
    ownership is clear.
-4. Keep the W56 Bun.Glob path-boundary owner and W57 cookie/cron/ini/JSON/heading
-   slices closed unless a new minimal reproduction reopens them. Keep GFM parked
-   behind its multiple owners; prioritize the next one-owner Bun row over zlib's
-   native-handle cluster and test-runner's multi-owner boundary.
+4. Keep the W56 Bun.Glob, W57 green builtin/util slices, and W58 JSON5/YAML parser
+   sample closed unless a new minimal reproduction reopens them. Keep GFM,
+   stripANSI, and import-attributes parked behind their multiple owners; prioritize
+   the next one-owner Bun row over zlib's native-handle cluster and test-runner's
+   multi-owner boundary.
 5. Keep the fixed W51 final-read ordering, W52 file-backed stdin, W53 stdout
    disturbed/reject, and W54 conversion-helper brand owners closed; reopen only
    with a new minimal reproduction.

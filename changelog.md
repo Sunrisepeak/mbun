@@ -5,6 +5,12 @@
 
 ## 2026-08-01
 
+- W58 parser sample（默认 **4G/512、3 jobs**，复用已有 fresh binary，无构建）新增
+  JSON5 扩展 **321/321**、JSON5 官方 suite **113/113**、YAML block-scalar matrix
+  **1084/1084**，合计 **3/4 files green、1521/1530 tests passed、9 failed、1809
+  expects**。`import-attributes` 的 9 个失败跨无扩展 JS/TS、JSON/JSONC/TOML/YAML
+  loader、tsconfig JSONC 识别以及 wasm/不存在模块处理，按多 owner 停车，不建混合
+  issue。未跑全量 corpus。
 - W57 fresh Bun built-in probes（默认 **4G/512、3 jobs**，无构建）新增 13 个绿色文件：
   `ini` **62/62**、`JSONC` **43/43**、`JSONL` **269/269**、Markdown heading IDs
   **17/17**，以及 cookie 四文件 **124/124**、cron parse **24/24**；合计新增绿色
