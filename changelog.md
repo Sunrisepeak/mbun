@@ -5,6 +5,11 @@
 
 ## 2026-08-01
 
+- W79 fresh Bun crypto probe（3 jobs、复用当前 Linux binary、无构建）测得 **2 green files、
+  9515 passed、736 failed、10251 ran、29406 expects**。cipheriv-decipheriv 与
+  x25519-derive-bits 全绿；WPT generateKey 的失败集中在 empty-algorithm 与 RSA
+  algorithm-property validation 的异常类型/校验矩阵，未混修。未修改上游 fixture，未跑
+  全量 corpus。
 - W78 fresh Bun file/util leaf probe（5 jobs、复用当前 Linux binary、无构建）测得 **4 green
   files、27 passed、1 failed、28 ran、227 expects**。bun-file-fd-read、bun-file-read、
   bun-isMainThread、fileUrl 全绿；`BunObject` 唯一失败是缺少

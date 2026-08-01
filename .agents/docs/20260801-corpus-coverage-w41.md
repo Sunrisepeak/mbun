@@ -882,6 +882,21 @@ surface on Linux:
 - No upstream fixture changes, no full corpus, and no workspace-wide build
   were performed.
 
+### W79 Bun crypto probe parked on WebCrypto validation matrix
+
+- A fresh three-file Bun-native crypto probe used **3 bounded jobs** and
+  reused the current Linux binary; no source change or build was needed. It
+  measured **2 green files, 9,515 passed, 736 failed, 10,251 ran, 29,406
+  expects**.
+- `cipheriv-decipheriv` (**13/13**) and `x25519-derive-bits` (**12/12**) were
+  green. The WPT `generateKey` file reached **9,490/10,226**; its failures
+  repeat across empty-algorithm and RSA algorithm-property validation cases
+  with exception-type/validation mismatches. This is a broad WebCrypto
+  validation matrix, not a single safe crypto primitive owner, so it is
+  parked without a speculative patch.
+- No upstream fixture changes, no full corpus, and no workspace-wide build
+  were performed.
+
 ### W59 Node buffer leaf sample
 
 - W59 使用 Node corpus runner 的默认 bounded profile、**3 jobs**。首批五个文件为
