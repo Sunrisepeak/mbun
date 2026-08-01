@@ -282,6 +282,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W332 | Bun low-coupling Linux leaves | 5 | 2/5 green; 4 passed / 4 failed / 8 ran / 17 expects; 0 timeout; no build; 5 fresh | retain RuntimeError/data-URL module; park namespace pollution, no-addons diagnostic, and glibc symbol owners |
 | W333 | Node error/internal-contract leaves | 5 | 1/5 pass; 4 fail; 0 timeout; no build; 5 fresh | retain bad-Unicode parser; park accessor brands, constants shape, stack limit, and SystemError dialect owners |
 | W334 | Node process lifecycle/propagation leaves | 5 | 4/5 pass; 1 fail; 0 timeout; no build; 5 fresh | retain beforeExit throw, binding allowlist, execArgv, and uncaught-monitor guards; park beforeExit reentry owner |
+| W335 | Node timer API leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build; 5 fresh | retain all five timer API guards; no source owner |
 
 ## W305 Bun/Deno Event/Performance/URL/crypto leaf probe
 
@@ -909,6 +910,26 @@ source or upstream-fixture changes, full corpus, or workspace-wide build were
 made. After the run, resources showed about **46 GiB available memory**,
 **52 KiB free swap**, and **14 GiB free disk at 100% usage**. Temporary runner
 output is cleaned immediately and the next wave remains resource-gated.
+
+## W335 Node timer API leaves
+
+The bounded five-job Node selector covered five fresh timer files after
+filename/stem and narrow semantic-owner review: `test-timers-api-refs.js`,
+`test-timers-args.js`, `test-timers-clear-timeout-interval-equivalent.js`,
+`test-timers-invalid-clear.js`, and `test-timers-to-primitive.js`. The runner
+measured **5/5 file-level passes**, **0 failures**, **0 runner timeouts**, and
+**232–484 ms** per file. The Node runner reports file-level status only; no
+assertion-level pass total is inferred.
+
+All five timer API guards passed: internal timer APIs remain usable after
+global timer deletion, callback arguments propagate through the bounded 128-
+argument sequence, timeout/interval clearing is interchangeable,
+`clearImmediate` handles a non-Immediate input, and timer primitive/string IDs
+clear correctly. No source or upstream-fixture changes, full corpus, or
+workspace-wide build were made. After the run, resources showed about **46 GiB
+available memory**, **60 KiB free swap**, and **16 GiB free disk at 99% usage**.
+Temporary runner output is cleaned immediately and the next wave remains
+resource-gated.
 
 ## Coverage novelty audit correction after W323
 
