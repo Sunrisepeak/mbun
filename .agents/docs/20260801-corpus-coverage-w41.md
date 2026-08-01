@@ -924,6 +924,16 @@ surface on Linux:
 - No upstream fixture changes, no full corpus, and no workspace-wide build
   were performed.
 
+### W82 Node path leaf coverage
+
+- A fresh five-file Node path probe used **5 bounded jobs** and reused the
+  current Linux binary; no source change or build was needed. All **5/5 files**
+  were green: **13 passed, 0 failed, 13 ran, 0 `expect()` calls**. These
+  assert-style files cover basename, dirname, extname, isAbsolute, and join.
+- The zero `expect()` count is a runner metric, not missing assertions: the
+  upstream files use Node's assert APIs. No upstream fixture changes, no full
+  corpus, and no workspace-wide build were performed.
+
 ### W59 Node buffer leaf sample
 
 - W59 使用 Node corpus runner 的默认 bounded profile、**3 jobs**。首批五个文件为

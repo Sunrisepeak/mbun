@@ -5,6 +5,10 @@
 
 ## 2026-08-01
 
+- W82 fresh Node path leaf probe（5 jobs、复用当前 Linux binary、无构建）新增 **5/5 files
+  green、13 passed、0 failed、13 ran、0 expect() calls**：basename、dirname、extname、
+  isAbsolute、join 全绿；0 expect 是因为上游使用 Node assert，不代表缺少断言。未修改
+  上游 fixture，未跑全量 corpus。
 - W81 fresh Node console/zlib probe（5 jobs、复用当前 Linux binary、无构建）测得 **4 green
   files、390 passed、12 failed、404 ran、480 expects**。console constructor/core、zlib leak、
   reset-race 全绿；`zlib.test` 的失败跨 invalid raw data、libdeflate level validation、
