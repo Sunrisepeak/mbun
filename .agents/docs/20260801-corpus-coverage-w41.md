@@ -74,6 +74,27 @@ the observed Linux limits; the coordinator owns the only root build.
 | W124 | Bun util object/string/file/GC/stdin leaves | 5 | 2/5 green; 11 passed / 6 failed / 17 ran / 250 expects; no build | retain stdin + error-GC; park internal helper exports, Bun.file async-stack/JSON message owners separately |
 | W125 | Node HTTP/fs stream lifecycle leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five green leaves; no source owner |
 | W126 | Bun util + Node HTTP mixed leaves | 5 | corrected split-run: 4/5 files green; Bun 350 passed / 53 failed / 403 ran / 54616 expects, Node 2/2 pass; no build | retain indexOfLine, Bun.main, and two Node HTTP leaves; park CryptoHasher HMAC/unsupported-algorithm owners separately |
+| W127 | Bun console + Node HTTP/net leaves | 5 | 4/5 valid files green; Bun 31 passed / 2 failed / 34 ran / 84 expects, Node 3/3 pass; no build | issue #63; retain console.write and all Node leaves, park console.table alignment policy |
+
+## W127 console TablePrinter triage
+
+The selectors were kept corpus-specific: Bun covered `console-write.test.ts`
+and `console-table.test.ts`; Node covered HTTP upgrade, URL auth-header, and
+net capture-rejection leaves. The corrected result is **4/5 valid files green**.
+Bun reached **31 passed / 2 failed / 34 ran / 84 expects**; `console.write` was
+**1/1** and `console.table` was **30 passed / 2 failed / 33 ran**. All three
+Node files passed, taking 251ms, 4.265s, and 249ms.
+
+The two `console.table` failures are exact padding differences in the same
+TablePrinter alignment policy: a primitive Values cell has internal padding,
+and a header is centered where the reference is left-aligned. Getter access,
+custom inspection, GC, and iteration cases remain green. Issue
+[#63](https://github.com/Sunrisepeak/mbun/issues/63) records the sanitized
+single-owner reproduction.
+
+No source or upstream fixture change was made. No full corpus or workspace-wide
+test was run; selectors and raw runner output were removed after recording the
+result.
 
 ## W126 corrected mixed-lane triage
 
