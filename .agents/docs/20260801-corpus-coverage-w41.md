@@ -122,6 +122,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W172 | Bun FileSink/ArrayBufferSink/file-exists leaves | 3 | 3/3 green; 53 passed / 0 failed / 53 ran / 1728 expects; 0 timeout; no build | retain all three I/O leaves; no source owner |
 | W173 | Node stream basic leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five Duplex/Readable/Writable leaves; no source owner |
 | W174 | Node stream error/end leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five invalid-chunk/finished/end leaves; no source owner |
+| W175 | Node stream state/event leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five Readable/Writable state leaves; no source owner |
 
 ## W133 Bun.Terminal green cluster
 
@@ -709,6 +710,18 @@ The bounded three-job selector covered readable and writable invalid chunks,
 writable finished state, end-of-stream handling, and Duplex end behavior. All
 **5/5 files passed**, with **0 failures and 0 timeouts**. Per-file durations
 were 165–230ms.
+
+No source or upstream fixture change was made. The selector used the existing
+coordinator binary through `tools/integration/node_corpus_runner.py` with
+three bounded jobs and a 30-second per-file timeout. No full corpus or
+workspace-wide test was run; the selector and raw runner output were removed
+after recording the result.
+
+## W175 Node stream state/event green cluster
+
+The bounded three-job selector covered Writable ended and needDrain state,
+Readable data and readable events, and isPaused behavior. All **5/5 files
+passed**, with **0 failures and 0 timeouts**. Per-file durations were 165–200ms.
 
 No source or upstream fixture change was made. The selector used the existing
 coordinator binary through `tools/integration/node_corpus_runner.py` with
