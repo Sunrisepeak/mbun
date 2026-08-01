@@ -262,6 +262,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W312 | Bun util error/file/unsafe/report/fuzzy leaves | 5 | 3/5 green; 9 passed / 155 failed / 164 ran / 30 expects; 0 timeout; no build | retain error-name, file-type, unsafe; park Promise.resolve intrinsic and split reportError owners |
 | W313 | Node console/process/path guard leaves | 5 | 4/5 pass; 1 fail; 0 timeout; no build | retain four process/path guards; park console.dir revoked-Proxy inspection owner |
 | W314 | Bun util mmap/hash/CSRF/file/concat leaves | 5 | 4/5 green; 50 passed / 8 failed / 58 ran / 200 expects; 0 timeout; no build | retain four green util guards; park missing Bun.mmap API owner |
+| W315 | Node process/console lifecycle green cluster | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five process/console lifecycle guards; no source owner |
 
 ## W305 Bun/Deno Event/Performance/URL/crypto leaf probe
 
@@ -486,6 +487,24 @@ workspace-wide build. After the run, resources showed about **44 GiB
 available memory**, about **1.4 MiB free swap**, and about **17 GiB free disk at
 99% usage**. Temporary runner output is cleaned immediately and the next wave
 remains resource-gated.
+
+## W315 Node process/console lifecycle green cluster
+
+The bounded five-job Node selector covered five previously unrecorded files:
+`test-process-kill-null.js`, `test-process-kill-pid.js`,
+`test-process-ref-unref.js`, `test-process-raw-debug.js`, and
+`test-console-async-write-error.js`. The runner measured **5/5 file-level
+passes**, **0 failures**, **0 runner timeouts**, and **233–386 ms** per file.
+The Node runner reports file-level status only; no assertion-level pass total is
+inferred.
+
+All five guards passed and are retained: process kill with a null signal,
+process kill by PID, ref/unref lifecycle, raw debug child-process behavior, and
+console async-write error handling. There were no source or upstream-fixture
+changes, no full corpus, and no workspace-wide build. After the run, resources
+showed about **44 GiB available memory**, about **1.4 MiB free swap**, and about
+**17 GiB free disk at 99% usage**. Temporary runner output is cleaned
+immediately and the next wave remains resource-gated.
 
 ## W304 Node events/path continuation leaf probe
 
