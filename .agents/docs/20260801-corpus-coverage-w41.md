@@ -55,6 +55,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W105 | Node process identity / timing leaves | 5 | 5/5 files pass; no build | retain all five green leaves; no source owner |
 | W106 | Node process exitCode validation leaves | 5 | pre-fix 4/5 pass; post-fix 5/5 pass; issue #57; fresh serialized build | retain all five leaves; keep exitCode owner closed unless a new reproduction reopens it |
 | W107 | Node net low-coupling leaves | 5 | 5/5 files pass; no build | retain all five green net leaves; no source owner |
+| W108 | Bun Node-net constructor/server leaves | 5 | pre 2/5 green, 147 passed / 20 failed / 175 ran / 300 expects; post 2/5 green, 152 passed / 15 failed / 175 ran / 301 expects | issue #58; retain two green leaves, park node-net multi-owner failures and matcher-only gaps |
 
 ## W96 delivered slice
 
@@ -297,6 +298,41 @@ reporting. All **5/5 files passed**; no source owner or issue was opened.
 
 No upstream fixture changed, no full corpus/workspace-wide test was run, and
 the temporary selectors/output were cleaned after verification.
+
+## W108 Bun Node-net constructor and server leaves
+
+W108 used three bounded jobs and the W106 binary. The fresh pre-fix selector
+measured **2/5 files green**, **147 passed**, **20 failed**, **175 ran**, and
+**300 expects**:
+
+- 'blocklist-gc.test.ts' and 'node-net-server.test.ts' were green;
+- 'socketaddress.spec.ts' had five failures from the Bun matcher
+  toThrowWithCode being unavailable in the mbun test harness;
+- 'node-net.test.ts' had nine failures across unref/liveness, flowing state,
+  AbortError, heap statistics, fd adoption, and reset behavior;
+- 'server.spec.ts' had six failures concentrated in constructor/prototype
+  shape and default fields.
+
+Issue [#58](https://github.com/Sunrisepeak/mbun/issues/58) isolated the
+server-shape owner. Commit 1d755dc aligns the callable constructor parent,
+publishes _connections, _unref, _usingWorkers, and highWaterMark, keeps
+connection counts synchronized, and matches the Bun EventEmitter prototype
+descriptor shape.
+
+Post-fix evidence from a fresh serialized build:
+
+- W108 full selector — **2/5 files green**, **152 passed**, **15 failed**,
+  **175 ran**, **301 expects**; five server runtime shape failures were
+  removed.
+- 'server.spec.ts' focused result — **37 passed / 1 failed / 41 ran / 58
+  expects**. The remaining failure is the mbun harness toMatchObject
+  own-property treatment of inherited EventEmitter methods; changing the
+  real constructor identity to satisfy it would diverge from Bun/Node and is
+  parked.
+- W107 Node net regression selector — **5/5 files pass**.
+
+No upstream fixture changed, no full corpus/workspace-wide test was run, and
+temporary selectors/output were cleaned after verification.
 
 ## Delivered slice
 

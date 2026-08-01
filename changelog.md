@@ -5,6 +5,14 @@
 
 ## 2026-08-01
 
+- W108 issue [#58](https://github.com/Sunrisepeak/mbun/issues/58) 推进 Bun
+  Node-net constructor/server shape：pre-fix **2/5 files green、147 passed / 20 failed /
+  175 ran / 300 expects**；1d755dc 修复 callable constructor parent、_connections、
+  _unref、_usingWorkers、highWaterMark 和连接计数，post-fix 为 **2/5 files green、
+  152 passed / 15 failed / 175 ran / 301 expects**。server.spec.ts 从 6 个 shape
+  failures 收敛到 1 个 harness toMatchObject own-property gap；node-net.test.ts 的
+  9 个失败仍跨多个 owner，socketaddress.spec.ts 的 5 个失败是 matcher 缺失。W107
+  Node net guard 保持 **5/5 pass**。未修改上游 fixture，未跑全量 corpus/workspace-wide test。
 - W107 fresh Node net low-coupling leaf probe（3 jobs、复用 W106 fresh binary、无构建）**5/5 files pass**：
   IPv4 classification、argument normalization、Socket constructor、listening state、本地 address/port
   全部通过。未发现 source owner，未修改上游 fixture，未跑全量 corpus/workspace-wide test。
