@@ -305,6 +305,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W356 | Node HTTP/2 TLS servername authority owner | 4 | pre 1/4 pass, 2 fail, 1 timeout; post focused authority file 1/1 pass and selector 2/4 pass, 1 fail, 1 timeout; one release rebuild; W355 regression 5/5 pass | include `options.servername` in the client `:authority`; park unknownProtocol `Duplex` identity and TLS socket timeout as separate owners |
 | W357 | Node HTTP/2 error-code mapping leaf probe | 6 | 6/6 pass; 0 fail; 0 timeout; no build; six fresh files | retain six `ERR_HTTP2_*` mapping guards; inventory entry is stale; no source owner |
 | W358 | Node TLS session-ticket/resumption source fix | 8 Node + 5 Node regression | pre 3/5 pass; post session target 4/5 pass and follow-up 2/3 pass; 2 independent failures parked; 0 timeout; two incremental release builds; W355 regression 5/5 pass | suppress resumed-session event forwarding and stabilize first/offered ticket reporting; park cluster session sharing and HTTPS Agent message owners |
+| W359 | Node TLS hostname/CN diagnostic source fix | 5 Node + 1 Node regression | pre 2/5 pass, 3 fail; post 3/5 pass, 2 independent failures parked; 0 timeout; one serial incremental release build; focused target 1/1 and W355 diagnostic regression 1/1 pass | recover the client leaf from the peer chain when direct lookup is unavailable, restoring Node's CN-specific hostname mismatch message; park HTTPS Agent SNI propagation and TLS SNI error mapping |
 
 ## W305 Bun/Deno Event/Performance/URL/crypto leaf probe
 
@@ -1418,6 +1419,31 @@ file failing. Three additional fresh HTTPS/session files measured **2/3
 passes**; the remaining failure is an HTTPS Agent certificate alt-name message
 owner. The current W355 TLS verification regression remained **5/5 passes**.
 No full corpus or workspace-wide test was run.
+
+## W359 Node TLS hostname/CN diagnostic source fix
+
+The fresh five-file selector initially measured **2/5 passes**, **3 failures**,
+and **0 runner timeouts**. The two passing files covered the direct Agent
+servername path and `checkServerIdentity`; the failing hostname-injection file
+returned Node's generic `is not in the cert's altnames` text even though the
+fixture has a Common Name and no DNS/IP subject-alternative name.
+
+The source owner is `modules/tls/src/openssl.cpp`. During a client-side
+certificate-verification failure, OpenSSL may no longer expose the leaf through
+the direct peer-certificate accessor, while the peer chain still retains it.
+The hostname diagnostic now uses that chain leaf as a read-only fallback and
+extracts the CN only when no DNS/IP SAN is present. No upstream fixture or
+`compat/` assertion changed.
+
+After one serial incremental release rebuild (**3.66 seconds**), the focused
+hostname-injection file measured **1/1 pass** and the complete W359 selector
+measured **3/5 passes**, **2 failures**, and **0 runner timeouts**. The two
+remaining failures are separate owners: HTTPS Agent SNI propagation still
+returns an undefined server name, and the TLS SNI invalid-context case still
+reports OpenSSL's `no shared cipher` text. The W355
+`test-tls-friendly-error-message.js` diagnostic regression measured **1/1
+pass**. Verification stayed bounded to the selector and focused regression;
+no full corpus or workspace-wide test was run.
 
 ## Coverage novelty audit correction after W323
 

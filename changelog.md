@@ -77,6 +77,13 @@
   **4/5 pass**，三文件 follow-up **2/3 pass**，唯一两个失败分别停车在 cluster session
   sharing/OpenSSL code 和 HTTPS Agent alt-name 文案；W355 回归 **5/5 pass**。最终增量
   release rebuild **6.04s**，未修改 `compat/`、未跑全量 corpus。
+- W359 Node TLS hostname/CN diagnostic source fix：五文件基线 **2/5 pass、3 fail、0
+  timeout**；`modules/tls/src/openssl.cpp` 在客户端 hostname verify 失败时从 peer chain
+  恢复 leaf，并在无 DNS/IP SAN 时输出 Node 要求的 CN-specific 文案。串行增量 release
+  rebuild **3.66s** 后，目标文件 **1/1 pass**，完整 selector **3/5 pass、2 fail、0
+  timeout**；HTTPS Agent SNI 传播和 TLS SNI `no shared cipher` 文案保留为两个独立 owner。
+  W355 `test-tls-friendly-error-message.js` 回归 **1/1 pass**。未修改 `compat/`、未跑全量
+  corpus。
 
 ## 2026-08-01
 

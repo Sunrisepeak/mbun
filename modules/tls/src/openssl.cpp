@@ -50,6 +50,68 @@ std::string drain_openssl_errors() {
     return message;
 }
 
+std::string hostname_mismatch_message(SSL* ssl, std::string_view serverName) {
+    X509* ownedPeer {ssl != nullptr ? ::SSL_get1_peer_certificate(ssl) : nullptr};
+    X509* peer {ownedPeer};
+    // On a client-side handshake that stops during certificate verification,
+    // OpenSSL can release the direct peer handle before fail_() inspects the
+    // result. The unowned peer chain still contains the leaf at this point.
+    if (peer == nullptr && ssl != nullptr) {
+        STACK_OF(X509)* chain {::SSL_get_peer_cert_chain(ssl)};
+        if (chain != nullptr && ::sk_X509_num(chain) > 0) {
+            peer = sk_X509_value(chain, 0);
+        }
+    }
+    if (peer == nullptr) {
+        return "Hostname/IP does not match certificate's altnames: Host: "
+             + std::string {serverName} + ". is not in the cert's altnames";
+    }
+
+    bool hasDnsOrIpSan {false};
+    GENERAL_NAMES* names {static_cast<GENERAL_NAMES*>(::X509_get_ext_d2i(
+        peer, NID_subject_alt_name, nullptr, nullptr))};
+    if (names != nullptr) {
+        const int count {::sk_GENERAL_NAME_num(names)};
+        for (int i {0}; i < count; ++i) {
+            const GENERAL_NAME* name {sk_GENERAL_NAME_value(names, i)};
+            if (name != nullptr && (name->type == GEN_DNS || name->type == GEN_IPADD)) {
+                hasDnsOrIpSan = true;
+                break;
+            }
+        }
+        ::GENERAL_NAMES_free(names);
+    }
+
+    std::string commonName {};
+    if (!hasDnsOrIpSan) {
+        X509_NAME* subject {::X509_get_subject_name(peer)};
+        const int index {subject != nullptr
+                             ? ::X509_NAME_get_index_by_NID(subject, NID_commonName, -1)
+                             : -1};
+        if (index >= 0) {
+            X509_NAME_ENTRY* entry {::X509_NAME_get_entry(subject, index)};
+            ASN1_STRING* value {entry != nullptr ? ::X509_NAME_ENTRY_get_data(entry) : nullptr};
+            unsigned char* utf8 {nullptr};
+            const int length {value != nullptr ? ::ASN1_STRING_to_UTF8(&utf8, value) : -1};
+            if (length > 0 && utf8 != nullptr) {
+                commonName.assign(reinterpret_cast<const char*>(utf8),
+                                  static_cast<std::size_t>(length));
+            }
+            ::OPENSSL_free(utf8);
+        }
+    }
+    if (ownedPeer != nullptr) {
+        ::X509_free(ownedPeer);
+    }
+
+    if (!commonName.empty()) {
+        return "Hostname/IP does not match certificate's altnames: Host: "
+             + std::string {serverName} + ". is not cert's CN: " + commonName;
+    }
+    return "Hostname/IP does not match certificate's altnames: Host: "
+         + std::string {serverName} + ". is not in the cert's altnames";
+}
+
 // PEM passphrase callback — node's crypto_util.cc PasswordCallback.
 //
 // It exists to make sure OpenSSL NEVER falls back to its default UI, which reads
@@ -401,8 +463,7 @@ struct TlsChannel::Impl {
             const long vr {::SSL_get_verify_result(ssl_)};
             if (vr == X509_V_ERR_HOSTNAME_MISMATCH || vr == X509_V_ERR_IP_ADDRESS_MISMATCH) {
                 errorCode_ = "ERR_TLS_CERT_ALTNAME_INVALID";
-                error_ = "Hostname/IP does not match certificate's altnames: Host: " +
-                         serverName_ + ". is not in the cert's altnames";
+                error_ = hostname_mismatch_message(ssl_, serverName_);
                 return;
             }
             // A CHAIN verification failure is reported by node as the X509 error
