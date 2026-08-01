@@ -211,6 +211,30 @@ the observed Linux limits; the coordinator owns the only root build.
 | W261 | Node Buffer iterator/read/allocation leaves | 3 | 3/3 pass; 0 fail; 0 timeout; no build | retain Buffer iterator variants, read boundary/error guards, and negative allocation validation; no source owner |
 | W262 | Node crypto Certificate/DH/keygen leaves | 3 | 3/3 pass; 0 fail; 0 timeout; no build | retain Certificate fixture parsing/API, `modp2` Diffie-Hellman group, and empty-passphrase keygen no-prompt guards; no source owner |
 | W263 | Node stream append/backpressure/order leaves | 3 | 3/3 pass; 0 fail; 0 timeout; no build | retain Readable data-time append, backpressure completion, and push ordering; no source owner |
+| W264 | Bun spyMatchers/pretty-format/test.failing leaves | 3 | 1/3 green; 130 passed / 24 failed / 159 ran / 494 expects; 0 timeout; no build | retain pretty-format 1/1; retain spyMatchers 124 pass + 5 todo; park matcher error/argument semantics and test.failing message/timeout owners |
+
+## W264 Bun spyMatchers/pretty-format/test.failing leaf probe
+
+The bounded three-job Bun selector covered `spyMatchers.test.ts`,
+`pretty-format-overflow.test.ts`, and `test-failing.test.ts`. It measured
+**1/3 files green**, with **130 passed / 24 failed / 159 ran / 494 expects / 0
+runner timeouts**. Per-file durations were 197–750ms.
+
+`pretty-format-overflow.test.ts` passed its single test for deeply nested diff
+formatting without a crash. `spyMatchers.test.ts` passed 124 tests, had 21
+failures and 5 todos; failures clustered around expected matcher-error throws,
+optional/trailing-undefined argument semantics, returned-call bookkeeping,
+negative nth validation, and incomplete recursive calls.
+
+`test-failing.test.ts` passed 5/8 tests. Its three failures split into the
+`test.failing` non-function error message, expected-failure output formatting,
+and a timeout fixture using unavailable `jest.setTimeout`. No mixed fix was
+attempted.
+
+No source or upstream fixture change was made. The selector reused the
+coordinator binary through `tools/integration/bun_corpus_runner.py` with
+three bounded jobs, a 30-second per-file timeout, and missing Node modules
+allowed. No full corpus, build, or workspace-wide test was run.
 
 ## W263 Node stream append/backpressure/order plain-script leaf probe
 
