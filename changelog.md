@@ -5,6 +5,7 @@
 
 ## 2026-08-01
 
+- W249 fresh Node process identity/memory plain-script probe（3 jobs、复用现有 coordinator binary、无构建）**3/3 files pass、0 fail、0 timeout**：process.ppid child relation、process.release LTS/version、process.availableMemory numeric shape 全部 clean-exit；Node runner 按 file-level 计数，单文件耗时 200–351ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W248 fresh Node console assignment/error plain-script probe（3 jobs、复用现有 coordinator binary、无构建）**3/3 files pass、0 fail、0 timeout**：global Console primitive replacement/self-assignment、Writable primitive-write error handling 全部 clean-exit；Node runner 按 file-level 计数，单文件耗时 199–201ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W247 fresh Node util.deprecate/inspect plain-script probe（3 jobs、复用现有 coordinator binary、无构建）**3/3 files pass、0 fail、0 timeout**：deprecate code validation、one-time warning/prototype behavior、util.inspect primordial isolation 全部 clean-exit；Node runner 按 file-level 计数，单文件耗时 199–349ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W246 fresh Node console/util plain-script probe（3 jobs、复用现有 coordinator binary、无构建）**3/3 files pass、0 fail、0 timeout**：Console method constructor/name guards、stdio setter routing、util.inherits 多级 prototype/constructor 关系全部 clean-exit；Node runner 按 file-level 计数，单文件耗时 198–199ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
