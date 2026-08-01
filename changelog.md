@@ -5,6 +5,13 @@
 
 ## 2026-08-02
 
+- W382 Bun fake-timer Intl default-format source fix：W381 的唯一 Intl owner 已关闭；
+  `modules/jsc/src/test_runner.cppm` 在 fake-timer 生命周期内包装 configurable 的
+  `Intl.DateTimeFormat.prototype.format` accessor，仅在缺省日期参数时注入 fake Date，并在
+  `useRealTimers()` 恢复原 descriptor。focused timer file 从 **6/7 pass、1 fail、24 expects**
+  到 **7/7 pass、0 fail、27 expects**；完整五文件 Bun selector 为 **3 green、2 no-tests、0
+  failure、49 passed、49 ran、44 expects、0 timeout**。Node fs + child-process 回归 **10/10 pass**；
+  incremental release build **15.23s**，未修改 upstream fixture、未跑全量 corpus。
 - W381 Bun run-mode fake-timers source fix：`test-timers.test.ts` 从 **3/7 pass、4 fail** 推进到
   **6/7 pass、1 fail、24 expects**；`modules/jsc/src/builtins/bootstrap.cppm` 为
   `Bun.jest().jest` 补齐真实 queue-backed fake timers、timer handle、Date rebasing、restore 和

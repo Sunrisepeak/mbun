@@ -328,6 +328,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W379 | Node fs fresh leaves | 5 | 5/5 pass in the 5-job wave and 5/5 in the serial confirmation; no timeout | retain fs read/write parameter coverage; no source owner |
 | W380 | Node child-process stdio fresh leaves | 5 | 5/5 pass in the 5-job wave; no timeout | retain stdio/pipe coverage; fd 1 raw-write remains a separate bounded-buffer owner |
 | W381 | Bun run-mode fake-timers source fix | 5 | pre 2 green / 2 no-tests / 1 failure / 45 passed / 4 failed / 49 ran / 38 expects; post 2 green / 2 no-tests / 1 failure / 48 passed / 1 failed / 49 ran / 41 expects; Node W379/W380 regression 10/10 pass; serial build 59.24s | implement queue-backed `Bun.jest().jest.useFakeTimers()` in run mode; park Intl.DateTimeFormat formatting as the remaining independent failure |
+| W382 | Bun fake-timer Intl default-format source fix | 5 | pre 2 green / 2 no-tests / 1 failure / 48 passed / 1 failed / 49 ran / 41 expects; post 3 green / 2 no-tests / 0 failure / 49 passed / 49 ran / 44 expects; Node regression 10/10 pass; incremental build 15.23s | wrap the configurable `Intl.DateTimeFormat.prototype.format` accessor only while fake timers are active and restore the exact descriptor afterward |
 
 ## W305 Bun/Deno Event/Performance/URL/crypto leaf probe
 
@@ -1727,6 +1728,23 @@ measured **2 green, 2 no-tests, 1 test failure**, with **48 passed, 1 failed,
 Intl date-format assertion. The W379 fs and W380 child-process selectors were
 re-run after this source change and remained **10/10 pass**. No upstream fixture
 changed and no full corpus/workspace-wide test ran.
+
+## W382 Bun fake-timer Intl default-format source fix
+
+W381 left one measured failure: under fake timers,
+`new Intl.DateTimeFormat().format()` read the engine's real wall clock while
+`new Date()` and `Date.now()` read the fake clock. The native
+`Intl.DateTimeFormat.prototype.format` is a configurable accessor, so
+`modules/jsc/src/test_runner.cppm` now wraps it only during fake-timer
+activation, injects an explicit fake `Date` only when the caller omits the
+value, and restores the original descriptor during `useRealTimers()`.
+
+The focused timer file moved from **6/7 pass, 1 failure, 24 expects** to
+**7/7 pass, 0 failure, 27 expects**. After an incremental release build
+(**15.23s**), the full five-file Bun selector measured **3 green, 2 no-tests,
+0 failure**, with **49 passed, 49 ran, 44 expects, and 0 runner timeout**.
+The W379/W380 Node fs and child-process regression selector remained **10/10
+pass**. No upstream fixture changed and no full corpus/workspace-wide test ran.
 
 ## Coverage novelty audit correction after W323
 

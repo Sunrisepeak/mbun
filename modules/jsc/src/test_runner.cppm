@@ -1170,7 +1170,8 @@ inline constexpr std::string_view HARNESS = R"JS(
   // performance.now() reports — FakeTimers.rs CURRENT_TIME.offset_raw starts at
   // Timespec::EPOCH); `FT.dateOffset` is the wall-clock base so that
   // Date.now() === FT.dateOffset + FT.now (CurrentTime::set's date_now_offset).
-  const FT = { on: false, now: 0, dateOffset: 0, seq: 0, queue: [], saved: null, savedPerfNow: null };
+  const FT = { on: false, now: 0, dateOffset: 0, seq: 0, queue: [], saved: null, savedPerfNow: null,
+    savedIntlProto: null, savedIntlFormat: null };
   // Mirror the fake clock onto the Date override installed above.
   function ftSync() { S.sysTime = FT.dateOffset + FT.now; }
   // FakeTimers.rs:234-242 error_unless_fake_timers — every accessor except
@@ -1252,6 +1253,26 @@ inline constexpr std::string_view HARNESS = R"JS(
       FT.savedPerfNow = perf.now;
       perf.now = function () { return FT.now; };
     }
+    // Intl.DateTimeFormat.prototype.format is an accessor whose native getter
+    // asks the engine for the current wall clock when called without a value.
+    // A fake Date wrapper does not alter that native clock, so Bun's
+    // `new Intl.DateTimeFormat().format()` would otherwise see real time while
+    // `new Date()` sees the fake time. Wrap only the accessor for the fake-timer
+    // lifetime and pass an explicit fake Date to preserve locale/options logic.
+    const intlProto = G.Intl && G.Intl.DateTimeFormat && G.Intl.DateTimeFormat.prototype;
+    const intlDesc = intlProto && Object.getOwnPropertyDescriptor(intlProto, "format");
+    if (intlProto && intlDesc && typeof intlDesc.get === "function" && intlDesc.configurable) {
+      FT.savedIntlProto = intlProto;
+      FT.savedIntlFormat = intlDesc;
+      Object.defineProperty(intlProto, "format", {
+        configurable: intlDesc.configurable,
+        enumerable: intlDesc.enumerable,
+        get() {
+          const nativeFormat = intlDesc.get.call(this);
+          return (value) => nativeFormat(value === undefined ? new Date(Date.now()) : value);
+        },
+      });
+    }
   }
   function ftUninstall() {
     if (!FT.on) return;
@@ -1264,6 +1285,11 @@ inline constexpr std::string_view HARNESS = R"JS(
     if (FT.savedPerfNow) {
       try { G.performance.now = FT.savedPerfNow; } catch (e) {}
       FT.savedPerfNow = null;
+    }
+    if (FT.savedIntlProto && FT.savedIntlFormat) {
+      Object.defineProperty(FT.savedIntlProto, "format", FT.savedIntlFormat);
+      FT.savedIntlProto = null;
+      FT.savedIntlFormat = null;
     }
     FT.queue = [];
   }
