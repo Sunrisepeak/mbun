@@ -754,7 +754,7 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
         const rawGet = desc.get ? desc.get.bind(proc) : () => store;
         const rawSet = desc.set ? desc.set.bind(proc) : (v) => { store = v; };
         Object.defineProperty(proc, "exitCode", {
-          configurable: true,
+          configurable: false,
           enumerable: true,
           get() { return rawGet(); },
           set(code) {
@@ -2200,6 +2200,27 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
   // there would have been undone by the process.send that __mbunSetupIpcChild
   // has only just assigned.
   try { if (typeof globalThis.__mbunWorkerDisableProcessOps === "function") globalThis.__mbunWorkerDisableProcessOps(); } catch (e) {}
+
+  // JSC's generic non-configurable-property error omits the property and
+  // receiver. Node exposes the process object with a stable diagnostic for
+  // deleting exitCode, so keep the native descriptor invariant above while
+  // formatting only this process-specific delete through a proxy.
+  try {
+    if (G.__mbunDialect === "node" && G.process && !G.__mbunProcessDeleteCompat) {
+      const processTarget = G.process;
+      G.process = new Proxy(processTarget, {
+        deleteProperty(target, property) {
+          if (property === "exitCode") {
+            throw new TypeError("Cannot delete property 'exitCode' of #<process>");
+          }
+          return Reflect.deleteProperty(target, property);
+        },
+      });
+      Object.defineProperty(G, "__mbunProcessDeleteCompat", {
+        value: true, writable: false, configurable: true, enumerable: false,
+      });
+    }
+  } catch (e) {}
 })();
 )JS";
 
