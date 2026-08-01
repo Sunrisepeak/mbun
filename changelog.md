@@ -5,6 +5,13 @@
 
 ## 2026-08-02
 
+- W393 Node TLS `allowHalfOpen` transport source fix：修复 `tls.connect({ allowHalfOpen: true })`
+  的隐藏 plaintext transport 硬编码为 false，导致收到对端 FIN 后提前关闭写侧、丢失 deferred
+  `Bye`。focused 文件从 **1/1 failure** 到 **1/1 pass**；五文件 TLS selector 从 W375 的
+  **2/5 pass、3 fail** 提升到 **3/5 pass、2 fail、0 timeout**，剩余 keepAlive/noDelay teardown
+  与 raw TLS close-order 保持独立 owner；Bun fake-timer 五文件回归 **5/5 green、8 passed、0
+  failed、8 ran、10 expects**；serial release build **57.70s**。未修改 upstream fixture、未跑
+  全量 corpus。
 - W392 Node `PerformanceObserver` forced-GC entry source fix：`globalThis.gc()` 完成真实
   `Bun.gc(true)` 后，在存在 GC observer 时发布 Node 形状的 forced major-GC entry，并支持
   `gc` observation selector。focused GC 文件 **1/1 pass**；五文件 performance selector 从

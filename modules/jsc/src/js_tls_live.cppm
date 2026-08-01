@@ -1156,7 +1156,7 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
     // The plaintext edge delegates every read/write to the transport, so the
     // caller's highWaterMark has to reach the transport too — the TLSSocket
     // aliases readableHighWaterMark/writableHighWaterMark onto it.
-    const transport = new NetSocket({ allowHalfOpen: false, highWaterMark: opts.highWaterMark });
+    const transport = new NetSocket({ allowHalfOpen: !!opts.allowHalfOpen, highWaterMark: opts.highWaterMark });
     const tlsOptsHwm = Object.assign({ highWaterMark: opts.highWaterMark }, tlsOpts);
     const tlsSock = new TLSSocket(transport, tlsOptsHwm);
     // node stores the resolved connect options on the socket (kConnectOptions);

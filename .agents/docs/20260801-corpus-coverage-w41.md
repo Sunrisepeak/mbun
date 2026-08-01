@@ -339,6 +339,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W390 | Node `PerformanceObserver.observe()` validation source fix | 5 | target pre 1/1 fail on invalid-argument message; post target 1/1 pass; performance selector 3/5 pass, 2 fail, 0 timeout; Bun W387 regression 5/5 green; serial build 59.06s | validate the options object, required observation selector, entryTypes array, and mutually exclusive selectors; park GC callback and milestone-order owners |
 | W391 | Node `performance.nodeTiming` milestone source fix | 5 | target pre 1/1 fail; post target 1/1 pass; performance selector 4/5 pass, 1 fail, 0 timeout; W390 observer and W389 uvMetricsInfo remain green; Bun regression 5/5 green; serial build 58.82s | provide ordered startup milestones, dynamic loop start/exit, duration, idleTime, and constant startTime; park the remaining GC callback owner |
 | W392 | Node `PerformanceObserver` forced-GC entry source fix | 5 | target 1/1 pass; performance selector 5/5 pass, 0 fail, 0 timeout; Bun fake-timer regression 5/5 green, 8 passed / 0 failed / 8 ran / 10 expects; serial release build 58.98s | publish a forced major-GC entry after the real `Bun.gc(true)` path and accept `gc` observation; no upstream fixture change |
+| W393 | Node TLS `allowHalfOpen` transport source fix | 5 | pre 2/5 pass + 3 fail; target 1/1 pass; post selector 3/5 pass + 2 fail, 0 timeout; Bun fake-timer regression 5/5 green, 8 passed / 0 failed / 8 ran / 10 expects; serial release build 57.70s | propagate `tls.connect({ allowHalfOpen })` to its hidden transport; park keepAlive/noDelay teardown and raw TLS close-order owners separately |
 
 ## W305 Bun/Deno Event/Performance/URL/crypto leaf probe
 
@@ -1835,6 +1836,22 @@ milestone-order owners remain. The five-file Bun fake-timer regression stayed
 **5/5 green, 8 passed, 0 failed, 8 ran, 10 expects** after the serialized release
 build (**59.06s**). No upstream fixture changed and no full corpus/workspace-wide
 test ran.
+
+## W393 Node TLS `allowHalfOpen` transport source fix
+
+The W375 TLS revalidation still had three failures. The half-open failure was
+isolated to the hidden plaintext transport created by `tls.connect()`: it was
+hard-coded with `allowHalfOpen: false`, and `TLSSocket` inherited that value
+from its adopted transport even when the caller requested `true`.
+
+The transport now receives the caller's boolean option. The focused
+`allowHalfOpen` file moved from **1/1 failure** to **1/1 pass**. The five-file
+TLS selector moved from **2/5 pass, 3 fail** to **3/5 pass, 2 fail, 0
+timeout**; the remaining two failures are independently retained as the
+keepAlive/noDelay teardown and raw TLS close-order owners. The five-file Bun
+fake-timer regression remained **5/5 green, 8 passed, 0 failed, 8 ran, 10
+expects**. The serialized release build took **57.70s**. No upstream fixture
+changed and no full corpus/workspace-wide test ran.
 
 ## W392 Node `PerformanceObserver` forced-GC entry source fix
 
