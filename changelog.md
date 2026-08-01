@@ -5,6 +5,12 @@
 
 ## 2026-08-01
 
+- W106 issue [#57](https://github.com/Sunrisepeak/mbun/issues/57) 修复 Node
+  process.exitCode contract：pre-fix 五文件 selector 为 **4/5 pass**；92dd963
+  让 exitCode 不可配置、为 Node 方言补精确的删除错误文本，并使 invalid
+  process.exit(code) 子进程以状态 1 退出。fresh serialized build 后 W106 为
+  **5/5 files pass**；W105 进程身份/计时回归保持 **5/5 pass**。未修改上游 fixture，未跑全量
+  corpus/workspace-wide test。
 - W105 fresh Node process identity/timing leaf probe（5 jobs、复用 W101 binary、无构建）**5/5 files pass**：`argv[0]`、
   `uptime`、symlinked `execPath`、`ppid`、Linux `O_NOATIME` 全部通过。未发现 source owner，未修改上游 fixture，
   未跑全量 corpus。

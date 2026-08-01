@@ -53,6 +53,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W103 | Bun `node:module` / SourceMap leaves | 5 | 3/5 files green; 44 passed / 10 failed / 54 ran / 142 expects; no build | retain three green leaves; park split CJS-loader and malformed-sourcemap diagnostic owners |
 | W104 | Bun Node process / stdio leaves | 5 | 5/5 files green; 39 passed / 0 failed / 39 ran / 93 expects; no build | retain all five green leaves; no source owner |
 | W105 | Node process identity / timing leaves | 5 | 5/5 files pass; no build | retain all five green leaves; no source owner |
+| W106 | Node process exitCode validation leaves | 5 | pre-fix 4/5 pass; post-fix 5/5 pass; issue #57; fresh serialized build | retain all five leaves; keep exitCode owner closed unless a new reproduction reopens it |
 
 ## W96 delivered slice
 
@@ -260,6 +261,31 @@ All **5/5 files passed** with no source owner or upstream fixture change.
 
 No build or full corpus/workspace-wide test was run, and the temporary
 selector/output were cleaned after verification.
+
+## W106 Node process exitCode validation leaves
+
+W106 selected five Linux-focused process leaves: high-resolution time,
+'process.exitCode' validation and deletion, environment-key deletion, and
+timer lifetime tracking. The pre-fix bounded probe was **4/5 files pass**;
+the only visible failure was the strict deletion assertion for
+'process.exitCode'.
+
+Issue [#57](https://github.com/Sunrisepeak/mbun/issues/57) isolated the owner.
+The process slot was wrapped with Node's validation setter but remained
+configurable, and JSC's generic non-configurable deletion diagnostic omitted
+the property and receiver. The fix in commit 92dd963 makes the slot
+non-configurable, formats only the Node process deletion through a narrow
+proxy, and preserves invalid 'process.exit(code)' as status 1 instead of
+falling through to status 0.
+
+Evidence from the fresh coordinator build:
+
+- bash tools/integration/build_or_die.sh — pass.
+- W106 rerun with three bounded jobs — **5/5 files pass**.
+- W105 adjacent Node process identity/timing guard — **5/5 files pass**.
+
+No upstream fixture changed, no full corpus/workspace-wide test was run, and
+temporary selectors/output were cleaned after verification.
 
 ## Delivered slice
 
