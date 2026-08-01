@@ -5,6 +5,7 @@
 
 ## 2026-08-01
 
+- W113 fresh Node process environment/runtime probe（3 jobs、复用 W108 fresh binary、无构建）**4/5 files pass、1 fail、0 timeout**：allowed flags、execve 参数校验、thread CPU usage、no-deprecation 通过；`test-process-env-tz.js` 在 1 job/60s 隔离复测仍失败。根因收敛为同一 `Date` 实例首次 `toString()` 后的 JSC 本地 Gregorian 缓存只按毫秒复用，TZ 名称更新但 offset 仍旧；issue [#59](https://github.com/Sunrisepeak/mbun/issues/59) 已创建。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W112 fresh Node child_process adjacent-contract probe（3 jobs、复用 W108 fresh binary、无构建）**5/5 files pass、0 fail、0 timeout**：`execFile`、exec 环境、stdio 形状、IPC 参数类型错误、kill 生命周期全部通过；单文件耗时 231–666ms。未修改 source/fixture，IPC backlog/handle 和 signal-race owners 未混入，未跑全量 corpus/workspace-wide test。
 - W111 fresh Node child_process basic-contract probe（3 jobs、复用 W108 fresh binary、无构建）**5/5 files pass、0 fail、0 timeout**：cwd、exec encoding、exit code、spawn type validation、stdio validation 全部通过；单文件耗时 215–850ms。未修改 source/fixture，fork/IPC、large-buffer、timeout/kill 等高耦合 owners 未混入，未跑全量 corpus/workspace-wide test。
 - W110 fresh Bun util low-coupling probe（3 jobs、复用 W108 fresh binary、无构建）**5/5 files green、57 passed、0 failed、57 ran、966 expects**：`escapeHTML`、`escapeRegExp`、`fileURL`、`hash`、`sleepSync` 全部通过。未修改 source/fixture，未跑全量 corpus/workspace-wide test。

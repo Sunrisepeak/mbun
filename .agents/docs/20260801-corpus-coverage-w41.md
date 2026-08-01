@@ -60,6 +60,30 @@ the observed Linux limits; the coordinator owns the only root build.
 | W110 | Bun util low-coupling leaves | 5 | 5/5 green; 57 passed / 0 failed / 57 ran / 966 expects; no build | retain all five green leaves; no source owner |
 | W111 | Node child_process basic contract leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five green leaves; keep fork/IPC and timeout/kill owners separate |
 | W112 | Node child_process adjacent contract leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five green leaves; park IPC backlog/handle and signal-race owners |
+| W113 | Node process environment/runtime leaves | 5 | 4/5 pass; 1 fail; 0 timeout; TZ failure reproduced at 1 job / 60s | issue #59; retain four green leaves, park existing-Date timezone cache invalidation |
+
+## W113 process feature triage
+
+The bounded three-job selector covered `test-process-env-tz.js`,
+`test-process-env-allowed-flags.js`, `test-process-execve-validation.js`,
+`test-process-threadCpuUsage-main-thread.js`, and
+`test-process-no-deprecation.js`. Four files passed; the only failure was
+`test-process-env-tz.js`. Per-file durations were 165–265 ms, with no timeout.
+
+An isolated one-job/60-second rerun reproduced the same failure. Node changes
+one existing `Date` from `Europe/Amsterdam` (`+0200`) to `Europe/London`
+(`+0100`) and then `Etc/UTC` (`+0000`). mbun changes the display names but keeps
+the first `+0200` offset. The setter reaches `__mbunProcNative.setTimeZone` and
+the VM DateCache reset, but the existing JSC Date instance reuses its cached
+local Gregorian value keyed only by milliseconds after the first
+`toString()`. This identifies cache invalidation as the owner, not host TZ
+variance or missing environment propagation.
+
+Issue [#59](https://github.com/Sunrisepeak/mbun/issues/59) records the sanitized
+reproduction and source owner. No source or upstream fixture change was made;
+the four green process leaves are retained, and the TZ owner is parked until a
+minimal existing-Date invalidation design is verified. No full corpus or
+workspace-wide test was run.
 
 ## W96 delivered slice
 
