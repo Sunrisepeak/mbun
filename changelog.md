@@ -5,6 +5,15 @@
 
 ## 2026-08-02
 
+- W378 Bun event-loop/timer/perf + stderr fd source fix：初始五文件 bounded selector 为 **2
+  green、1 no-tests、2 test-failure**，共 **45 passed、5 failed、50 ran、36 expects、0 timeout**。
+  失败的 socket-wait fixture 已定位到 `fs.writeSync(2, ...)` 被 raw fd fallback 错误拒绝；
+  `modules/jsc/src/runtime/io_fd_raw.inc` 现允许有效 POSIX fd 2，保持 fd 0/1 的 Bun.spawn
+  未读管道增长 owner 独立停车。serial release build **58.05s** 后，同一五文件波次为 **2
+  green、2 no-tests、1 test-failure**，**45 passed、4 failed、49 ran、38 expects、0 timeout**；
+  socket-wait 文件可输出 timer marker 并 clean-exit，`spawn-pipe-leak` 独立确认 **1/1 green、
+  3 passed、0 failed、3 ran**。剩余四个 fake-timers assertion 属于 run-mode `jest.useFakeTimers`
+  owner；未修改 upstream fixture、未跑全量 corpus。
 - W377 Node ResourceTiming buffer source fix：ResourceTiming 目标从 **0/1** 推进到 **1/1 pass**；
   五文件 performance selector 从 **2/5 pass、3 fail、0 timeout** 提升到 **3/5 pass、2 fail、0
   timeout**。`modules/jsc/src/builtins/node_perf.cppm` 补齐 bounded resource buffer、

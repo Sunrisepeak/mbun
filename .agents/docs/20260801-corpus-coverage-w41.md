@@ -324,6 +324,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W375 | Node TLS socket option/close triage | 5 | 2/5 pass; 3 fail; 0 timeout; serial confirmation 3/3 fail; no build | retain HWM and socket half-open guards; park TLS data-half-close, keepalive/noDelay reset, and raw net/TLS close-order owners separately |
 | W376 | Node performance timeline source fix | 5 | pre 1/5 pass + 4 fail; post 2/5 pass + 3 fail; timeline target 1/1 pass serially; W375 TLS regression 2/5 pass + 3 fail; three serial release builds | sort performance entries by `startTime` and align missing-argument TypeError shape; park ResourceTiming callback, uvMetricsInfo, and GC observer owners separately |
 | W377 | Node ResourceTiming buffer source fix | 5 | pre 2/5 pass + 3 fail; post 3/5 pass + 2 fail; ResourceTiming target 1/1 serially; W375 TLS regression 2/5 pass + 3 fail; one serial release build (59.24s) | implement bounded resource entries, overflow event, resize, clear, and promotion semantics; park uvMetricsInfo and GC observer owners separately |
+| W378 | Bun event-loop/timer/perf + stderr fd source fix | 5 | pre 2 green / 1 no-tests / 2 failures / 45 passed / 5 failed / 50 ran; post 2 green / 2 no-tests / 1 failure / 45 passed / 4 failed / 49 ran / 38 expects; 0 timeout; serial build 58.05s | allow valid POSIX fd 2 through the raw fs read/write fallback; retain fd 0/1 pipe-buffer owner and run-mode fake-timers owner separately |
 
 ## W305 Bun/Deno Event/Performance/URL/crypto leaf probe
 
@@ -1658,6 +1659,32 @@ confirmation**. Remaining failures are `uvMetricsInfo()` and GC observer
 owners; W375 TLS remained **2/5 pass, 3 failures, 0 timeout**.
 
 No upstream fixture changed and no full corpus/workspace-wide test ran.
+
+## W378 Bun event-loop/timer/perf leaf probe
+
+The pre-fix five-file Bun selector used **5 bounded jobs** with the standard 4G
+per-file memory profile and measured **2 green files, 1 no-tests file, and 2
+test failures**, with **45 passed, 5 failed, 50 ran, 36 expects, and 0 runner
+timeout**. `histogram.test.ts` passed **38/38** tests and
+`spawnsync-isolated-event-loop.test.ts` passed **4/4** tests with **15 expect**
+calls. `keep-event-loop-alive.js` executed zero tests and is excluded from
+green coverage.
+
+The socket-wait fixture's native setup failure was isolated to
+`fs.writeSync(2, ...)`: the raw descriptor fallback rejected all stdio fds, so
+the test's timer marker was reported as `EBADF` before the timer result could be
+observed. `modules/jsc/src/runtime/io_fd_raw.inc` now admits a valid POSIX fd 2
+while retaining fd 0/1 as a separate owner because enabling stdout exposes the
+unbounded unread-pipe buffering path covered by `spawn-pipe-leak`.
+
+After a serial release build (**58.05s**), the five-file wave measured **2 green,
+2 no-tests, and 1 test failure**, with **45 passed, 4 failed, 49 ran, 38
+expects, and 0 runner timeout**. The socket-wait file now emits its timer marker
+and exits cleanly (the runner still classifies it as no-tests); a separate
+`spawn-pipe-leak` confirmation remains **1/1 green, 3 passed, 0 failed, 3 ran**.
+The four remaining timer assertions are the independent run-mode
+`jest.useFakeTimers` owner. No upstream fixture changed and no full
+corpus/workspace-wide test ran.
 
 ## Coverage novelty audit correction after W323
 

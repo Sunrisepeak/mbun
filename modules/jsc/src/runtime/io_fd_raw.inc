@@ -17,7 +17,7 @@
 
 // Is `fd` a descriptor that can only be an un-owned OS one?
 //
-// The window is 3 <= fd < 1000, and both bounds are load-bearing.
+// The window is stderr (2), or 3 <= fd < 1000, and both bounds are load-bearing.
 //
 // Upper: virtual fds start AT 1000, and under load (Bun.spawn's 250-process
 // pipe-leak test) the OS descriptor table climbs past 1000 too. Without the cap,
@@ -25,18 +25,19 @@
 // unrelated OS descriptor of the same number instead of the EBADF its caller is
 // waiting for.
 //
-// Lower: stdio (0/1/2) keeps returning EBADF as before. Sending fs.writeSync(1, …)
-// to the raw descriptor is what node does, but it also uncovers an unbounded
-// buffering defect in the Bun.spawn 'pipe' reader: a child that pushes 8 MiB into
-// an unread pipe grew the parent past 1.3 GB until fork() failed (compat/bun
-// spawn-pipe-leak passed only because its child died on the EBADF). That reader is
-// a separate job; until it is fixed, stdio is left exactly as it was.
+// Lower: stderr (2) must be usable by node diagnostics and test fixtures. stdout
+// and stdin remain deferred: sending fs.writeSync(1, …) through the raw descriptor
+// also uncovers an unbounded buffering defect in the Bun.spawn 'pipe' reader: a
+// child that pushes 8 MiB into an unread pipe grew the parent past 1.3 GB until
+// fork() failed (compat/bun spawn-pipe-leak passed only because its child died on
+// EBADF). That reader is a separate job; keep fd 1/0 closed to this fallback until
+// its buffering is bounded.
 bool fd_raw_eligible(int fd) {
 #if defined(_WIN32)
     (void)fd;
     return false;
 #else
-    return fd >= 3 && fd < 1000 && ::fcntl(fd, F_GETFD) != -1;
+    return (fd == 2 || (fd >= 3 && fd < 1000)) && ::fcntl(fd, F_GETFD) != -1;
 #endif
 }
 
