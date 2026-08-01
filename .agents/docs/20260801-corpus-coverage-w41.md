@@ -35,6 +35,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W85 | Bun os/string_decoder | 5 | pre 3 green + 1 skipped; post 4 green + 1 skipped; 149 passed / 0 failed / 150 ran | issue #51; dialect-aware Buffer ceiling |
 | W86 | Bun Buffer completion guards | 5 | 4/5 green; 25 passed / 6 failed / 31 ran | park concat multi-owner; preserve four green guards |
 | W87 | Bun Node-fs leaves | 5 | 5/5 green; 46 passed / 0 failed / 70 ran / 92 expects | fresh confirmation; no source owner |
+| W88 | Bun Node-fs directory/Stats leaves | 5 | 5/5 green; 52 passed / 0 failed / 55 ran / 138 expects | fresh confirmation of narrow fs leaves; no source owner |
 
 ## Delivered slice
 
@@ -1036,6 +1037,22 @@ surface on Linux:
   them as current facts. All five remain green, no single source owner surfaced,
   and no issue or patch was needed. No upstream fixture changes, no full corpus,
   and no workspace-wide build were performed.
+
+### W88 Bun Node-fs directory/Stats leaf confirmation
+
+- A fresh five-file Bun filesystem probe reused the W85 binary with **5 bounded
+  jobs** and no build. The dependency gate required the already-authorized
+  missing-dependency measurement mode; this was a runner precondition, not a
+  test failure. The probe measured **5/5 files green, 52 passed, 0 failed, 55
+  ran, 138 expects**.
+- `dir` was **23/23**, `fs-mkdir` **21/24**, async-iterator `writeFile` **2/2**,
+  Stats constructor **3/3**, and Stats truncate **3/3**. This refreshes the
+  older W70 filesystem result with current bounded evidence; no single source
+  owner surfaced, no issue or patch was needed, and no upstream fixture was
+  changed.
+- No full corpus or workspace-wide build was performed. The next route remains
+  a fresh one-owner Bun/Node leaf, with 3–5 bounded lanes while swap and disk
+  headroom remain low.
 
 ### W59 Node buffer leaf sample
 

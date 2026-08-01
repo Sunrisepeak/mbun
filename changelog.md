@@ -5,6 +5,10 @@
 
 ## 2026-08-01
 
+- W88 fresh Bun Node-fs directory/Stats leaf probe（5 jobs、复用 W85 binary、无构建）确认 **5/5
+  files green、52 passed、0 failed、55 ran、138 expects**：`dir` **23/23**、`fs-mkdir` **21/24**、
+  async-iterator writeFile **2/2**、Stats constructor **3/3**、Stats truncate **3/3**。这是对旧
+  W70 记录的 fresh bounded refresh，未发现单一 source owner；未修改上游 fixture，未跑全量 corpus。
 - W87 fresh Bun Node-fs leaf probe（5 jobs、复用当前 Linux binary、无构建）确认 **5/5 files
   green、46 passed、0 failed、70 ran、92 expects**：fs.glob **27/27**、fs-path-length
   **11/11**、Linux birthtime **5/5**、cp symlink target **2/2**、recursive readdir error leak
