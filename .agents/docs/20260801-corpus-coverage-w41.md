@@ -94,6 +94,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W144 | Bun Web console basic leaves | 4 | 2/4 green; 3 passed / 7 failed / 10 ran / 15 expects; 0 timeout; no build | retain UTF-16/recursive; park console.log and console.timeLog multi-owner formatting gaps |
 | W145 | Node timers adjacent leaves | 5 | 4/5 pass; 1 fail; 0 timeout; no build | retain four leaves; park non-integer delay callback-order owner |
 | W146 | Bun Web Request leaves | 3 | 2/3 green; 14 passed / 6 failed / 20 ran / 24 expects; 0 timeout; no build | retain request-subclass; retain clone-leak only as slow stress; park request-method heapStats NaN owner |
+| W147 | Node path adjacent pure leaves | 3 | 3/3 pass; 0 fail; 0 timeout; no build | retain join/normalize/relative; no source owner |
 
 ## W133 Bun.Terminal green cluster
 
@@ -325,6 +326,18 @@ coordinator binary through `tools/integration/bun_corpus_runner.py` with three
 bounded jobs, a 30-second per-file timeout, and missing Node modules allowed.
 No full corpus or workspace-wide test was run; the selector and raw runner
 output were removed after recording the result.
+
+## W147 Node path adjacent green cluster
+
+The bounded three-job selector covered path join, normalize, and relative
+resolution semantics. All **3/3 files passed**, with **0 failures and 0
+timeouts**. Per-file durations were 198–199ms.
+
+No source or upstream fixture change was made. The selector used the existing
+coordinator binary through `tools/integration/node_corpus_runner.py` with
+three bounded jobs and a 30-second per-file timeout. No full corpus or
+workspace-wide test was run; the selector and raw runner output were removed
+after recording the result.
 
 ## W132 Node VM and WebStreams owner split
 
