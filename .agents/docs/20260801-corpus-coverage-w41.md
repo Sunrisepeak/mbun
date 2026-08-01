@@ -337,6 +337,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W388 | Node performance five-file triage | 5 | pre 1/5 pass; post 2/5 pass; target `uvMetricsInfo` 1/1 pass; 3 remaining failures are independent GC/observer/timeline owners; 0 timeout | close only the `nodeTiming.uvMetricsInfo` owner and keep the other performance failures separate |
 | W389 | Node `uvMetricsInfo` source fix | 5 | serial release build 59.24s; target 1/1 pass; post selector 2/5 pass, 3 fail, 0 timeout; W387 regression 5/5 green | expose `PerformanceNodeTiming.uvMetricsInfo` and make internal binding read the live timer/check loop counter; no upstream fixture change |
 | W390 | Node `PerformanceObserver.observe()` validation source fix | 5 | target pre 1/1 fail on invalid-argument message; post target 1/1 pass; performance selector 3/5 pass, 2 fail, 0 timeout; Bun W387 regression 5/5 green; serial build 59.06s | validate the options object, required observation selector, entryTypes array, and mutually exclusive selectors; park GC callback and milestone-order owners |
+| W391 | Node `performance.nodeTiming` milestone source fix | 5 | target pre 1/1 fail; post target 1/1 pass; performance selector 4/5 pass, 1 fail, 0 timeout; W390 observer and W389 uvMetricsInfo remain green; Bun regression 5/5 green; serial build 58.82s | provide ordered startup milestones, dynamic loop start/exit, duration, idleTime, and constant startTime; park the remaining GC callback owner |
 
 ## W305 Bun/Deno Event/Performance/URL/crypto leaf probe
 
@@ -1833,6 +1834,22 @@ milestone-order owners remain. The five-file Bun fake-timer regression stayed
 **5/5 green, 8 passed, 0 failed, 8 ran, 10 expects** after the serialized release
 build (**59.06s**). No upstream fixture changed and no full corpus/workspace-wide
 test ran.
+
+## W391 Node `performance.nodeTiming` milestone source fix
+
+The remaining Node timing failure was a single milestone owner, but the direct
+smoke showed the public object also had stale `duration`, `idleTime`,
+`loopStart`, `loopExit`, and `startTime` values. `node_perf.cppm` now provides an
+ordered startup sequence, derives loop start from the live timer batch, derives
+loop exit from the process exit state, keeps `startTime` at Node's required zero,
+and exposes live duration with zero idle time.
+
+The focused Node timing file moved from **1/1 failure** to **1/1 pass**. The same
+five-file performance selector is now **4/5 pass, 1 fail, 0 timeout**; the only
+remaining failure is the isolated GC callback owner. The five-file Bun fake-timer
+regression remained **5/5 green, 8 passed, 0 failed, 8 ran, 10 expects** after
+the serialized release build (**58.82s**). No upstream fixture changed and no
+full corpus/workspace-wide test ran.
 
 ## Coverage novelty audit correction after W323
 

@@ -5,6 +5,11 @@
 
 ## 2026-08-02
 
+- W391 Node `performance.nodeTiming` milestone source fix：`node_perf.cppm` 补齐有序 startup
+  milestones、动态 loop start/exit、live duration、idleTime=0 和 Node 要求的 startTime=0。focused
+  timing 文件从 **1/1 failure** 到 **1/1 pass**；五文件 performance selector 为 **4/5 pass、1 fail、0
+  timeout**，唯一剩余是 GC callback owner。Bun fake-timer 回归保持 **5/5 green、8 passed、0 failed、8
+  ran、10 expects**；serial release build **58.82s**，未修改 upstream fixture、未跑全量 corpus。
 - W390 Node `PerformanceObserver.observe()` validation source fix：`node_perf.cppm` 补齐 options
   object、`entryTypes`/`type` 必选、数组类型和互斥校验，并补上 Node received-value 错误文案。
   focused Node 文件从 **1/1 failure** 到 **1/1 pass**；五文件 performance selector 为 **3/5 pass、2

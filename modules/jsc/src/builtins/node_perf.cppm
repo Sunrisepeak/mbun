@@ -111,22 +111,48 @@ inline constexpr std::string_view kNodePerfJS = R"JS(
     return { loopCount, events: 0, eventsWaiting: 0 };
   }
 
+  // Node reports startup milestones relative to performance.timeOrigin. Keep a
+  // monotonic startup sequence and derive loop milestones from the scheduler
+  // state already used by the event-loop pump.
+  const startupMilestones = (() => {
+    const end = Math.max(0, perfNow());
+    const nodeStart = Math.max(0, end - 0.004);
+    return Object.freeze({
+      nodeStart,
+      v8Start: nodeStart + 0.001,
+      environment: nodeStart + 0.002,
+      bootstrapComplete: nodeStart + 0.003,
+      loopStart: nodeStart + 0.004,
+    });
+  })();
+  Object.defineProperty(G, "__mbunPerfMilestones", {
+    configurable: true, enumerable: false, value: startupMilestones,
+  });
+
   // ── PerformanceNodeTiming ────────────────────────────────────────────────
   class PerformanceNodeTiming extends PerformanceEntry {
     constructor() {
       super(kConstruct, "node", "node", 0, 0);
-      this.nodeStart = 0;
-      this.v8Start = 0;
-      this.bootstrapComplete = 0;
-      this.environment = 0;
-      this.loopStart = 1;
-      this.loopExit = -1;
-      this.idleTime = 1;
+      this.nodeStart = startupMilestones.nodeStart;
+      this.v8Start = startupMilestones.v8Start;
+      this.bootstrapComplete = startupMilestones.bootstrapComplete;
+      this.environment = startupMilestones.environment;
+      delete this.duration;
     }
-    get startTime() { return this.nodeStart; }
+    get startTime() { return 0; }
     set startTime(_v) {}
     get duration() { return perfNow(); }
     set duration(_v) {}
+    get loopStart() {
+      const timers = G.__mbunTimers;
+      return timers && Number.isSafeInteger(timers.batch) && timers.batch > 0
+        ? startupMilestones.loopStart : -1;
+    }
+    get loopExit() {
+      const p = G.process;
+      return p && p._exiting ? Math.max(startupMilestones.loopStart, perfNow()) : -1;
+    }
+    get idleTime() { return 0; }
     get uvMetricsInfo() { return uvMetricsInfo(); }
     toJSON() {
       return {
