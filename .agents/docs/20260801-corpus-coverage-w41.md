@@ -168,6 +168,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W218 | Node console plain-script leaves | 3 | 3/3 pass; 0 fail; 0 timeout; no build | retain console replacement/recovery, primitive throw output, and inspect-toString guards; no source owner |
 | W219 | Node Buffer plain-script leaves | 3 | 3/3 pass; 0 fail; 0 timeout; no build | retain isUtf8 validation, byteLength encoding/type boundaries, and compare offset/range guards; no source owner |
 | W220 | Bun stack/stdio/HTTP leaves | 3 | 21 passed / 29 failed / 50 ran / 114 expects; 0 runner timeout; no build | retain HTTP proxy-style normal paths; park CR/LF host validation, stdio write-after-end pipe/file state, and stack/frame/internal-hook/lazy-error owners |
+| W221 | Node Buffer continuation leaves | 3 | 3/3 pass; 0 fail; 0 timeout; no build | retain bad-hex handling, BigInt64/BigUInt64 endian/range, and ArrayBuffer sharing/offset/length guards; no source owner |
 
 ## W133 Bun.Terminal green cluster
 
@@ -204,6 +205,20 @@ the existing coordinator binary through `tools/integration/node_corpus_runner.py
 with three bounded jobs and a 30-second per-file timeout. No full corpus or
 workspace-wide test was run; the selector and raw runner output were removed
 after recording the result.
+
+## W221 Node Buffer continuation green cluster
+
+The bounded three-job Node selector covered malformed-hex writes, signed and
+unsigned 64-bit BigInt read/write boundaries, and ArrayBuffer sharing with
+offset/length validation. All **3/3 files passed**, with **0 failures and 0
+timeouts**; each file took about 200ms.
+
+These upstream files are plain scripts, so the Node runner's file-level
+clean-exit classification is the authoritative result. No source or upstream
+fixture change was made. The selector used the existing coordinator binary
+through `tools/integration/node_corpus_runner.py` with three bounded jobs and a
+30-second per-file timeout. No full corpus or workspace-wide test was run; the
+selector and raw runner output were removed after recording the result.
 
 ## W220 Bun stack/stdio/HTTP owner split
 

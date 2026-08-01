@@ -5,6 +5,7 @@
 
 ## 2026-08-01
 
+- W221 fresh Node Buffer continuation probe（3 jobs、复用现有 coordinator binary、无构建）**3/3 files pass、0 fail、0 timeout**：bad hex、BigInt64/BigUInt64 endian/range、ArrayBuffer sharing/offset/length 全部 clean-exit；Node runner 按 file-level 计数，单文件耗时均约 200ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W220 fresh Bun stack/stdio/HTTP probe（3 jobs、复用现有 coordinator binary、无构建）**21 passed、29 failed、50 ran、114 expects、0 runner timeout**：proxy-style HTTP 为 2/3（CR/LF host 未抛 `ERR_INVALID_CHAR`）；stdio write-after-end 为 0/4（pipe state 与 file report 两类 owner）；capture-stack-trace 为 19/43，失败拆为 stack/frame formatting、internal hook exposure、async/sourceURL/limit、lazy error-info/timeout owners；单文件耗时 582–5645ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W219 fresh Node Buffer plain-script probe（3 jobs、复用现有 coordinator binary、无构建）**3/3 files pass、0 fail、0 timeout**：isUtf8 valid/invalid input、Buffer.byteLength 类型/编码边界、Buffer.compare offset/range 全部 clean-exit；Node runner 按 file-level 计数，单文件耗时 232–285ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W218 fresh Node console plain-script probe（3 jobs、复用现有 coordinator binary、无构建）**3/3 files pass、0 fail、0 timeout**：console 被非对象替换后恢复、primitive throw 写入、util.inspect 不调用函数 toString 全部 clean-exit；Node runner 按 file-level 计数，单文件耗时 199–200ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
