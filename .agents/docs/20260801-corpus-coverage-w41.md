@@ -217,6 +217,29 @@ the observed Linux limits; the coordinator owns the only root build.
 | W267 | Node DNS promises/error-shape leaves | 3 | 1/3 pass; 2 fail; 0 timeout; no build | retain resolve-promises; park dns/promises `NODATA` export and memory-error stack-shape owners |
 | W268 | Node DNS lookup/order/type leaves | 3 | 3/3 pass; 0 fail; 0 timeout; no build | retain lookup promise stub, result-order controls, and resolveNs type guards; no source owner |
 | W269 | Node DNS lookup/resolver leaves | 3 | 2/3 pass; 1 fail; 0 timeout; no build | retain lookupService and malformed resolveAny guards; park invalid-hostname/all-mode sync validation owner |
+| W270 | Bun module/Buffer/DOMException leaves | 3 | 2/3 green; 8 passed / 1 failed / 9 ran / 44 expects; 0 timeout; no build | retain Buffer and DOMException leaves; park `node:missing` built-in error contract |
+
+## W270 Bun module/Buffer/DOMException leaf probe
+
+The bounded three-job Bun selector covered `missing-module.test.js`,
+`buffer-inspectmaxbytes.test.ts`, and `domexception-node.test.js`. It measured
+**2/3 files green**, **8 passed / 1 failed / 9 ran / 44 expects**, and **0 runner
+timeouts**. The runner used the default bounded profile of **4G memory / 512
+tasks**; per-file durations were 200ms.
+
+`buffer-inspectmaxbytes.test.ts` passed **1/1** and
+`domexception-node.test.js` passed **7/7** (including its declared failing
+case). `missing-module.test.js` stopped at its first assertion: for the
+`node:missing` built-in, the reference requires `ERR_UNKNOWN_BUILTIN_MODULE`
+and the `No such built-in module` message, while mbun returned a generic
+missing-module error message. The remaining missing-module cases were not
+counted after that first failure; this is one module-loader error-contract
+owner, not a reason to mix in the passing Buffer/DOMException surfaces.
+
+No source or upstream fixture change was made. The selector reused the
+coordinator binary through `tools/integration/bun_corpus_runner.py` with
+three bounded jobs, a 30-second per-file timeout, and missing Node modules
+allowed. No full corpus, build, or workspace-wide test was run.
 
 ## W269 Node DNS lookup/resolver plain-script leaf probe
 
