@@ -5,6 +5,11 @@
 
 ## 2026-08-01
 
+- W80 fresh Node zlib probe（5 jobs、复用当前 Linux binary、无构建）测得 **3 green files、17
+  passed、30 failed、47 ran、64 expects**。bytesWritten、deflate-streaming、zlib.kMaxLength
+  全绿；handle-bounds 与 onerror-reentrancy 的失败跨 native handle bounds/writeState、缺失
+  handle 方法、close 后 init 校验和 reentrancy，属 zlib binding lifecycle/handle owner，未混修。
+  未修改上游 fixture，未跑全量 corpus。
 - W79 fresh Bun crypto probe（3 jobs、复用当前 Linux binary、无构建）测得 **2 green files、
   9515 passed、736 failed、10251 ran、29406 expects**。cipheriv-decipheriv 与
   x25519-derive-bits 全绿；WPT generateKey 的失败集中在 empty-algorithm 与 RSA

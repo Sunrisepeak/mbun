@@ -897,6 +897,20 @@ surface on Linux:
 - No upstream fixture changes, no full corpus, and no workspace-wide build
   were performed.
 
+### W80 Node zlib leaf probe parked on native-handle boundary
+
+- A fresh five-file Node zlib probe used **5 bounded jobs** and reused the
+  current Linux binary; no source change or build was needed. It measured
+  **3 green files, 17 passed, 30 failed, 47 ran, 64 expects**.
+- `bytesWritten` (**5/5**), `deflate-streaming` (**1/1**), and
+  `zlib.kMaxLength.global` (**8/8**) were green. The two remaining files
+  failed across native handle bounds/writeState, missing handle methods,
+  init-after-close validation, and onerror re-entrancy. These are a shared
+  zlib binding lifecycle/handle surface rather than one safe leaf owner, so
+  no mixed fix was attempted.
+- No upstream fixture changes, no full corpus, and no workspace-wide build
+  were performed.
+
 ### W59 Node buffer leaf sample
 
 - W59 使用 Node corpus runner 的默认 bounded profile、**3 jobs**。首批五个文件为
