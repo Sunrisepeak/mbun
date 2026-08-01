@@ -246,6 +246,25 @@ the observed Linux limits; the coordinator owns the only root build.
 | W296 | Bun fetch/encoding/timer leaf probe | 5 | 5/5 green; 70 passed / 0 failed / 70 ran / 85 expects; 0 timeout; no build | retain all five Bun guards; no source owner |
 | W297 | Bun fetch/blob/timer ownership probe | 5 | 3/5 green; 24 passed / 1 failed / 25 ran / 54 expects; 1 runner timeout; no build | retain three Blob guards; park fetch-gzip timeout and setInterval cancellation owners |
 | W298 | Node path/os continuation leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five path/os guards; no source owner |
+| W299 | Bun Blob/stream/event/body leaf probe | 5 | 5/5 green; 47 passed / 0 failed / 50 ran / 119 expects; 0 timeout; no build | retain all five Bun/Deno guards; no source owner |
+
+## W299 Bun Blob/stream/event/body leaf probe
+
+The bounded five-job Bun selector covered Blob write behavior, stream fast
+paths, EventTarget, CustomEvent, and Fetch body leaves. It measured **5/5
+green files**, **47 passed / 0 failed / 50 ran / 119 expects**, and **0 runner
+timeouts**. Per-file durations were **200–251 ms**.
+
+`blob-write.test.ts` measured **10 passed / 0 failed / 10 ran / 25 expects**;
+`stream-fast-path.test.ts` measured **18 / 0 / 18 / 32**;
+`event-target.test.ts` measured **14 / 0 / 15 / 43**;
+`custom-event.test.ts` measured **2 / 0 / 2 / 8**; and
+`body.test.ts` measured **3 / 0 / 5 / 11**. All five guards are retained as
+green coverage with no source or upstream-fixture changes.
+
+The selector used the bounded five-job Bun runner with a 30-second per-file
+timeout, the existing coordinator binary, and missing Node modules allowed.
+No full corpus, build, or workspace-wide test was run.
 
 ## W298 Node path/os continuation leaf probe
 
