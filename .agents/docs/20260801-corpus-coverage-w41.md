@@ -237,6 +237,25 @@ the observed Linux limits; the coordinator owns the only root build.
 | W287 | Bun util inspect/fs metadata leaves | 5 | 4/5 green; 61 passed / 1 failed / 62 ran / 130 expects; 0 timeout; no build | retain Bun/custom inspect, birthtime, and cp symlink guards; park proxy inspect trap owner |
 | W288 | Node resolver/require flag leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain import resilience, dot resolution, guarded ESM require, process identity, and invalid resolve-path validation; no source owner |
 | W289 | Node resolver/extension/symlink leaves | 5 | 3/5 pass; 2 fail; 0 timeout; no build | retain symlinked-peer, invalid-main, and relative-path guards; park extension-over-directory and require.resolve fixture lookup owners |
+| W290 | Node module metadata/extension leaves | 5 | 4/5 pass; 1 fail; 0 timeout; no build | retain module children/stat/version and extension-main guards; merge same-filename-as-dir into the W289 extension-over-directory precedence owner |
+
+## W290 Node module metadata/extension leaf probe
+
+The bounded five-job Node selector covered module metadata and extension
+resolution leaves. It measured **4/5 file-level passes**, **1 failure**, and
+**0 runner timeouts**. Per-file durations were **198–299 ms**.
+
+`test-module-children.js`, `test-module-stat.js`,
+`test-module-version.js`, and `test-require-extensions-main.js` passed.
+`test-require-extensions-same-filename-as-dir.js` failed because resolution
+selected the directory-backed fixture content where the test expected the
+explicit module file. This confirms the W289 extension-over-directory
+precedence owner rather than introducing a new source owner. There were no
+source or upstream-fixture changes.
+
+The selector used the bounded five-job Node runner with a 30-second per-file
+timeout. No full corpus, build, or workspace-wide test was run; the Node
+runner reports file-level status only.
 
 ## W289 Node resolver/extension/symlink leaf probe
 
