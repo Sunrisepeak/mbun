@@ -255,6 +255,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W305 | Bun/Deno Event/Performance/URL/crypto leaves | 5 | 4/5 green; 63 passed / 0 failed / 68 ran / 287 expects; 1 all-skipped; 0 timeout; no build | retain four green guards; record Deno V8 error file as an all-skipped corpus entry |
 | W306 | Bun/Deno abort/encoding/Event/Fetch body leaves | 5 | 5/5 green; 46 passed / 0 failed / 51 ran / 118 expects; 5 skipped; 0 timeout; no build | retain all five files; keep encoding and Fetch body skips as bounded capability gaps |
 | W307 | Bun globals/archive/console/crypto leaf probe | 5 | 2/5 green; 72 passed / 118 failed / 191 ran / 212 expects; 1 skipped; 0 runner timeout; no build | retain inspect-table and cipheriv; park Archive API, console iterator, and split globals owners |
+| W308 | Node console/path leaf probe | 5 | 4/5 pass; 1 fail; 0 timeout; no build | retain console-clear, console-instance, path-isabsolute, and path-join; park diagnostics-channel callback delivery |
 
 ## W305 Bun/Deno Event/Performance/URL/crypto leaf probe
 
@@ -325,6 +326,32 @@ allowed. After the run, resources showed about **46 GiB available memory**,
 about **332 KiB free swap**, and about **18 GiB free disk at 99% usage**;
 temporary runner output is cleaned immediately and the next wave remains
 deferred until the swap pressure improves.
+
+## W308 Node console/path leaf probe
+
+The bounded five-job Node selector covered five previously unrecorded files:
+`test-console-clear.js`, `test-console-instance.js`,
+`test-console-diagnostics-channels.js`, `test-path-isabsolute.js`, and
+`test-path-join.js`. The final run measured **4/5 file-level passes**, **1
+failure**, **0 runner timeouts**, and **200–201 ms** per file. The Node runner
+reports file status only; no assertion-level pass total is inferred.
+
+`test-console-clear.js`, `test-console-instance.js`,
+`test-path-isabsolute.js`, and `test-path-join.js` passed. The only failure,
+`test-console-diagnostics-channels.js`, repeatedly observed **0** subscriber
+callbacks where the fixture expects one callback for each console diagnostic
+channel publication. This is one diagnostics-channel callback-delivery owner;
+no mixed console patch was attempted.
+
+The first invocation was rejected before dispatch because the temporary
+selector had not been created in the coordinator worktree; it produced no test
+result and is excluded from the metrics above. After correcting the selector
+location, the same five files ran successfully under the existing binary.
+There were no source or upstream-fixture changes, no full corpus, and no
+workspace-wide build. After the run, resources showed about **46 GiB
+available memory**, about **768 KiB free swap**, and about **18 GiB free disk at
+99% usage**; the temporary runner output is cleaned and the next wave remains
+resource-gated.
 
 ## W304 Node events/path continuation leaf probe
 
