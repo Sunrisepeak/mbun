@@ -5,6 +5,7 @@
 
 ## 2026-08-01
 
+- W208 fresh Node events lifecycle probe（3 jobs、复用现有 coordinator binary、无构建）**2/4 files pass、2 fail、0 timeout**：addAbortListener 与静态 getEventListeners 通过；事件 async-iterator 停在 invalid-argument `ERR_INVALID_ARG_TYPE` code，uncaught-exception stack 停在首行 stack-shape owner；单文件耗时 233–332ms。未修改 source/fixture，原始日志未发布，未跑全量 corpus/workspace-wide test。
 - W207 fresh Node diagnostics_channel probe（3 jobs、复用现有 coordinator binary、无构建）**5/5 files pass、0 fail、0 timeout**：has-subscribers、object-channel pub/sub、named pub/sub、symbol-named 与 sync-unsubscribe 全部通过；单文件耗时 168–252ms。未发现 source owner，未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W206 fresh Bun Web/Atomics/URLPattern probe（3 jobs、复用现有 coordinator binary、无构建）修正路径后为 **4/5 files green、447 passed、12 failed、459 ran、6375 expects、0 timeout**：explicit-resource-management、nationalized、WebCrypto SHA-3、Atomics 全绿；URLPattern 为 396/408，失败拆分为 URL 解析、非法 pattern/port、base-URL wildcard 序列化和 Unicode regexp set owners。首次 cwd-relative selector 产生 5 个 harness load-error、0 tests ran，已排除且未计入覆盖。
 - W205 fresh Node stream state/lifecycle probe（3 jobs、复用现有 coordinator binary、无构建）**5/5 files pass、0 fail、0 timeout**：Readable asyncDispose、readableListening、setEncoding(null)、unpipe-resume 与 Writable ending-state 全部通过；单文件耗时 166–316ms。未发现 source owner，未修改 source/fixture，未跑全量 corpus/workspace-wide test。

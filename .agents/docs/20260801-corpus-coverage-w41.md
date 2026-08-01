@@ -155,6 +155,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W205 | Node stream state/lifecycle leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain asyncDispose, readableListening, setEncoding(null), unpipe-resume, and Writable ending-state leaves; no source owner |
 | W206 | Bun Web/Atomics/URLPattern leaves | 5 | 4/5 green; 447 passed / 12 failed / 459 ran / 6375 expects; 0 timeout; no build | retain explicit-resource-management, nationalized, SHA-3, and Atomics; park URLPattern parser/URL-base/Unicode owners |
 | W207 | Node diagnostics_channel leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain has-subscribers, object/channel pub-sub, symbol channel, and sync-unsubscribe leaves; no source owner |
+| W208 | Node events lifecycle leaves | 4 | 2/4 pass; 2 fail; 0 timeout; no build | retain addAbortListener and static getEventListeners; park async-iterator invalid-argument code and uncaught-exception stack-shape owners |
 
 ## W133 Bun.Terminal green cluster
 
@@ -1232,6 +1233,25 @@ found. The selector used the existing coordinator binary through
 `tools/integration/node_corpus_runner.py` with three bounded jobs and a
 30-second per-file timeout. No full corpus or workspace-wide test was run; the
 selector and raw runner output were removed after recording the result.
+
+## W208 Node events lifecycle owner split
+
+The bounded three-job selector covered `events.addAbortListener`, event
+async-iterator behavior, static `getEventListeners`, and uncaught-exception
+stack shape. It reached **2/4 files passed**, with **2 failures and 0
+timeouts**; per-file durations were 233–332ms.
+
+`addAbortListener` and static `getEventListeners` stayed green. The async
+iterator file fails on the invalid-argument path because the thrown error lacks
+Node's `ERR_INVALID_ARG_TYPE` code. The uncaught-exception stack file reports
+the throw-site location in the first stack line instead of Node's `Error`
+header. These remain separate owners; no mixed fix was attempted.
+
+No source or upstream fixture change was made. The selector used the existing
+coordinator binary through `tools/integration/node_corpus_runner.py` with
+three bounded jobs and a 30-second per-file timeout. No full corpus or
+workspace-wide test was run; the selector and raw runner output were removed
+after recording the result.
 
 ## W132 Node VM and WebStreams owner split
 
