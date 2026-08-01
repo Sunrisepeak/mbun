@@ -108,6 +108,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W158 | Node Buffer compare/copy leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five Buffer compare/copy leaves; no source owner |
 | W159 | Node assert deep-comparison leaves | 5 | 2/5 pass; 3 fail; 0 timeout; no build | retain assert-fail/if-error; park deep/partial/typed-array assertion owners separately |
 | W160 | Bun Web URL/Response/clone leaves | 4 | 2/3 executable files green; 131 passed / 1 failed / 148 ran / 842 expects; 16 Linux-inapplicable skips; 0 timeout | retain URLSearchParams and structured-clone-fastpath; park Response FileRef snapshot root mismatch; exclude Windows URL skips |
+| W161 | Bun WebStreams leak/fast-path leaves | 4 | 4/4 green; 15 passed / 0 failed / 15 ran / 23 expects; 0 timeout; no build | retain all four leaves; mark native-source-onclose as slow but bounded |
 
 ## W133 Bun.Terminal green cluster
 
@@ -736,6 +737,20 @@ coordinator binary through `tools/integration/bun_corpus_runner.py` with three
 bounded jobs, a 30-second per-file timeout, and missing Node modules allowed.
 No full corpus or workspace-wide test was run; the selector and raw runner
 output were removed after recording the result.
+
+## W161 Bun WebStreams green cluster
+
+The bounded three-job selector covered readable-stream Blob consumption,
+synchronous pull fast paths, TransformStream leak handling, and native-source
+close handling. All **4/4 files were green**, reaching **15 passed / 0 failed /
+15 ran / 23 expects**, with **0 timeouts**. Per-file durations were 200ms–4.121s;
+the native-source-onclose leaf is retained as a slow but bounded guard.
+
+No source or upstream fixture change was made. The selector used the existing
+coordinator binary through `tools/integration/bun_corpus_runner.py` with
+three bounded jobs, a 30-second per-file timeout, and missing Node modules
+allowed. No full corpus or workspace-wide test was run; the selector and raw
+runner output were removed after recording the result.
 
 ## W121 Node zlib metric triage
 

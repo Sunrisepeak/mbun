@@ -5,6 +5,7 @@
 
 ## 2026-08-01
 
+- W161 fresh Bun WebStreams probe（3 jobs、复用现有 coordinator binary、无构建）**4/4 files green、15 passed、0 failed、15 ran、23 expects、0 timeout**：readable-stream Blob consumption、sync pull fast path、TransformStream leak、native-source close 全部通过；单文件耗时 200ms–4.121s，native-source close 标记为慢但 bounded guard。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W160 fresh Bun Web URL/Response/clone probe（3 jobs、复用现有 coordinator binary、无构建）**2/3 executable files green、131 passed、1 failed、148 ran、842 expects、0 timeout**：URLSearchParams **17/17** 与 structured-clone-fastpath **92/92** 通过；Response **22/23**，唯一失败为 FileRef print-size snapshot 的相对路径根差异；Windows URL 文件 Linux 下 **16/16 skipped**，不计入 green denominator。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W159 fresh Node assert owner-split probe（3 jobs、复用现有 coordinator binary、无构建）**2/5 files pass、3 fail、0 timeout**：assert-fail 与 assert-if-error 通过；deep、partial-deep-equal、typed-array-deepequal 跨 generic deep-comparison、partial-matching、typed-array assertion owners，分别停车，未混修或猜测性开 issue。
 - W158 fresh Node Buffer compare/copy probe（3 jobs、复用现有 coordinator binary、无构建）**5/5 files pass、0 fail、0 timeout**：compare、copy、equals、indexOf、double-precision read 全部通过；单文件耗时 165–300ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
