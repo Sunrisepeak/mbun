@@ -572,6 +572,27 @@ surface on Linux:
   全量 corpus。当前资源约 **44 GiB available memory、43 MiB swap free、20 GiB
   free disk**，继续暂停 broad build，仅保留 bounded lane。
 
+### W56 Bun.Glob path-boundary owner
+
+- W56 先纠正了一次候选路径选择错误：错误的 `compat/bun/...` 前缀只触发了
+  harness 的 no-test/load-error 分类，未计入覆盖数据。修正为真实 vendored 路径后，
+  `cli/install/semver`、`glob/match`、`glob/proto`、`util/toUTF16Alloc` 四个文件先得
+  到 **4/4 files、58/58 tests、0 failed、3261 expects**；随后加入
+  `glob/path-length`，初始为 **1/6、5 failed**，失败集中在同一条路径边界 owner。
+- Issue [#42](https://github.com/Sunrisepeak/mbun/issues/42) 和设计记录
+  `.agents/docs/20260801-bun-glob-path-boundary-design.md` 先固定了契约：复用
+  `mbun.platform.path` 的 host policy，在 pattern、目录下降以及
+  `directory_entry` status/iterator 返回 `ENAMETOOLONG` 时传递错误；matched file 的
+  逻辑路径仍按原生测试要求可返回，并保留 matcher、symlink-cycle 和 only-files 语义。
+- `d8d8082` 在 `glob.cppm` 增加可选 scan error-code 输出和目录边界传播，在 JSC
+  callback 使用已有 Node-shaped fs error helper，并补齐 only-files fast path 的
+  `absolute` 结果。glob 单元目标为 **1497 checks、0 failures**；root release build
+  约 **59.3 秒**。
+- 最终 bounded lane 使用默认 **4G/512、3 jobs**，9 个真实文件为 **9/9 files
+  green、193/193 tests、0 failed、3856 expects**：`glob/path-length` 已从 **1/6**
+  提升到 **6/6**，四条既有 guards 仍为 **4/4 files、128/128 tests、0 failed、565
+  expects**。未跑全量 corpus，未做 workspace-wide build。
+
 ### W55 fresh inventory refresh and Bun CSS triage
 
 - W55 首先复测了 inventory 指向的 Node fs owner：FileHandle
@@ -600,8 +621,8 @@ surface on Linux:
    identified.
 3. Keep test-v8 profiler/queryObjects and broad VM wording changes parked until
    ownership is clear.
-4. Re-measure the adjacent path sample only if it can be done without a new
-   broad build; otherwise prioritize the next one-owner Bun row over zlib's
+4. Keep the W56 Bun.Glob path-boundary owner closed unless a new minimal
+   reproduction reopens it; prioritize the next one-owner Bun row over zlib's
    native-handle cluster and test-runner's multi-owner boundary.
 5. Keep the fixed W51 final-read ordering, W52 file-backed stdin, W53 stdout
    disturbed/reject, and W54 conversion-helper brand owners closed; reopen only

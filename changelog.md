@@ -5,6 +5,13 @@
 
 ## 2026-08-01
 
+- `d8d8082`（issue #42）修复 Bun.Glob 路径边界兼容：复用平台 path policy，在
+  pattern、目录下降、`directory_entry` status/iterator 的 `ENAMETOOLONG` 路径上保留
+  Bun 错误信号，同时修正 only-files fast path 的 `absolute` 输出。新增 glob scan
+  error-code 回归，`test_glob` **1497 checks、0 failures**；`glob/path-length.test.ts`
+  从 **1/6** 提升为 **6/6**。W56 九文件 bounded lane（默认 **4G/512、3 jobs**）为
+  **9/9 files green、193/193 tests、0 failed、3856 expects**，其中四条既有 guards
+  全部保持 green。root release build 约 **59.3 秒**，未跑全量 corpus。
 - W55 fresh-binary triage 更新路线：Node fs inventory 中 FileHandle 6 文件与
   flush/AbortSignal/WHATWG URL 5 文件均已 **11/11 pass**，确认旧 inventory 不能直接
   作为当前 owner 来源；Bun CSS `cssInternals` 5 文件 bounded probe 为 **1/5 files
