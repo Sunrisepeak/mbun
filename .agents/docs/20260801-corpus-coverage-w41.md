@@ -73,6 +73,26 @@ the observed Linux limits; the coordinator owns the only root build.
 | W123 | Node fs error/HTTP lifecycle leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five green leaves; no source owner |
 | W124 | Bun util object/string/file/GC/stdin leaves | 5 | 2/5 green; 11 passed / 6 failed / 17 ran / 250 expects; no build | retain stdin + error-GC; park internal helper exports, Bun.file async-stack/JSON message owners separately |
 | W125 | Node HTTP/fs stream lifecycle leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five green leaves; no source owner |
+| W126 | Bun util + Node HTTP mixed leaves | 5 | corrected split-run: 4/5 files green; Bun 350 passed / 53 failed / 403 ran / 54616 expects, Node 2/2 pass; no build | retain indexOfLine, Bun.main, and two Node HTTP leaves; park CryptoHasher HMAC/unsupported-algorithm owners separately |
+
+## W126 corrected mixed-lane triage
+
+The first attempt accidentally sent a mixed Bun/Node selector to the Bun
+runner; its two Node rows were `no-tests` and are excluded from all coverage
+counts. The selector was corrected into separate bounded runners without
+rerunning the Bun files.
+
+The valid Bun result was **2/3 files green**, **350 passed**, **53 failed**,
+**403 ran**, and **54,616 expects**: `index-of-line.test.ts` passed **4/4**,
+`bun-main.test.ts` passed **2/2**, and `bun-cryptohasher.test.ts` reached
+**344 passed / 53 failed / 397 ran**. The valid Node runner then passed both
+HTTP files (**2/2**), taking 232ms and 6.242s. Thus the corrected five-file
+lane is **4/5 green** with no timeout.
+
+CryptoHasher failures split into unsupported HMAC keying and a separate
+unsupported-algorithm matrix expectation; they are parked separately rather
+than treated as one source fix. No source or upstream fixture change was
+made. No full corpus or workspace-wide test was run.
 
 ## W125 Node HTTP and fs green leaves
 

@@ -5,6 +5,7 @@
 
 ## 2026-08-01
 
+- W126 corrected split Bun/Node probe（Bun 3 jobs + Node 3 jobs、复用现有 coordinator binary、无构建）**4/5 valid files green**：Bun **350 passed / 53 failed / 403 ran / 54616 expects**，`index-of-line` **4/4**、`Bun.main` **2/2**；Node HTTP 两文件 **2/2 pass**，耗时 232ms/6.242s。CryptoHasher 的 HMAC keying 与 unsupported-algorithm matrix 分开停车。初次混用 Bun runner 产生的两条 Node `no-tests` 已排除，不计入覆盖；未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W125 fresh Node HTTP/fs stream lifecycle probe（3 jobs、复用现有 coordinator binary、无构建）**5/5 files pass、0 fail、0 timeout**：HTTP agent error/close、empty write、cpSync symlink error、WriteStream uncork、uncaught request callback 全部通过；四个叶子耗时 215–234ms，empty-write HTTP 为 4.289s，仍在 30s bound 内。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W124 fresh Bun util object/string/file/GC/stdin probe（3 jobs、复用现有 coordinator binary、无构建）**2/5 files green、11 passed、6 failed、17 ran、250 expects、0 timeout**：stdin slice **2/2**、Error GC **4/4** 保留；BunObject 缺 `hasNonReifiedStatic` internal helper、BunString 缺 refcount-delta helper、Bun.file 的 async stack 与 empty-JSON message 为分离 owners，暂不混修或猜测性开 issue。原始 runner log 仅本地诊断且含环境展开，未进入文档、commit 或 PR；未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W123 fresh Node fs error/HTTP lifecycle probe（3 jobs、复用现有 coordinator binary、无构建）**5/5 files pass、0 fail、0 timeout**：WriteStream 参数校验、两个 `cpSync` 错误契约、HTTP 无 Content-Length response、HTTP agent timeout 全部通过；单文件耗时 215–265ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
