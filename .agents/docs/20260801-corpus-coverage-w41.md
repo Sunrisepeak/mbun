@@ -242,6 +242,25 @@ the observed Linux limits; the coordinator owns the only root build.
 | W292 | Bun console/performance/HTTP leaf probe | 5 | 4/5 green; 30 passed / 4 failed / 34 ran / 66 expects; 0 runner timeout; no build | retain four green guards; park malformed HTTP trailer validation/liveness owner |
 | W293 | Node loader/symlink continuation leaves | 5 | 3/5 pass; 2 fail; 0 timeout; no build | retain entry-point and trailing-slash guards; split custom multi-extension selection from preserve-symlinks cache identity |
 | W294 | Node path/os/url pure-contract leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five path/os/url guards; no source owner |
+| W295 | Node path/query/url/events leaves | 5 | 4/5 pass; 1 fail; 0 timeout; no build | retain path identity, querystring, URL invalid-input, and CustomEvent guards; park events.on invalid-argument error-code shape |
+
+## W295 Node path/query/url/events leaf probe
+
+The bounded five-job Node selector covered path identity, querystring handling,
+URL invalid-input validation, CustomEvent, and `events.on` async iteration. It
+measured **4/5 file-level passes**, **1 failure**, and **0 runner timeouts**.
+Per-file durations were **199–700 ms**.
+
+`test-path-posix-exists.js`, `test-querystring.js`,
+`test-url-parse-invalid-input.js`, and `test-events-customevent.js` passed.
+`test-events-on-async-iterator.js` failed in its invalid-argument validation:
+the thrown error lacked the expected `ERR_INVALID_ARG_TYPE` `code` property.
+This is a focused events error-code shape owner. There were no source or
+upstream-fixture changes.
+
+The selector used the bounded five-job Node runner with a 30-second per-file
+timeout. No full corpus, build, or workspace-wide test was run; the Node
+runner reports file-level status only.
 
 ## W294 Node path/os/url pure-contract leaf probe
 
