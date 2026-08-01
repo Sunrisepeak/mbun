@@ -787,7 +787,18 @@ export constexpr std::string_view kHttp2JS_part2 = R"JS(
             stream.rstCode = code; stream.aborted = true;
             if (code !== 0) G.queueMicrotask(() => stream.emit("aborted"));
             stream._closed = true;
-            http2StreamFinish(stream);
+            if (code !== constants.NGHTTP2_NO_ERROR && code !== constants.NGHTTP2_CANCEL) {
+              // A non-zero peer reset is a stream error, not only a close.
+              // Keep the session alive while routing it through _destroy so
+              // the server stream publishes ERR_HTTP2_STREAM_ERROR.
+              const err = streamErr(code);
+              G.queueMicrotask(() => {
+                if (!stream.destroyed) stream.destroy(err);
+                else stream.emit("error", err);
+              });
+            } else if (code === constants.NGHTTP2_CANCEL) {
+              G.queueMicrotask(() => { if (!stream.destroyed) stream.destroy(); });
+            } else http2StreamFinish(stream);
           }
           else if ((streamId & 1) === 1 && streamId > this._lastStreamId) { this._connError(constants.NGHTTP2_PROTOCOL_ERROR); return false; }  // RST on an idle stream (§5.1)
           else if ((streamId & 1) === 0 && streamId > (this._lastPushId || 0)) { this._connError(constants.NGHTTP2_PROTOCOL_ERROR); return false; }

@@ -1399,7 +1399,18 @@ export constexpr std::string_view kHttp2JS_part1 = R"JS(
       // code NGHTTP2_CANCEL'.
       if (code !== constants.NGHTTP2_NO_ERROR && code !== constants.NGHTTP2_CANCEL) {
         const err = streamErr(code);
-        G.queueMicrotask(() => { if (!stream.destroyed) stream.destroy(err); else stream.emit("error", err); });
+        G.queueMicrotask(() => {
+          // node's stream-close path ends the readable side before delivering
+          // the reset error, so consumers still observe `end` on an aborted
+          // request.
+          if (!stream.destroyed) {
+            http2StreamEndReadable(stream);
+            G.process.nextTick(() => {
+              if (!stream.destroyed) stream.destroy(err);
+              else stream.emit("error", err);
+            });
+          } else stream.emit("error", err);
+        });
         return;
       }
       http2StreamFinish(stream);
