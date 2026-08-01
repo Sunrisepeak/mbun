@@ -5,6 +5,9 @@
 
 ## 2026-08-01
 
+- W93 fresh Node `fs/promises` FileHandle leaf probe（5 jobs、复用 W92 binary、无构建）**5/5 files pass**：
+  chmod、stat、truncate、write、sync 全部通过。作为 W92 AbortError 修复后的 Node-side guard，未发现
+  新 source owner，未修改 fixture，未跑全量 corpus。
 - W92 issue [#52](https://github.com/Sunrisepeak/mbun/issues/52) 修复 `fs/promises` AbortError
   message owner：W90 的 **17 passed / 12 failed / 34 ran** 经 fresh build 后变为 **24 passed / 5 failed /
   34 ran**，四个 child_process/fs guards 仍全绿；Bun focused aggregate 为 **4/5 files green、46 passed、

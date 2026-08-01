@@ -40,6 +40,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W90 | Bun Node-fs/child_process leaves | 5 | corrected probe: 4/5 green; 39 passed / 12 failed / 56 ran / 107 expects | retain four green leaves; park fs/promises multi-owner failures |
 | W91 | Bun Node-net leaves | 5 | 3/5 green; 5 passed / 1 failed / 7 ran / 15 expects; one no-tests stress fixture | retain three green net leaves; park autoSelectFamily liveness |
 | W92 | Bun/Node fs/promises AbortError owner | 5 Bun + 3 Node guards | Bun target 24 passed / 5 failed / 34 ran; 4 Bun guards green; Node 2/3 pass | issue #52; focused message fix landed, remaining fs/promises owners parked |
+| W93 | Node fs/promises FileHandle leaves | 5 | 5/5 files pass; no build | retain FileHandle coverage after W92 fix; no source owner |
 
 ## Delivered slice
 
@@ -1130,6 +1131,16 @@ surface on Linux:
   readFile file remains red only at its unrelated zero-byte-liar child fixture
   assertion. No upstream fixture changes, full corpus, or workspace-wide build
   were performed.
+
+### W93 Node fs/promises FileHandle leaf confirmation
+
+- A fresh Node corpus probe reused the W92 release binary with **5 bounded
+  jobs** and no build. All **5/5 files passed**: FileHandle `chmod`, `stat`,
+  `truncate`, `write`, and `sync`.
+- This is a post-fix Node-side guard for the adjacent fs/promises surface. It
+  found no new source owner and required no fixture change or issue. No full
+  corpus or workspace-wide build was performed; temporary selector and output
+  data were removed.
 
 ### W59 Node buffer leaf sample
 
