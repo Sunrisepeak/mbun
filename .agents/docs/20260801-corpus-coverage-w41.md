@@ -249,6 +249,23 @@ the observed Linux limits; the coordinator owns the only root build.
 | W299 | Bun Blob/stream/event/body leaf probe | 5 | 5/5 green; 47 passed / 0 failed / 50 ran / 119 expects; 0 timeout; no build | retain all five Bun/Deno guards; no source owner |
 | W300 | Node util/styleText/os/url leaves | 5 | 4/5 pass; 1 skip; 0 fail; 0 timeout; no build | retain util sleep, hex styleText, URL deprecation, and userinfo guards; record regular styleText as a TTY harness skip |
 | W301 | Node util/VM/encoding continuation leaves | 5 | 2/5 pass; 3 fail; 0 timeout; no build | retain signal exit-code and TextDecoder guards; split VM namespace inspect, internal symbol enumerability, and promisify custom-name owners |
+| W302 | Node URL continuation leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five URL parse/format/brand guards; no source owner |
+
+## W302 Node URL continuation leaf probe
+
+The bounded five-job Node selector covered URL parse/query and parse/format
+compatibility, `urlToHttpOptions`, relative resolution, and the internal URL
+brand check. It measured **5/5 file-level passes**, **0 failures**, and **0
+runner timeouts**. Per-file durations were **200–399 ms**.
+
+`test-url-parse-query.js`, `test-url-parse-format.js`,
+`test-url-urltooptions.js`, `test-url-relative.js`, and
+`test-url-is-url-internal.js` all passed. There were no source or
+upstream-fixture changes.
+
+The selector used the bounded five-job Node runner with a 30-second per-file
+timeout. No full corpus, build, or workspace-wide test was run; the Node
+runner reports file-level status only.
 
 ## W301 Node util/VM/encoding continuation leaf probe
 
