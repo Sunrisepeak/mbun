@@ -216,6 +216,28 @@ the observed Linux limits; the coordinator owns the only root build.
 | W266 | Node HTTP framing/status/listening leaves | 3 | 3/3 pass; 0 fail; 0 timeout; no build | retain no-content-length framing, statusMessage behavior, and server listening transitions; no source owner |
 | W267 | Node DNS promises/error-shape leaves | 3 | 1/3 pass; 2 fail; 0 timeout; no build | retain resolve-promises; park dns/promises `NODATA` export and memory-error stack-shape owners |
 | W268 | Node DNS lookup/order/type leaves | 3 | 3/3 pass; 0 fail; 0 timeout; no build | retain lookup promise stub, result-order controls, and resolveNs type guards; no source owner |
+| W269 | Node DNS lookup/resolver leaves | 3 | 2/3 pass; 1 fail; 0 timeout; no build | retain lookupService and malformed resolveAny guards; park invalid-hostname/all-mode sync validation owner |
+
+## W269 Node DNS lookup/resolver plain-script leaf probe
+
+The bounded three-job Node selector covered `test-dns-lookup.js`,
+`test-dns-lookupService.js`, and `test-dns-resolveany-bad-ancount.js`. It
+measured **2/3 file-level passes**, **1 failure**, and **0 runner timeouts**.
+Per-file durations were 300–351ms.
+
+`test-dns-lookupService.js` passed the stubbed `getnameinfo` error contract for
+callback and promise APIs. `test-dns-resolveany-bad-ancount.js` passed the
+local malformed-DNS-answer handling for callback and promise resolvers.
+`test-dns-lookup.js` failed at the `dns.lookup(false, { all: true })` guard:
+the reference expects a synchronous `ERR_INVALID_ARG_VALUE`, but no exception
+was raised. This is a separate invalid-hostname/all-mode validation owner; no
+mixed DNS fix was attempted.
+
+No source or upstream fixture change was made. The selector reused the
+coordinator binary through `tools/integration/node_corpus_runner.py` with
+three bounded jobs and a 30-second per-file timeout. No full corpus, build,
+or workspace-wide test was run. The Node corpus runner reports only file-level
+status for these plain scripts, so no synthetic subtest count was added.
 
 ## W268 Node DNS lookup/order/type plain-script leaf probe
 
