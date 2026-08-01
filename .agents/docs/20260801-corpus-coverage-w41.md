@@ -65,6 +65,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W115 | Node streams event-order/pipe leaves | 5 | 4/5 pass; 1 fail; 0 timeout; TickObject failure reproduced at 1 job / 60s | issue #60; retain four green leaves, park callback-less Writable tick scheduling |
 | W116 | Node streams state/encoding leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five green leaves; no source owner |
 | W117 | Bun util UUID/cookie/width/error leaves | 5 | 2/5 green; 288 passed / 54 failed / 360 ran / 1297 expects; no build | retain cookie + UUIDv5; park UUIDv7 validation/monotonicity, stringWidth ANSI/unicode, inspect-error source diagnostics as separate owners |
+| W118 | Bun util encoding/file/error/path leaves | 5 | 5/5 green; 15 passed / 0 failed / 16 ran / 559 expects; no build | retain all five green leaves; no source owner |
 
 ## W117 Bun util owner triage
 
