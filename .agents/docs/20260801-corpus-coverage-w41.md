@@ -88,6 +88,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W138 | Node os pure-contract leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five os leaves; no source owner |
 | W139 | Bun Web Abort leaves | 3 | 3/3 green; 15 passed / 0 failed / 15 ran / 27 expects; 0 timeout; no build | retain all three abort leaves; no source owner |
 | W140 | Bun Web timers basic leaves | 4 | 4/4 green; 12 passed / 0 failed / 12 ran / 58 expects; 0 timeout; no build | retain all four timer leaves; no source owner |
+| W141 | Node events basic leaves | 5 | 3/5 pass; 2 fail; 0 timeout; no build | retain CustomEvent/list/listener-count; park AbortSignal max-listener default and events.once error-code owners |
 
 ## W133 Bun.Terminal green cluster
 
@@ -211,6 +212,26 @@ coordinator binary through `tools/integration/bun_corpus_runner.py` with three
 bounded jobs, a 30-second per-file timeout, and missing Node modules allowed.
 No full corpus or workspace-wide test was run; the selector and raw runner
 output were removed after recording the result.
+
+## W141 Node events owner split
+
+The bounded three-job selector covered CustomEvent, getMaxListeners, the
+events list surface, listener-count behavior, and `events.once`. It reached
+**3/5 files passed**, with **2 failures and 0 timeouts**; per-file durations
+were 164–349ms. The green leaves were CustomEvent, events list, and
+listener-count-with-listener.
+
+The two failures are separate owners. `test-events-getmaxlisteners.js` reports
+the default maximum for an AbortSignal as **10** where Node expects **0**.
+`test-events-once.js` reaches the invalid-argument error path but the thrown
+error has no `ERR_INVALID_ARG_TYPE` code. Neither is folded into the other or
+patched speculatively.
+
+No source or upstream fixture change was made. The selector used the existing
+coordinator binary through `tools/integration/node_corpus_runner.py` with
+three bounded jobs and a 30-second per-file timeout. No full corpus or
+workspace-wide test was run; the selector and raw runner output were removed
+after recording the result.
 
 ## W132 Node VM and WebStreams owner split
 

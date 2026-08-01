@@ -5,6 +5,7 @@
 
 ## 2026-08-01
 
+- W141 fresh Node events basic probe（3 jobs、复用现有 coordinator binary、无构建）**3/5 files pass、2 fail、0 timeout**：CustomEvent、events list、listener-count 通过；`getMaxListeners(AbortSignal)` 默认值 10 vs Node 0，`events.once` invalid-argument error 缺少 `ERR_INVALID_ARG_TYPE` code，两个独立 owner 暂停。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W140 fresh Bun Web timers basic cluster（3 jobs、复用现有 coordinator binary、无构建）**4/4 files green、12 passed、0 failed、12 ran、58 expects、0 timeout**：setImmediate、setImmediate2、performance、performance-entries 全部通过；单文件耗时 166ms–1.709s。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W139 fresh Bun Web Abort cluster（3 jobs、复用现有 coordinator binary、无构建）**3/3 files green、15 passed、0 failed、15 ran、27 expects、0 timeout**：Abort 基础 contract、AbortController GC reason、AbortSignal listener leak 全部通过；单文件耗时 298–800ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W138 fresh Node os pure-contract cluster（3 jobs、复用现有 coordinator binary、无构建）**5/5 files pass、0 fail、0 timeout**：checked-function、signal constants、EOL、homedir fallback、userinfo getter errors 全部通过；单文件耗时 199–349ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
