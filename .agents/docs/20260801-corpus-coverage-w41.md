@@ -184,6 +184,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W234 | Bun Node util leaves | 3 | 2/3 green; 297 passed / 2 failed / 300 ran / 559 expects; 0 timeout; no build | retain promisify/callbackify; park util.styleText ANSI colorization under runner color policy |
 | W235 | Node timers leaves | 3 | 3/3 pass; 0 fail; 0 timeout; no build | retain zero-timeout arguments, clearImmediate cancellation, and timer callback receiver/argument guards; no source owner |
 | W236 | Bun timers leaves | 3 | 1 counted file; 18 passed / 2 failed / 20 ran / 31 expects; 0 runner timeout; 2 no-tests excluded; no build | park UTF-16 timer-id classification and immediate-exception fixture subprocess owners |
+| W237 | Bun Node stream leaves | 2 | 1/2 green; 92 passed / 6 failed / 104 ran / 165 expects; 0 runner timeout; no build | retain Uint8Array stream guards; park stdin subprocess, Web/Node cancellation reasons, Bun.serve direct sink, and gated resolve.paths owners |
 
 ## W133 Bun.Terminal green cluster
 
@@ -290,6 +291,20 @@ upstream files are plain scripts, so file-level clean exit is authoritative.
 No source or fixture change was made, and no full corpus or workspace-wide test
 was run; the selector and raw runner output were removed after recording the
 result.
+
+## W237 Bun Node stream partial cluster
+
+The bounded three-job Bun selector covered the broad Node stream suite and a
+Uint8Array-focused stream suite. **1/2 files was green**, reaching **92 passed /
+6 failed / 104 ran / 165 expects** with **0 runner timeouts**; the Uint8Array
+file passed 5/5 and the broad file passed 87/99 in about 8.2s.
+
+The six failures split into stdin piping subprocess behavior, three Web/Node
+stream cancellation or abort-reason cases, direct-byte ReadableStream
+consumption by the Bun.serve sink, and `require.resolve.paths` agreement for
+gated stream/iterator specifiers. No source or upstream fixture change was
+made, and no full corpus or workspace-wide test was run; the selector and raw
+runner output were removed after recording the result.
 
 ## W236 Bun timers partial cluster
 
