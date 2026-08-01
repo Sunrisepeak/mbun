@@ -81,6 +81,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W131 | Node VM/URL/WHATWG leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five green leaves; no source owner |
 | W132 | Node VM/WHATWG streams/URL leaves | 5 | 3/5 pass; 2 fail; 0 timeout; no build | issues #66/#67; retain VM ownpropertynames, URLSearchParams entries, WritableStream close; park VM readonly wording and TextDecoderStream invalid receivers |
 | W133 | Bun.Terminal native leaves | 3 | 3/3 green; 129 passed / 0 failed / 130 ran / 334 expects; no build | retain all three terminal leaves; no source owner |
+| W134 | Node HTTP low-coupling leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five HTTP leaves; no source owner |
 
 ## W133 Bun.Terminal green cluster
 
@@ -94,6 +95,20 @@ coordinator binary through `tools/integration/bun_corpus_runner.py` with three
 bounded jobs, a 30-second per-file timeout, and missing Node modules allowed.
 No full corpus or workspace-wide test was run; the selector and raw runner
 output were removed after recording the result.
+
+## W134 Node HTTP green cluster
+
+The bounded three-job selector covered five previously unrecorded, low-coupling
+HTTP leaves: agent close, destroyed-socket handling, default headers, input
+function handling, and null-prototype client options. All **5/5 files passed**;
+there were **0 failures and 0 timeouts**. Per-file durations were 205–299ms.
+
+No source or upstream fixture change was made. The corrected selector used the
+existing coordinator binary through `tools/integration/node_corpus_runner.py`
+with three bounded jobs and a 30-second per-file timeout. An initial path-only
+selector validation was rejected before dispatch and is excluded from the
+result. No full corpus or workspace-wide test was run; the selector and raw
+runner output were removed after recording the result.
 
 ## W132 Node VM and WebStreams owner split
 

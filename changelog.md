@@ -5,6 +5,7 @@
 
 ## 2026-08-01
 
+- W134 fresh Node HTTP low-coupling cluster（3 jobs、复用现有 coordinator binary、无构建）**5/5 files pass、0 fail、0 timeout**：agent close、destroyed-socket、default headers、input function、null-prototype options 全部通过；单文件耗时 205–299ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。首次 selector 路径校验未启动测试，不计入结果。
 - W133 fresh Bun.Terminal native cluster（3 jobs、复用现有 coordinator binary、无构建）**3/3 files green、129 passed、0 failed、130 ran、334 expects**：core terminal、platform gaps、terminal spawn integration 全部通过；单文件耗时 1.233–3.694s，无 timeout。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W132 fresh Node VM/WHATWG streams/URL probe（3 jobs、复用现有 coordinator binary、无构建）**3/5 pass、2 fail、0 timeout**：VM own-property names、URLSearchParams entries、WritableStream close 通过；VM readonly assignment message mismatch issue [#66](https://github.com/Sunrisepeak/mbun/issues/66)，TextDecoderStream 五个 invalid-receiver getter 静默返回 `undefined` issue [#67](https://github.com/Sunrisepeak/mbun/issues/67)。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W131 fresh Node VM/URL/WHATWG probe（3 jobs、复用现有 coordinator binary、无构建）**5/5 files pass、0 fail、0 timeout**：VM indexed/global assignment、legacy URL query、IDN ASCII/Unicode、URLSearchParams invalid-this 全部通过；单文件耗时 164–215ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
