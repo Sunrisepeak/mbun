@@ -8245,7 +8245,7 @@ inline constexpr char kBootstrapJS_[] = R"JS(
   // an aborted signal rejects with an AbortError carrying signal.reason as
   // `cause`, checked before the first byte and between chunks.
   const fsAbortErr = (signal) => {
-    const e = new Error("The operation was aborted");
+    const e = new Error("The operation was aborted.");
     e.name = "AbortError"; e.code = "ABORT_ERR";
     if (signal && signal.reason !== undefined) e.cause = signal.reason;
     return e;
