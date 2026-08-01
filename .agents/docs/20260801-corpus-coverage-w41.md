@@ -75,6 +75,24 @@ the observed Linux limits; the coordinator owns the only root build.
 | W125 | Node HTTP/fs stream lifecycle leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five green leaves; no source owner |
 | W126 | Bun util + Node HTTP mixed leaves | 5 | corrected split-run: 4/5 files green; Bun 350 passed / 53 failed / 403 ran / 54616 expects, Node 2/2 pass; no build | retain indexOfLine, Bun.main, and two Node HTTP leaves; park CryptoHasher HMAC/unsupported-algorithm owners separately |
 | W127 | Bun console + Node HTTP/net leaves | 5 | 4/5 valid files green; Bun 31 passed / 2 failed / 34 ran / 84 expects, Node 3/3 pass; no build | issue #63; retain console.write and all Node leaves, park console.table alignment policy |
+| W128 | Node worker/message-port leaves | 5 | initial 4/5 pass + 1 timeout at 30s; isolated 1 job / 60s confirmation 5/5 pass, slow leaf 57.762s; no build | retain all five, mark MessagePort race as slow stress leaf and exclude it from the default 30s fast lane |
+
+## W128 Node worker stress confirmation
+
+The bounded three-job selector covered MessagePort close/race delivery,
+MessagePort close behavior, worker thread names, worker async-module exit, and
+clean worker exit. The initial result was **4/5 pass** with one 30-second
+timeout and no failure. The timeout had no error output or residual process.
+
+An isolated one-job rerun with a 60-second per-file timeout passed the MessagePort
+race file in **57.762s**, confirming a slow stress path rather than a stable
+hang. The other four files passed in 165–651ms. The five leaves are retained,
+but the 10,000-message race file is not used in the default 30-second fast
+lane.
+
+No source or upstream fixture change was made. No full corpus or workspace-wide
+test was run; selectors and raw runner output were removed after recording both
+the initial bounded result and the isolated confirmation.
 
 ## W127 console TablePrinter triage
 
