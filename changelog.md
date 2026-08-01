@@ -5,6 +5,12 @@
 
 ## 2026-08-02
 
+- W392 Node `PerformanceObserver` forced-GC entry source fix：`globalThis.gc()` 完成真实
+  `Bun.gc(true)` 后，在存在 GC observer 时发布 Node 形状的 forced major-GC entry，并支持
+  `gc` observation selector。focused GC 文件 **1/1 pass**；五文件 performance selector 从
+  W391 的 **4/5 pass、1 fail** 提升到 **5/5 pass、0 fail、0 timeout**；Bun fake-timer 五文件
+  回归 **5/5 green、8 passed、0 failed、8 ran、10 expects**；serial release build **58.98s**。
+  未修改 upstream fixture、未跑全量 corpus。
 - W391 Node `performance.nodeTiming` milestone source fix：`node_perf.cppm` 补齐有序 startup
   milestones、动态 loop start/exit、live duration、idleTime=0 和 Node 要求的 startTime=0。focused
   timing 文件从 **1/1 failure** 到 **1/1 pass**；五文件 performance selector 为 **4/5 pass、1 fail、0

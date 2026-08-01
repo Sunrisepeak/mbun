@@ -215,6 +215,18 @@ inline constexpr std::string_view kNodePerfJS = R"JS(
   }
 
   function addEntry(entry) { buffer.push(entry); notifyObservers(entry); }
+  // node_process_extra calls this after globalThis.gc() completes its real
+  // Bun.gc(true) collection. Publish the forced major-GC shape that Node's
+  // PerformanceObserver contract exposes, without adding a second collector.
+  Object.defineProperty(G, "__mbunPerfGc", {
+    configurable: true, enumerable: false, writable: true,
+    value: () => {
+      if (!hasObserverFor("gc")) return;
+      addEntry(new PerformanceNodeEntry(kConstruct, "gc", "gc", perfNow(), 0, {
+        kind: 4, flags: 4,
+      }));
+    },
+  });
   function timelineEntries(entries) {
     return entries.slice().sort((a, b) => a.startTime - b.startTime);
   }
@@ -360,7 +372,7 @@ inline constexpr std::string_view kNodePerfJS = R"JS(
   performanceObj.timerify = timerify;
 
   // ── PerformanceObserver ───────────────────────────────────────────────────
-  const SUPPORTED = ["mark", "measure", "function", "net", "http"];
+  const SUPPORTED = ["mark", "measure", "function", "net", "http", "gc"];
   class PerformanceObserver {
     constructor(callback) {
       if (typeof callback !== "function") throw errArgType("callback", "function", callback);

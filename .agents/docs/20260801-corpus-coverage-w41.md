@@ -338,6 +338,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W389 | Node `uvMetricsInfo` source fix | 5 | serial release build 59.24s; target 1/1 pass; post selector 2/5 pass, 3 fail, 0 timeout; W387 regression 5/5 green | expose `PerformanceNodeTiming.uvMetricsInfo` and make internal binding read the live timer/check loop counter; no upstream fixture change |
 | W390 | Node `PerformanceObserver.observe()` validation source fix | 5 | target pre 1/1 fail on invalid-argument message; post target 1/1 pass; performance selector 3/5 pass, 2 fail, 0 timeout; Bun W387 regression 5/5 green; serial build 59.06s | validate the options object, required observation selector, entryTypes array, and mutually exclusive selectors; park GC callback and milestone-order owners |
 | W391 | Node `performance.nodeTiming` milestone source fix | 5 | target pre 1/1 fail; post target 1/1 pass; performance selector 4/5 pass, 1 fail, 0 timeout; W390 observer and W389 uvMetricsInfo remain green; Bun regression 5/5 green; serial build 58.82s | provide ordered startup milestones, dynamic loop start/exit, duration, idleTime, and constant startTime; park the remaining GC callback owner |
+| W392 | Node `PerformanceObserver` forced-GC entry source fix | 5 | target 1/1 pass; performance selector 5/5 pass, 0 fail, 0 timeout; Bun fake-timer regression 5/5 green, 8 passed / 0 failed / 8 ran / 10 expects; serial release build 58.98s | publish a forced major-GC entry after the real `Bun.gc(true)` path and accept `gc` observation; no upstream fixture change |
 
 ## W305 Bun/Deno Event/Performance/URL/crypto leaf probe
 
@@ -1834,6 +1835,21 @@ milestone-order owners remain. The five-file Bun fake-timer regression stayed
 **5/5 green, 8 passed, 0 failed, 8 ran, 10 expects** after the serialized release
 build (**59.06s**). No upstream fixture changed and no full corpus/workspace-wide
 test ran.
+
+## W392 Node `PerformanceObserver` forced-GC entry source fix
+
+The remaining performance selector failure was isolated to the `gc` callback
+owner. The real `globalThis.gc()` path already reaches synchronous
+`Bun.gc(true)`; `node_process_extra.cppm` now publishes one forced major-GC
+entry after that native collection returns when a GC observer is registered.
+`node_perf.cppm` also accepts `gc` as an observer selector and preserves the
+Node entry shape (`kind=MAJOR`, `flags=FORCED`).
+
+The focused GC file passed **1/1**. The five-file Node performance selector
+passed **5/5**, with **0 failures** and **0 timeouts**. The five-file Bun
+fake-timer regression remained **5/5 green, 8 passed, 0 failed, 8 ran, 10
+expects**. The serialized release build took **58.98s**. No upstream fixture
+changed and no full corpus/workspace-wide test ran.
 
 ## W391 Node `performance.nodeTiming` milestone source fix
 

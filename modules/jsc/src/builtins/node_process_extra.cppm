@@ -2170,7 +2170,13 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
     try {
       if (!("gc" in G)) {
         const collect = (full) => {
-          try { if (G.Bun && typeof G.Bun.gc === "function") return G.Bun.gc(full !== false); } catch (e) {}
+          try {
+            if (G.Bun && typeof G.Bun.gc === "function") {
+              const result = G.Bun.gc(full !== false);
+              try { if (typeof G.__mbunPerfGc === "function") G.__mbunPerfGc(); } catch (e) {}
+              return result;
+            }
+          } catch (e) {}
           return undefined;
         };
         Object.defineProperty(G, "gc", {
