@@ -240,6 +240,32 @@ the observed Linux limits; the coordinator owns the only root build.
 | W290 | Node module metadata/extension leaves | 5 | 4/5 pass; 1 fail; 0 timeout; no build | retain module children/stat/version and extension-main guards; merge same-filename-as-dir into the W289 extension-over-directory precedence owner |
 | W291 | Bun Base64/Buffer/console/encoding leaves | 5 | 5/5 green; 38 passed / 0 failed / 40 ran / 118 expects; 0 timeout; no build | retain all five Bun guards; no source owner |
 | W292 | Bun console/performance/HTTP leaf probe | 5 | 4/5 green; 30 passed / 4 failed / 34 ran / 66 expects; 0 runner timeout; no build | retain four green guards; park malformed HTTP trailer validation/liveness owner |
+| W293 | Node loader/symlink continuation leaves | 5 | 3/5 pass; 2 fail; 0 timeout; no build | retain entry-point and trailing-slash guards; split custom multi-extension selection from preserve-symlinks cache identity |
+
+## W293 Node loader/symlink continuation leaf probe
+
+The bounded five-job Node selector continued the W289/W290 loader probe with
+entry-point, multi-extension, trailing-slash, and preserve-symlinks leaves. It
+measured **3/5 file-level passes**, **2 failures**, and **0 runner timeouts**.
+Per-file durations were **199–450 ms**.
+
+`test-module-main-fail.js`,
+`test-module-main-preserve-symlinks-fail.js`, and
+`test-require-extensions-same-filename-as-dir-trailing-slash.js` passed. The
+trailing-slash variant passing while W290's non-trailing variant failed narrows
+that existing owner to a specific extensionless directory/file precedence
+path, not all trailing-slash resolution.
+
+`test-module-multi-extensions.js` failed because the custom multi-part
+extension was not selected for the extensionless require path. This is a
+separate custom-extension selection owner. `test-require-symlink.js` failed in
+the preserve-symlinks child/worker path because the symlinked entry's
+`__filename` was absent from `require.cache`; this is a preserve-symlinks
+cache-identity owner. There were no source or upstream-fixture changes.
+
+The selector used the bounded five-job Node runner with a 30-second per-file
+timeout. No full corpus, build, or workspace-wide test was run; the Node
+runner reports file-level status only.
 
 ## W292 Bun console/performance/HTTP leaf probe
 
