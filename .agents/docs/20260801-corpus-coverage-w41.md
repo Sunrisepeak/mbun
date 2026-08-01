@@ -141,6 +141,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W191 | Bun util low-coupling leaves | 5 | 5/5 green; 105 passed / 0 failed / 106 ran / 1 skipped / 409 expects; 0 timeout; no build | retain all five password/hash/error/sleep/path leaves; no source owner |
 | W192 | Bun parser/cron adjacent leaves | 5 | 3/5 green; 464 passed / 78 failed / 578 ran / 755 expects; 0 timeout; no build | retain TLS-segment-size and JSON5/JSONC suites; park cron scheduling plus cron alias/validation owners separately |
 | W193 | Bun low-coupling stream/source-map/system leaves | 5 | 3/5 green; 323 passed / 12 failed / 604 ran / 2302 expects; 0 timeout; no build | retain direct-readable, libuv error-name, histogram; park source-map path/UTF-8 and internal-source-map owners separately |
+| W194 | Bun JSC/resolve/transpiler leaves | 5 | 3/5 green; 39 passed / 73 failed / 130 ran / 286 expects; 0 timeout; no build | retain native-constructor, string-noAtomize, bun-lock; park REPL transform and bytecode/type-export owners separately |
 
 ## W133 Bun.Terminal green cluster
 
@@ -999,6 +1000,26 @@ path/source-root normalization with truncated-UTF-8 mapping, while the
 internal-source-map failures combine astral inline-snapshot positions,
 long-line mapping, cache eviction, and stack-path shape. No source or upstream
 fixture change was made and no mixed fix was attempted.
+
+The selector used the existing coordinator binary through
+`tools/integration/bun_corpus_runner.py` with three bounded jobs, a 30-second
+per-file timeout, and missing Node modules allowed. No full corpus or
+workspace-wide test was run; the selector and raw runner output were removed
+after recording the result.
+
+## W194 Bun JSC/resolve/transpiler owner split
+
+The bounded three-job selector covered native constructor identity, string
+no-atomize behavior, bun.lock import, REPL-mode transpilation, and TypeScript
+type-export cases. It reached **3/5 files green**, with **39 passed**, **73
+failed**, **130 ran**, **286 expects**, and **0 timeouts**.
+
+The retained green files were native constructor identity (**4/4**),
+string-noAtomize (**1/1**), and bun.lock import (**1/1**). The REPL transform
+file splits between destructuring/parser failures and REPL-output behavior.
+The type-export file is dominated by the explicit `--bytecode` unavailable
+compile path plus related compile cases. These are separate owners; no source
+or upstream fixture change was made and no mixed fix was attempted.
 
 The selector used the existing coordinator binary through
 `tools/integration/bun_corpus_runner.py` with three bounded jobs, a 30-second
