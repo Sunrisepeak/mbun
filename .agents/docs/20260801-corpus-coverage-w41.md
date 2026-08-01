@@ -219,6 +219,24 @@ the observed Linux limits; the coordinator owns the only root build.
 | W269 | Node DNS lookup/resolver leaves | 3 | 2/3 pass; 1 fail; 0 timeout; no build | retain lookupService and malformed resolveAny guards; park invalid-hostname/all-mode sync validation owner |
 | W270 | Bun module/Buffer/DOMException leaves | 3 | 2/3 green; 8 passed / 1 failed / 9 ran / 44 expects; 0 timeout; no build | retain Buffer and DOMException leaves; park `node:missing` built-in error contract |
 | W271 | Bun Buffer/process/module leaves | 3 | 2/3 green; 9 passed / 5 failed / 14 ran / 21 expects; 0 timeout; no build | retain UTF-16 Buffer and Module options.paths; park process.nextTick input/args/order/repeat owners |
+| W272 | Node querystring pure-contract leaves | 3 | 3/3 pass; 0 fail; 0 timeout; no build | retain escape coercion/URI errors, multi-character separators, and non-finite maxKeys behavior; no source owner |
+
+## W272 Node querystring pure-contract plain-script leaf probe
+
+The bounded three-job Node selector covered `test-querystring-escape.js`,
+`test-querystring-multichar-separator.js`, and
+`test-querystring-maxKeys-non-finite.js`. It measured **3/3 file-level passes**,
+**0 failures**, and **0 runner timeouts**. Per-file durations were 181–197ms.
+
+The probe retained querystring value coercion and malformed-URI behavior,
+multi-character key/value separators for parse/stringify, and the 10,000-key
+non-finite `maxKeys` boundary. The Node corpus runner reports only file-level
+status for these plain scripts, so no synthetic subtest count was added.
+
+No source or upstream fixture change was made. The selector reused the
+coordinator binary through `tools/integration/node_corpus_runner.py` with
+three bounded jobs and a 30-second per-file timeout. No full corpus, build,
+or workspace-wide test was run.
 
 ## W271 Bun Buffer/process/module leaf probe
 
