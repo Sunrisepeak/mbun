@@ -1756,6 +1756,19 @@ export constexpr std::string_view kHttp2JS_part1 = R"JS(
       this._openRequests = 0;
       this._pendingSubmits = [];
       this._destroyPending = false;
+      this._connectAbort = false;
+      const connectSignal = this._options.signal;
+      if (connectSignal && typeof connectSignal.addEventListener === "function") {
+        const onConnectAbort = () => {
+          this._connectAbort = true;
+          if (!this.destroyed) this.destroy(abortErr(connectSignal.reason));
+        };
+        if (connectSignal.aborted === true) G.queueMicrotask(onConnectAbort);
+        else {
+          connectSignal.addEventListener("abort", onConnectAbort, { once: true });
+          this.once("close", () => { try { connectSignal.removeEventListener("abort", onConnectAbort); } catch (e) {} });
+        }
+      }
       // node Http2Session: `encrypted` reflects the transport, `alpnProtocol` is
       // "h2c" for a cleartext session, and `originSet` stays undefined until an
       // ORIGIN frame arrives (DEFERRED).
@@ -1833,6 +1846,7 @@ export constexpr std::string_view kHttp2JS_part1 = R"JS(
           servername: options && options.servername ? options.servername
             : (net && typeof net.isIP === "function" && net.isIP(host) ? undefined : host),
         });
+        delete tlsOpts.signal;
         // node initializeTLSOptions: the h2 ALPN list is only imposed when the
         // caller did NOT supply an ALPNCallback (the two are mutually exclusive
         // in tls.connect), and allowHTTP1 appends the fallback protocol.
@@ -1855,6 +1869,7 @@ export constexpr std::string_view kHttp2JS_part1 = R"JS(
         // both. Going through net.connect also lets localAddress/family/lookup
         // reach the transport the way node's spread does.
         const netOpts = Object.assign({ port: String(port), host }, options);
+        delete netOpts.signal;
         const sock = typeof net.connect === "function" ? net.connect(netOpts) : new net.Socket();
         this._rawSocket = sock;
         sock.on("connect", () => { self.alpnProtocol = "h2c"; self._onSocketReady(); });
@@ -2597,7 +2612,10 @@ export constexpr std::string_view kHttp2JS_part1 = R"JS(
       // socket teardown, and force-finishing those cost 5 files (they emit their
       // own 'close'/'aborted' first). A stream on a session that never connected
       // has nothing to drive it at all, so it kept its handle and the loop alive.
-      const pending = !this._connected ? Array.from(this.streams.values()) : [];
+      const pending = this._connectAbort
+        ? Array.from(this.streams.values())
+        : (!this._connected ? Array.from(this.streams.values()) : []);
+      const pendingSet = new Set(pending);
       // An OPEN stream is usually driven to its end by the socket teardown, and
       // force-finishing it in this microtask cost 5 files last time — it ran
       // BEFORE the stream's own 'close'/'aborted' and reordered them. But when
@@ -2607,7 +2625,7 @@ export constexpr std::string_view kHttp2JS_part1 = R"JS(
       // (test-http2-client-session-close-before-stream-close). Sweep them one
       // I/O TURN later instead: every natural path has already run by then, so
       // only the genuinely dangling ones are still here.
-      const open = this._connected ? Array.from(this.streams.values()) : [];
+      const open = this._connected ? Array.from(this.streams.values()).filter((s) => !pendingSet.has(s)) : [];
       // A request still queued behind the peer's concurrency limit has no id and
       // is not in `streams`, so the socket teardown cannot reach it. node
       // destroys its pending streams with ERR_HTTP2_STREAM_CANCEL; leaving them
