@@ -639,6 +639,15 @@ export constexpr std::string_view kHttp2JS_part2 = R"JS(
         _srvSettings && "enablePush" in _srvSettings
           ? Object.assign({}, _srvSettings, { enablePush: false })
           : _srvSettings));
+      // node counts the server's initial SETTINGS frame toward
+      // maxOutstandingSettings until the peer ACKs it. Without this entry the
+      // first application settings() call starts at zero, so a limit of two
+      // never trips on the second call (test-http2-too-many-settings).
+      this._pendingSettingsAcks = [{
+        settings: _srvSettings ? Object.assign({}, _srvSettings) : {},
+        cb: null,
+        start: Date.now(),
+      }];
       socket.on("data", (d) => self._onData(d));
       socket.on("error", (e) => self._onSocketError(e));
       socket.on("close", () => self._onSocketClose());

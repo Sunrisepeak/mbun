@@ -349,6 +349,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W401 | Node fs flush revalidation | 5 | `writeFile/appendFile` flush pair plus three fs guards 5/5 pass, 0 fail, 0 timeout | inventory entry is stale for this slice; no source owner |
 | W402 | Node HTTP/2 `unknownProtocol` Duplex identity source fix | 5 | baseline selector 4/5 pass + 1 fail; focused target 1/1 fail → 1/1 pass; post selector 5/5 pass, 0 fail, 0 timeout; Bun fake-timer regression 5/5 green, 8 passed / 0 failed / 8 ran / 10 expects; serial release build 59.29s | connect the custom `net.Socket` prototype to `stream.Duplex.prototype` while preserving its reactor-specific methods; no upstream fixture change |
 | W403 | Node HTTP/2 delayed request/GOAWAY ready-edge source fix | 5 | baseline selector 4/5 pass + 1 fail; focused target 1/1 fail → 1/1 pass; post selector 5/5 pass, 0 fail, 0 timeout; W402 HTTP/2 regression 5/5 pass, 0 fail, 0 timeout; Bun fake-timer guard 4 green + 1 no-tests, 43 passed / 0 failed / 43 ran / 98 expects; serial release builds 58.98s + 59.16s + 59.29s | defer cleartext HTTP/2 ready handling to the next I/O turn so `request()` + `close()` preserves Node's `ERR_HTTP2_GOAWAY_SESSION` timing; no upstream fixture change |
+| W404 | Node HTTP/2 initial SETTINGS ACK accounting source fix | 5 | baseline selector 2/5 pass + 3 timeout; focused target 1/1 timeout → 1/1 pass; post selector 3/5 pass + 2 timeout; W403 regression 5/5 pass, W402 regression 5/5 pass; serial release build 59.50s | count the server's initial SETTINGS frame in `pendingSettingsAck` so `maxOutstandingSettings: 2` trips on the second application settings call; park autoselect and trailer-size stalled exchanges as separate owners |
 
 ## W305 Bun/Deno Event/Performance/URL/crypto leaf probe
 
@@ -1884,6 +1885,29 @@ release builds took **58.98s**, **59.16s**, and **59.29s**; the latter is the
 final verified source state after the stale-binary guard required a rebuild for
 a comment-only source mtime change. No upstream fixture changed and no full
 corpus/workspace-wide test ran.
+
+## W404 Node HTTP/2 initial SETTINGS ACK accounting source fix
+
+The W404 five-file HTTP/2 misc selector initially measured **2/5 passes, 3
+timeouts, and 0 failures**. The focused
+`test-http2-too-many-settings.js` timeout had a narrow source owner:
+`ServerHttp2Session` wrote its initial SETTINGS frame but did not count the
+outstanding peer ACK. With `maxOutstandingSettings: 2`, both application
+`settings()` calls therefore fit in the local queue and the expected
+`ERR_HTTP2_MAX_PENDING_SETTINGS_ACK` never arrived.
+
+`js_http2_part2.cppm` now seeds the server session's pending-settings queue with
+that initial frame. The focused file moved from **1/1 timeout** to **1/1 pass**.
+The post selector measured **3/5 passes, 2 timeouts, and 0 failures**:
+`test-http2-info-headers-errors.js` and `test-http2-respond-nghttperrors.js`
+were already green, while `test-http2-autoselect-protocol.js` and
+`test-http2-exceeds-server-trailer-size.js` remained independent stalled
+exchanges. Hang-dump evidence for all three original timeouts showed live
+server/socket handles and **0 timers**, so they were not merged into this
+settings fix. The W403 five-file regression stayed **5/5 pass** and the W402
+five-file regression stayed **5/5 pass**. One serial release build took
+**59.50s**. No upstream fixture changed and no full corpus/workspace-wide test
+ran.
 
 ## W401 Node fs flush revalidation
 

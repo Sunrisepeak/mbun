@@ -5,6 +5,13 @@
 
 ## 2026-08-02
 
+- W404 Node HTTP/2 initial SETTINGS ACK accounting source fix：`ServerHttp2Session` 现在把初始 SETTINGS
+  frame 计入 `pendingSettingsAck`，`maxOutstandingSettings: 2` 在第二次 application `settings()` 时
+  正确触发 `ERR_HTTP2_MAX_PENDING_SETTINGS_ACK`。focused 文件从 **1/1 timeout** 到 **1/1 pass**；W404
+  五文件 selector 从 **2/5 pass、3 timeout** 到 **3/5 pass、2 timeout、0 fail**；W403/W402 回归各
+  **5/5 pass**；serial release build **59.50s**。剩余两个 timeout 经 hang-dump 确认为独立 stalled
+  exchange owner，未做 speculative 修改、未修改 upstream fixture、未跑全量 corpus。
+
 - W403 Node HTTP/2 delayed request/GOAWAY ready-edge source fix：修复 loopback `net.connect()` 在同一
   microtask 发布连接、抢在测试 `setImmediate(client.close())` 之前的问题；cleartext HTTP/2 ready
   edge 现在延迟到下一轮 I/O，delayed-request 的 `ERR_HTTP2_GOAWAY_SESSION` 时序与 Node 一致。
