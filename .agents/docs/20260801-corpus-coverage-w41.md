@@ -118,6 +118,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W168 | Bun util error/ANSI leaves | 4 | 2/4 green; 50 passed / 203 failed / 253 ran / 261 expects; 0 timeout; no build | retain error-code-mirror/exotic-global; park reportError printer and wrapAnsi multi-owner failures |
 | W169 | Node fs/promises basic leaves | 5 | 4/5 pass; 1 fail; 0 timeout; no build | retain four green leaves; park readfile zero-byte-liar child-fixture callback owner |
 | W170 | Node fs vector/copy/truncate leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five vector/copy/truncate leaves; no source owner |
+| W171 | Node fs directory/stat leaves | 5 | 4/4 executable pass; 1 MacOS-inapplicable skip; 0 fail; 0 timeout; no build | retain all four executable leaves; exclude MacOS-only readdir buffer skip |
 
 ## W133 Bun.Terminal green cluster
 
@@ -652,6 +653,20 @@ after recording the result.
 The bounded three-job selector covered readv, writev, writevSync, copyfile,
 and truncateSync behavior. All **5/5 files passed**, with **0 failures and 0
 timeouts**. Per-file durations were 165–265ms.
+
+No source or upstream fixture change was made. The selector used the existing
+coordinator binary through `tools/integration/node_corpus_runner.py` with
+three bounded jobs and a 30-second per-file timeout. No full corpus or
+workspace-wide test was run; the selector and raw runner output were removed
+after recording the result.
+
+## W171 Node fs directory/stat green cluster
+
+The bounded three-job selector covered opendir, readdir entry types, symlink
+entry types, and stat behavior. All **4/4 Linux-executable files passed**, with
+**0 failures and 0 timeouts**. The remaining readdir-buffer file is explicitly
+MacOS-only and was skipped, so it is excluded from the green denominator.
+Executable per-file durations were 165–352ms.
 
 No source or upstream fixture change was made. The selector used the existing
 coordinator binary through `tools/integration/node_corpus_runner.py` with
