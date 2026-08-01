@@ -5,6 +5,7 @@
 
 ## 2026-08-01
 
+- W159 fresh Node assert owner-split probe（3 jobs、复用现有 coordinator binary、无构建）**2/5 files pass、3 fail、0 timeout**：assert-fail 与 assert-if-error 通过；deep、partial-deep-equal、typed-array-deepequal 跨 generic deep-comparison、partial-matching、typed-array assertion owners，分别停车，未混修或猜测性开 issue。
 - W158 fresh Node Buffer compare/copy probe（3 jobs、复用现有 coordinator binary、无构建）**5/5 files pass、0 fail、0 timeout**：compare、copy、equals、indexOf、double-precision read 全部通过；单文件耗时 165–300ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W157 fresh Node Buffer numeric read/write probe（3 jobs、复用现有 coordinator binary、无构建）**5/5 files pass、0 fail、0 timeout**：signed/unsigned integer reads、floating-point reads、signed/unsigned integer writes 全部通过；单文件耗时 164–201ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W156 fresh Node util low-coupling probe（3 jobs、复用现有 coordinator binary、无构建）**5/5 files pass、0 fail、0 timeout**：util.deprecate、util.inherits、util.types、type-existence helpers、VT control-character stripping 全部通过；单文件耗时 165–350ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。

@@ -106,6 +106,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W156 | Node util low-coupling leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five util leaves; no source owner |
 | W157 | Node Buffer numeric read/write leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five Buffer numeric leaves; no source owner |
 | W158 | Node Buffer compare/copy leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five Buffer compare/copy leaves; no source owner |
+| W159 | Node assert deep-comparison leaves | 5 | 2/5 pass; 3 fail; 0 timeout; no build | retain assert-fail/if-error; park deep/partial/typed-array assertion owners separately |
 
 ## W133 Bun.Terminal green cluster
 
@@ -495,6 +496,21 @@ after recording the result.
 The bounded three-job selector covered Buffer compare, copy, equals, indexOf,
 and double-precision read behavior. All **5/5 files passed**, with **0
 failures and 0 timeouts**. Per-file durations were 165–300ms.
+
+No source or upstream fixture change was made. The selector used the existing
+coordinator binary through `tools/integration/node_corpus_runner.py` with
+three bounded jobs and a 30-second per-file timeout. No full corpus or
+workspace-wide test was run; the selector and raw runner output were removed
+after recording the result.
+
+## W159 Node assert owner split
+
+The bounded three-job selector covered five assertion leaves. It measured **2/5
+files passed, 3/5 failed, and 0 timeouts**. `test-assert-fail.js` and
+`test-assert-if-error.js` stayed green. The failures in `test-assert-deep.js`,
+`test-assert-partial-deep-equal.js`, and `test-assert-typedarray-deepequal.js`
+span generic deep-comparison, partial-matching, and typed-array assertion
+contracts; they are parked as separate owners rather than mixed into one fix.
 
 No source or upstream fixture change was made. The selector used the existing
 coordinator binary through `tools/integration/node_corpus_runner.py` with
