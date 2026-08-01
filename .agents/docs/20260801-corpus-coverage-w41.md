@@ -37,6 +37,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W87 | Bun Node-fs leaves | 5 | 5/5 green; 46 passed / 0 failed / 70 ran / 92 expects | fresh confirmation; no source owner |
 | W88 | Bun Node-fs directory/Stats leaves | 5 | 5/5 green; 52 passed / 0 failed / 55 ran / 138 expects | fresh confirmation of narrow fs leaves; no source owner |
 | W89 | Bun Node-inspector probe | 5 | 4/5 green; 34 passed / 27 failed / 64 ran / 131 expects | park inspector-profiler behind missing inspector/profiler subsystem |
+| W90 | Bun Node-fs/child_process leaves | 5 | corrected probe: 4/5 green; 39 passed / 12 failed / 56 ran / 107 expects | retain four green leaves; park fs/promises multi-owner failures |
 
 ## Delivered slice
 
@@ -1071,6 +1072,24 @@ surface on Linux:
   boundary, not a safe error-text or one-method patch; it is parked without a
   speculative issue or source change. No upstream fixture changes, full corpus,
   or workspace-wide build were performed.
+
+### W90 Bun Node-fs/child_process leaf probe
+
+- The first dispatch had one selector typo (`fs/fs-promises.test.js`); the
+  runner classified it as a harness load error with no tests. It was not counted
+  as runtime evidence. The corrected selector used the real
+  `fs/promises.test.js` path and reran the same five-file wave with **5 bounded
+  jobs** and no build.
+- The authoritative corrected result was **4/5 files green, 39 passed, 12
+  failed, 56 ran, 107 expects**. `child-process-exec` was **11/11**,
+  `child-process-rlimit-nofile` **1/1**, `child-process-stdio` **7/7**, and
+  Linux `fs-stat-seccomp` **3/3**.
+- `fs/promises` reached **17 passed / 12 failed / 34 ran**. Its failures split
+  across async stack frames, the internal stream loader, FileHandle close/
+  in-flight lifetime, and AbortError message/shape. The current source layout
+  does not expose one safe live owner for this mixed row, so no issue or patch
+  was opened. No upstream fixture changes, full corpus, or workspace-wide
+  build were performed; temporary selector and output data were removed.
 
 ### W59 Node buffer leaf sample
 

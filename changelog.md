@@ -5,6 +5,11 @@
 
 ## 2026-08-01
 
+- W90 fresh Bun Node-fs/child_process leaf probe（5 jobs、复用 W85 binary、无构建）先纠正一次 selector
+  拼写错误后，以真实 `fs/promises.test.js` 重跑；权威结果为 **4/5 files green、39 passed、12 failed、
+  56 ran、107 expects**。`child-process-exec` **11/11**、rlimit **1/1**、stdio **7/7**、Linux
+  fs-stat-seccomp **3/3**；`fs/promises` 为 **17 passed / 12 failed / 34 ran**，失败跨 async stack、
+  internal stream loader、FileHandle 生命周期和 AbortError shape 多个 owner，停车不混修。
 - W89 fresh Bun Node-inspector probe（5 jobs、复用 W85 binary、无构建）测得 **4/5 files green、34
   passed、27 failed、64 ran、131 expects**：`inspector.test` **5/5**、diagnostics channel **6/9**、
   perf hooks **8/8**、timers promises **4/4**；`inspector-profiler` 为 **11 passed / 27 failed / 38 ran**。
