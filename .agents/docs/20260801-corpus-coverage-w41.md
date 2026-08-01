@@ -83,6 +83,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W133 | Bun.Terminal native leaves | 3 | 3/3 green; 129 passed / 0 failed / 130 ran / 334 expects; no build | retain all three terminal leaves; no source owner |
 | W134 | Node HTTP low-coupling leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five HTTP leaves; no source owner |
 | W135 | Bun spawn/io low-coupling leaves | 5 | 3/5 green; 58 passed / 14 failed / 75 ran / 1391 expects; 0 timeout; no build | retain exit-code, empty stdin, kill-signal; park Bun.write and spawnSync multi-owner failures |
+| W136 | Bun Web Encoding leaves | 5 | 4/5 green; 82 passed / 34 failed / 116 ran / 10777 expects; 0 timeout; no build | retain four encoding leaves; park CJK decoder behind missing legacy-label support |
 
 ## W133 Bun.Terminal green cluster
 
@@ -126,6 +127,29 @@ timed output, so it is not one safe owner. `spawnSync.test.ts` took 7029ms and
 had **6 passed / 7 failed / 16 ran / 16 expects**; its failures split across
 timeout-zero behavior, memfd/counter optimizations, and uid/gid validation.
 Both files are parked without a speculative source change or issue.
+
+No source or upstream fixture change was made. The selector used the existing
+coordinator binary through `tools/integration/bun_corpus_runner.py` with three
+bounded jobs, a 30-second per-file timeout, and missing Node modules allowed.
+No full corpus or workspace-wide test was run; the selector and raw runner
+output were removed after recording the result.
+
+## W136 Bun Web Encoding green cluster
+
+The bounded three-job selector covered bad stream chunks, CJK decoding,
+single-byte decoding, TextEncoder, and TextEncoderStream. It reached **4/5
+files green**, with **82 passed / 34 failed / 116 ran / 10777 expects / 0
+timeouts**. The green files were `encode-bad-chunks.test.ts` (**6/6**),
+`text-decoder-single-byte.test.ts` (**14/14**), `text-encoder-stream.test.ts`
+(**20/20**), and `text-encoder.test.js` (**42/42**); their durations were
+165–565ms.
+
+`text-decoder-cjk.test.ts` took 202ms and failed **34/34** cases before any
+assertion expectations were counted. Every case reported an unsupported
+legacy encoding label across Shift_JIS, EUC-JP, Big5, EUC-KR, GBK, GB18030, or
+ISO-2022-JP. This is one broad missing-encoding subsystem owner, not a safe
+single-file patch, so it is parked without a speculative issue or source
+change.
 
 No source or upstream fixture change was made. The selector used the existing
 coordinator binary through `tools/integration/bun_corpus_runner.py` with three

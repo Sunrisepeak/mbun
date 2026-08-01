@@ -5,6 +5,7 @@
 
 ## 2026-08-01
 
+- W136 fresh Bun Web Encoding probe（3 jobs、复用现有 coordinator binary、无构建）**4/5 files green、82 passed、34 failed、116 ran、10777 expects、0 timeout**：bad chunks、single-byte decoder、TextEncoder、TextEncoderStream 全部通过；CJK decoder 34 个 case 均因缺少 Shift_JIS/EUC-JP/Big5/EUC-KR/GBK/GB18030/ISO-2022-JP legacy encoding label 支持而失败，停车为宽编码 subsystem owner。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W135 fresh Bun spawn/io low-coupling probe（3 jobs、复用现有 coordinator binary、无构建）**3/5 files green、58 passed、14 failed、75 ran、1391 expects、0 timeout**：exit-code、empty ArrayBuffer/Blob stdin、kill-signal 全部通过；`Bun.write` 7 个失败横跨 file/content、mtime、GC、copyFileRange、fd/createPath、timed output，`spawnSync` 7 个失败横跨 timeout、memfd/counters、uid/gid，均暂不归并或猜测性开 issue。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W134 fresh Node HTTP low-coupling cluster（3 jobs、复用现有 coordinator binary、无构建）**5/5 files pass、0 fail、0 timeout**：agent close、destroyed-socket、default headers、input function、null-prototype options 全部通过；单文件耗时 205–299ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。首次 selector 路径校验未启动测试，不计入结果。
 - W133 fresh Bun.Terminal native cluster（3 jobs、复用现有 coordinator binary、无构建）**3/3 files green、129 passed、0 failed、130 ran、334 expects**：core terminal、platform gaps、terminal spawn integration 全部通过；单文件耗时 1.233–3.694s，无 timeout。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
