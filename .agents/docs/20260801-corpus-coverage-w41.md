@@ -71,6 +71,33 @@ the observed Linux limits; the coordinator owns the only root build.
 | W121 | Node HTTP/FS/UDP/zlib leaves | 5 | 4/5 pass; 1 fail; 0 timeout; no build | retain four green leaves; park zlib weak-handle memory accounting after a bounded zero-delta reproduction |
 | W122 | Bun util file/stream leaves | 5 | 4/5 green; 12 passed / 2 failed / 14 ran / 432 expects; no build | issue #62; retain four green leaves, park `readableStreamToArrayBuffer` intrinsic Promise plumbing |
 | W123 | Node fs error/HTTP lifecycle leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five green leaves; no source owner |
+| W124 | Bun util object/string/file/GC/stdin leaves | 5 | 2/5 green; 11 passed / 6 failed / 17 ran / 250 expects; no build | retain stdin + error-GC; park internal helper exports, Bun.file async-stack/JSON message owners separately |
+
+## W124 Bun util owner triage
+
+The bounded three-job selector covered Bun object initialization, BunString
+thread-safe refcounts, Error GC, Bun.file behavior, and stdin slicing. The
+result was **2/5 files green**, **11 passed**, **6 failed**, **17 ran**, and
+**250 expects**, with no timeout.
+
+The retained green leaves are stdin slicing (**2/2**) and Error GC (**4/4**).
+The non-green files are intentionally split:
+
+- `BunObject.test.ts`: **2 passed / 1 failed / 3 ran**; the one failure is the
+  missing `hasNonReifiedStatic` internal test helper, while module import and
+  Bun object identity checks pass.
+- `bunstring-tothreadsafe.test.ts`: **1 passed / 1 failed / 2 ran**; the real
+  Bun.file/fs.write caller balance passes, while the optional internal
+  refcount-delta helper is not exported.
+- `bun-file.test.ts`: **2 passed / 4 failed / 6 ran**; three failures are
+  async-stack frame formatting and one is the empty-JSON parse message. These
+  are separate from the two internal-helper gaps.
+
+No source or upstream fixture change was made. The selector used the existing
+coordinator binary through `tools/integration/bun_corpus_runner.py` with three
+bounded jobs, a 30-second per-file timeout, and missing Node modules allowed.
+Raw output was discarded without copying its local environment expansion into
+this record. No full corpus or workspace-wide test was run.
 
 ## W123 Node fs and HTTP green leaves
 
