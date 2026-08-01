@@ -5,6 +5,8 @@
 
 ## 2026-08-01
 
+- W234 fresh Bun Node util promisify/callbackify leaf probe（3 jobs、复用现有 coordinator binary、无构建）**2/3 files green、297 passed、2 failed、300 ran、559 expects、0 timeout**：util.promisify 16/17（1 skip）、util.callbackify 90/90；util.test 191/193，两个失败均为 runner color-disabled policy 下的 ANSI styleText colorization。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W233 fresh Node path/querystring/URL leaf probe（3 jobs、复用现有 coordinator binary、无构建）**3/3 files pass、0 fail、0 timeout**：path.parse/format、querystring、legacy url.parse/url.format 全部 clean-exit，单文件耗时 200–250ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W232 fresh Node string/events/URL leaf probe（3 jobs、复用现有 coordinator binary、无构建）**1/3 files pass、2 fail、0 timeout**：url.parse query clean-exit；events.once invalid options 缺少预期 `ERR_INVALID_ARG_TYPE` code，StringDecoder forged receiver 未抛 `ERR_INVALID_THIS`，收敛为两个 API semantic owners。单文件耗时 198–401ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W231 fresh Bun Node util/events/string_decoder probe（3 jobs、复用现有 coordinator binary、无构建）**3/3 files green、214 passed、0 failed、214 ran、6538 expects、0 timeout**：EventEmitter 67、StringDecoder 95、util.types 52 全部 clean-exit，单文件耗时 200–451ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W230 fresh Bun Node path/URL leaf probe（3 jobs、复用现有 coordinator binary、无构建）**3/3 files green、8 passed、0 failed、8 ran、0 expects、0 timeout**：path.basename 4/4、path.extname 3/3、WHATWG url.format 1/1 全部 clean-exit，单文件约 200ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。

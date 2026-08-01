@@ -180,6 +180,8 @@ the observed Linux limits; the coordinator owns the only root build.
 | W230 | Bun Node path/URL leaves | 3 | 3/3 green; 8 passed / 0 failed / 8 ran / 0 expects; 0 timeout; no build | retain basename/extname platform cases and WHATWG URL format; no source owner |
 | W231 | Bun Node util/events/string_decoder leaves | 3 | 3/3 green; 214 passed / 0 failed / 214 ran / 6538 expects; 0 timeout; no build | retain EventEmitter, StringDecoder, and util.types green cluster; no source owner |
 | W232 | Node string/events/URL leaves | 3 | 1/3 pass; 2 fail; 0 timeout; no build | retain URL query parsing; park events.once invalid-option error code and StringDecoder forged-receiver ERR_INVALID_THIS owners |
+| W233 | Node path/querystring/URL leaves | 3 | 3/3 pass; 0 fail; 0 timeout; no build | retain path parse/format, querystring, and legacy URL parse/format leaves; no source owner |
+| W234 | Bun Node util leaves | 3 | 2/3 green; 297 passed / 2 failed / 300 ran / 559 expects; 0 timeout; no build | retain promisify/callbackify; park util.styleText ANSI colorization under runner color policy |
 
 ## W133 Bun.Terminal green cluster
 
@@ -286,6 +288,32 @@ upstream files are plain scripts, so file-level clean exit is authoritative.
 No source or fixture change was made, and no full corpus or workspace-wide test
 was run; the selector and raw runner output were removed after recording the
 result.
+
+## W234 Bun Node util partial cluster
+
+The bounded three-job Bun selector covered `util.promisify`, `util.callbackify`,
+and the broader Node util contract. **2/3 files were green**, reaching **297
+passed / 2 failed / 300 ran / 559 expects** with **0 timeouts**; per-file
+durations were 199–249ms.
+
+`util.promisify` recorded 16 passes across 17 ran tests (one upstream skip), and
+`util.callbackify` recorded 90/90 passes. The broader util file recorded 191
+passes and two failures, both ANSI `styleText` colorization cases affected by
+the runner's color-disabled policy. No source or upstream fixture change was
+made, and no full corpus or workspace-wide test was run; the selector and raw
+runner output were removed after recording the result.
+
+## W233 Node path/querystring/URL green cluster
+
+The bounded three-job Node selector covered POSIX/Win32 `path.parse` and
+`path.format`, prototype-safe querystring parsing/stringifying and limits, and
+legacy URL parse/format behavior. All **3/3 files passed**, with **0 failures
+and 0 timeouts**; per-file durations were 200–250ms.
+
+These plain upstream scripts were classified at file-level clean exit. No
+source or upstream fixture change was made, and no full corpus or workspace-wide
+test was run; the selector and raw runner output were removed after recording
+the result.
 
 ## W232 Node string/events/URL owner split
 
