@@ -6034,12 +6034,115 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     // 32793 pins the clock from `bun -e`. The Date patch is installed lazily on
     // the first call so an ordinary run keeps the untouched native Date.
     let sysTime = null;
+    // Run-mode fake timers use the same queue contract as the bun:test runner,
+    // but cannot borrow test_runner.cppm: `bun -e`/`Bun.jest()` does not load the
+    // runner partition. Keep the implementation here real rather than exposing
+    // methods that only make a child process exit successfully.
+    const runModeFT = { on: false, now: 0, dateOffset: 0, seq: 0, queue: [], saved: null };
+    const runModeTimerId = (t) => (t !== null && typeof t === "object") ? t._id : t;
+    const runModeRemove = (id) => {
+      for (let i = 0; i < runModeFT.queue.length; i++) {
+        if (runModeFT.queue[i].id === id) { runModeFT.queue.splice(i, 1); return; }
+      }
+    };
+    const runModeHandle = (rec) => ({
+      _id: rec.id,
+      [Symbol.toPrimitive]() { return rec.id; },
+      ref() { return this; },
+      unref() { return this; },
+      hasRef() { return true; },
+      refresh() { rec.fireAt = runModeFT.now + (rec.interval || rec.delay); return this; },
+      close() { runModeRemove(rec.id); return this; },
+      [Symbol.dispose]() { runModeRemove(rec.id); },
+    });
+    const runModeSchedule = (fn, delay, args, interval) => {
+      let d = Number(delay); if (!isFinite(d) || d < 0) d = 0;
+      const rec = { id: ++runModeFT.seq, fireAt: runModeFT.now + d,
+        fn, args, interval, delay: d };
+      runModeFT.queue.push(rec);
+      return runModeHandle(rec);
+    };
+    const runModeSyncClock = () => { sysTime = runModeFT.dateOffset + runModeFT.now; };
+    const runModeFire = (rec) => {
+      runModeFT.now = rec.fireAt;
+      runModeSyncClock();
+      if (rec.interval > 0) rec.fireAt += rec.interval;
+      else runModeRemove(rec.id);
+      if (typeof rec.fn === "function") rec.fn.apply(undefined, rec.args);
+    };
+    const runModeAdvance = (ms) => {
+      let n = Number(ms); if (!isFinite(n) || n < 0) n = 0;
+      const target = runModeFT.now + (n === 0 ? 1 : n);
+      let guard = 0;
+      for (;;) {
+        let next = null;
+        for (const rec of runModeFT.queue) {
+          if (rec.fireAt <= target && (!next || rec.fireAt < next.fireAt ||
+              (rec.fireAt === next.fireAt && rec.id < next.id))) next = rec;
+        }
+        if (!next || ++guard > 100000) break;
+        runModeFire(next);
+      }
+      if (runModeFT.now < target) { runModeFT.now = target; runModeSyncClock(); }
+    };
+    const runModeInstall = (opts) => {
+      const RD = G.__mbunRunRealDate || G.Date;
+      let base = RD.now();
+      if (opts !== undefined && opts !== null) {
+        if (typeof opts !== "object") throw new TypeError("useFakeTimers() expects an options object");
+        const n = opts.now;
+        if (n !== undefined && n !== null) {
+          if (typeof n === "number") base = n;
+          else if (typeof n === "object" && typeof n.getTime === "function") base = n.getTime();
+          else throw new TypeError("'now' must be a number or Date");
+        }
+      }
+      runModeFT.now = 0; runModeFT.seq = 0; runModeFT.queue = [];
+      runModeFT.dateOffset = Math.floor(base); runModeSyncClock();
+      setSystemTime(runModeFT.dateOffset);
+      if (runModeFT.on) return;
+      runModeFT.on = true;
+      runModeFT.saved = { setTimeout: G.setTimeout, clearTimeout: G.clearTimeout,
+        setInterval: G.setInterval, clearInterval: G.clearInterval };
+      const fakeSetTimeout = function (fn, delay) {
+        return runModeSchedule(fn, delay, Array.prototype.slice.call(arguments, 2), 0);
+      };
+      fakeSetTimeout.clock = true;
+      const fakeSetInterval = function (fn, delay) {
+        let iv = Number(delay); if (!isFinite(iv) || iv <= 0) iv = 1;
+        return runModeSchedule(fn, delay, Array.prototype.slice.call(arguments, 2), iv);
+      };
+      G.setTimeout = fakeSetTimeout;
+      G.setInterval = fakeSetInterval;
+      G.clearTimeout = (t) => { if (t != null) runModeRemove(runModeTimerId(t)); };
+      G.clearInterval = (t) => { if (t != null) runModeRemove(runModeTimerId(t)); };
+    };
+    const runModeUninstall = () => {
+      if (!runModeFT.on) return;
+      runModeFT.on = false;
+      if (runModeFT.saved) {
+        G.setTimeout = runModeFT.saved.setTimeout; G.clearTimeout = runModeFT.saved.clearTimeout;
+        G.setInterval = runModeFT.saved.setInterval; G.clearInterval = runModeFT.saved.clearInterval;
+        runModeFT.saved = null;
+      }
+      runModeFT.queue = [];
+    };
+    const runModeJest = { fn: (i) => i || (() => {}),
+      useFakeTimers: (o) => { runModeInstall(o); return runModeJest; },
+      useRealTimers: () => { runModeUninstall(); setSystemTime(); return runModeJest; },
+      setSystemTime: (v) => { setSystemTime(v); if (runModeFT.on && v !== undefined && v !== null) { runModeFT.dateOffset = sysTime - runModeFT.now; } return runModeJest; },
+      advanceTimersByTime: (ms) => { runModeAdvance(ms); return runModeJest; },
+      runAllTimers: () => { while (runModeFT.queue.length) { const next = runModeFT.queue.reduce((a, b) => !a || b.fireAt < a.fireAt ? b : a, null); if (!next) break; runModeFire(next); } return runModeJest; },
+      clearAllTimers: () => { runModeFT.queue = []; return runModeJest; },
+      getTimerCount: () => runModeFT.queue.length,
+      isFakeTimers: () => runModeFT.on };
     const setSystemTime = (v) => {
       if (v === undefined || v === null) { sysTime = null; return; }
       sysTime = (typeof v === "number") ? v : Number(v.valueOf());
       if (G.__mbunRunDatePatched) return;
       G.__mbunRunDatePatched = true;
       const RD = G.Date;
+      G.__mbunRunRealDate = RD;
       const MbunDate = function Date(...args) {
         if (!new.target) return RD();                       // Date() → string
         const a = (args.length === 0 && sysTime !== null) ? [sysTime] : args;
@@ -6053,7 +6156,7 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     Object.defineProperty(M, "bun:test", { enumerable: true, configurable: true,
       get() { return G.__mbunBT || { test: noop, it: noop, xit: noop.skip, xtest: noop.skip,
         describe: desc, xdescribe: desc, expect: expectStub,
-        jest: { fn: (i) => i || (() => {}), setSystemTime: (v) => { setSystemTime(v); } },
+        jest: runModeJest,
         // `vi` is bun:test's vitest-compat surface and, like `mock`, exists
         // outside the runner — vi.mock IS mock.module, so a run-mode script gets
         // the same validation and the same module override.

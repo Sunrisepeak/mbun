@@ -325,6 +325,9 @@ the observed Linux limits; the coordinator owns the only root build.
 | W376 | Node performance timeline source fix | 5 | pre 1/5 pass + 4 fail; post 2/5 pass + 3 fail; timeline target 1/1 pass serially; W375 TLS regression 2/5 pass + 3 fail; three serial release builds | sort performance entries by `startTime` and align missing-argument TypeError shape; park ResourceTiming callback, uvMetricsInfo, and GC observer owners separately |
 | W377 | Node ResourceTiming buffer source fix | 5 | pre 2/5 pass + 3 fail; post 3/5 pass + 2 fail; ResourceTiming target 1/1 serially; W375 TLS regression 2/5 pass + 3 fail; one serial release build (59.24s) | implement bounded resource entries, overflow event, resize, clear, and promotion semantics; park uvMetricsInfo and GC observer owners separately |
 | W378 | Bun event-loop/timer/perf + stderr fd source fix | 5 | pre 2 green / 1 no-tests / 2 failures / 45 passed / 5 failed / 50 ran; post 2 green / 2 no-tests / 1 failure / 45 passed / 4 failed / 49 ran / 38 expects; 0 timeout; serial build 58.05s | allow valid POSIX fd 2 through the raw fs read/write fallback; retain fd 0/1 pipe-buffer owner and run-mode fake-timers owner separately |
+| W379 | Node fs fresh leaves | 5 | 5/5 pass in the 5-job wave and 5/5 in the serial confirmation; no timeout | retain fs read/write parameter coverage; no source owner |
+| W380 | Node child-process stdio fresh leaves | 5 | 5/5 pass in the 5-job wave; no timeout | retain stdio/pipe coverage; fd 1 raw-write remains a separate bounded-buffer owner |
+| W381 | Bun run-mode fake-timers source fix | 5 | pre 2 green / 2 no-tests / 1 failure / 45 passed / 4 failed / 49 ran / 38 expects; post 2 green / 2 no-tests / 1 failure / 48 passed / 1 failed / 49 ran / 41 expects; Node W379/W380 regression 10/10 pass; serial build 59.24s | implement queue-backed `Bun.jest().jest.useFakeTimers()` in run mode; park Intl.DateTimeFormat formatting as the remaining independent failure |
 
 ## W305 Bun/Deno Event/Performance/URL/crypto leaf probe
 
@@ -1685,6 +1688,45 @@ and exits cleanly (the runner still classifies it as no-tests); a separate
 The four remaining timer assertions are the independent run-mode
 `jest.useFakeTimers` owner. No upstream fixture changed and no full
 corpus/workspace-wide test ran.
+
+## W379 Node fs fresh leaves
+
+The fresh five-file Node selector covered `fs.write`, `fs.read`, optional
+`writeSync` parameters, `readv`, and `writev`. It passed **5/5 files** with
+**5 bounded jobs**, and the same selector passed **5/5** in a serial
+confirmation. This was a coverage-only measurement: the current raw-fd source
+owner was not widened based on these green results.
+
+No source or upstream fixture changed for this probe.
+
+## W380 Node child-process stdio fresh leaves
+
+The next fresh five-file selector covered child stdout writes, default spawn
+options, double pipes, destroyed stdio, and ordinary child stdio. It passed
+**5/5 files** with **5 bounded jobs** and no timeout. These files did not expose
+the fd 1 unread-pipe growth owner, so no speculative stdout fallback change was
+made.
+
+No source or upstream fixture changed for this probe.
+
+## W381 Bun run-mode fake-timers source fix
+
+After W378's fd2 fix, `test-timers.test.ts` still had **3/7 tests pass and 4
+failures**: three child run-mode checks could not call `jest.useFakeTimers`, and
+one parent assertion was an independent `Intl.DateTimeFormat` clock-format
+owner. `modules/jsc/src/builtins/bootstrap.cppm` now gives run-mode
+`Bun.jest().jest` a queue-backed fake-timer implementation: it validates the
+`now` option, replaces and restores timer globals even when callers pre-set
+them to a string/Symbol/BigInt, returns timer handles, advances the fake clock,
+rebases `Date.now()`, and clears/restores the queue through `useRealTimers()`.
+
+After a serial release build (**59.24s**), the focused timer file moved to
+**6/7 tests pass, 1 failure, 24 expects**. The full W378 five-file Bun wave
+measured **2 green, 2 no-tests, 1 test failure**, with **48 passed, 1 failed,
+49 ran, 41 expects, and 0 runner timeout**. The remaining failure is only the
+Intl date-format assertion. The W379 fs and W380 child-process selectors were
+re-run after this source change and remained **10/10 pass**. No upstream fixture
+changed and no full corpus/workspace-wide test ran.
 
 ## Coverage novelty audit correction after W323
 

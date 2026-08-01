@@ -5,6 +5,19 @@
 
 ## 2026-08-02
 
+- W381 Bun run-mode fake-timers source fix：`test-timers.test.ts` 从 **3/7 pass、4 fail** 推进到
+  **6/7 pass、1 fail、24 expects**；`modules/jsc/src/builtins/bootstrap.cppm` 为
+  `Bun.jest().jest` 补齐真实 queue-backed fake timers、timer handle、Date rebasing、restore 和
+  arbitrary pre-set timer globals。完整 W378 五文件波次为 **2 green、2 no-tests、1 test-failure**，
+  **48 passed、1 failed、49 ran、41 expects、0 timeout**；剩余仅为 Intl.DateTimeFormat 格式 owner。
+  W379 fs + W380 child-process 回归最终 **10/10 pass**；serial release build **59.24s**，未修改
+  upstream fixture、未跑全量 corpus。
+- W380 Node child-process stdio fresh leaves：五文件 bounded selector **5/5 pass、0 timeout**，覆盖
+  stdout write、default options、double pipe、destroyed stdio 与普通 stdio；fd1 raw-write/未读管道
+  增长保持独立 owner，未做 speculative 修改、未跑全量 corpus。
+- W379 Node fs fresh leaves：五文件 selector 在 **5 jobs** 与 **1 job 串行复核**均为 **5/5 pass、0
+  timeout**，覆盖 write/read/optional writeSync/readv/writev；无 source owner，未修改 upstream
+  fixture、未跑全量 corpus。
 - W378 Bun event-loop/timer/perf + stderr fd source fix：初始五文件 bounded selector 为 **2
   green、1 no-tests、2 test-failure**，共 **45 passed、5 failed、50 ran、36 expects、0 timeout**。
   失败的 socket-wait fixture 已定位到 `fs.writeSync(2, ...)` 被 raw fd fallback 错误拒绝；
