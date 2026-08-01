@@ -239,6 +239,11 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     if (typeof h.bind === "function" && typeof h.send === "function") return { fd, type: "dgram.Native" };
     return { fd, type: "net.Native" };
   };
+  const isUnlistenedNetServer = (h) => {
+    if (h === null || typeof h !== "object" || typeof h._fd !== "number" || h._fd >= 0) return false;
+    const netmod = M["net"] || M["node:net"];
+    return !!(netmod && typeof netmod.Server === "function" && h instanceof netmod.Server);
+  };
   const ipcRecvHandle = (type, fd) => {
     if (typeof fd !== "number" || fd < 0) return null;
     const netmod = M["net"] || M["node:net"];
@@ -370,12 +375,14 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
       let sendFd = -1;
       if (handle !== undefined && handle !== null) {
         const info = canPassFd() ? ipcHandleInfo(handle) : null;
-        if (info === null) {
+        if (info === null && !isUnlistenedNetServer(handle)) {
           const e = new TypeError("This handle type cannot be sent"); e.code = "ERR_INVALID_HANDLE_TYPE"; throw e;
         }
-        sendFd = info.fd;
-        message = { cmd: "NODE_HANDLE", type: info.type, msg: message };
-        ch.sent.push({ handle, keepOpen: !!(options && options.keepOpen) });
+        if (info !== null) {
+          sendFd = info.fd;
+          message = { cmd: "NODE_HANDLE", type: info.type, msg: message };
+          ch.sent.push({ handle, keepOpen: !!(options && options.keepOpen) });
+        }
       }
       if (!this.connected || ch.closed) {
         const e = new Error("Channel closed"); e.code = "ERR_IPC_CHANNEL_CLOSED";
