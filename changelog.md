@@ -5,6 +5,10 @@
 
 ## 2026-08-01
 
+- W71 fresh Bun HTTP probe（5 jobs、复用当前 Linux binary、无构建）测得 **3 green
+  files、22 passed、13 failed、35 ran、68 expects**。numeric headers、response
+  setTimeout/unref、early-hints 全绿；HTTPParser 与 transfer-encoding/trailer 的
+  状态机、校验和 timeout 失败为多 owner，未混修。未跑全量 corpus。
 - W70 fresh Bun filesystem leaf probe（5 jobs、复用当前 Linux binary、无构建）新增 **5/5
   files green、52 passed、0 failed、55 ran、138 expects**：目录、mkdir、async-iterator
   writeFile、Stats constructor/truncate 全绿。未跑全量 corpus。

@@ -744,6 +744,22 @@ surface on Linux:
   bounded filesystem guards and continue with a fresh one-owner row under the
   3–5 lane policy.
 
+### W71 Bun HTTP leaf probe parked
+
+- A fresh five-file Bun-native probe used **5 bounded jobs** and reused the
+  current Linux binary; no source change or build was needed. The sample was
+  numeric headers, response timeout/unref, early hints, HTTPParser, and
+  transfer-encoding/trailer handling.
+- The runner measured **3 green files, 22 passed, 13 failed, 35 ran, 68
+  expects**. `numeric-header`, `node-http-res-settimeout-unref`, and
+  `early-hints-crlf-injection` were green.
+- `node-http-parser` and `node-http-transfer-encoding` remain parked: their
+  failures span parser state transitions, buffer ownership, header/trailer
+  validation, connection ordering, and timeout/liveness behavior. No single
+  safe HTTP owner was inferred and no full HTTP subtree was scanned.
+- No full corpus or workspace-wide build was started. Keep the three green
+  HTTP guards and select the next fresh one-owner row.
+
 ### W59 Node buffer leaf sample
 
 - W59 使用 Node corpus runner 的默认 bounded profile、**3 jobs**。首批五个文件为
