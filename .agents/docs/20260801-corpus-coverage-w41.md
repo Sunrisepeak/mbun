@@ -160,6 +160,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W210 | Node dgram UDP lifecycle leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain address, asyncDispose, default bind address, AbortSignal close, and bytes-length leaves; no source owner |
 | W211 | Bun Node crypto leaves | 5 | 5/5 green; 72 passed / 0 failed / 72 ran / 383 expects; 0 timeout; no build | retain LazyHash, one-shot hash/verify, RSA sign variants, X509 subclass, and random API leaves; no source owner |
 | W212 | Node DNS contract leaves | 5 | 3/5 pass; 2 fail; 0 timeout; no build | retain getServer, lookup option validation, setServers type checks; park dns/promises ENODATA constant and maxTimeout error-shape owners |
+| W213 | Bun VM/TLS/zlib leaves | 3 | 2/3 green; 5 passed / 3 failed / 8 ran / 262 expects; 0 timeout; no build | retain vm-sourceURL and Node TLS internals; park zlib native handle `write` exposure owner; no source/fixture change |
 
 ## W133 Bun.Terminal green cluster
 
@@ -1319,6 +1320,25 @@ coordinator binary through `tools/integration/node_corpus_runner.py` with
 three bounded jobs and a 30-second per-file timeout. No full corpus or
 workspace-wide test was run; the selector and raw runner output were removed
 after recording the result.
+
+## W213 Bun VM/TLS/zlib owner split
+
+The bounded three-job selector covered VM `sourceURL` stack/output behavior,
+Node TLS internal helpers, and a zlib native-handle re-entrancy guard. It reached
+**2/3 files green: 5 passed / 3 failed / 8 ran / 262 expects / 0 timeouts**;
+per-file durations were 201–502ms.
+
+`vm-sourceUrl.test.ts` was **3/3** and `node-tls-internals.test.ts` was **2/2**.
+The zlib file ran all three bounded iterations, but each child stopped before
+the intended re-entrancy assertion because the native handle did not expose the
+expected `write` method. This is recorded as a zlib native-handle exposure
+owner, separate from the intended write/close lifetime behavior.
+
+No source or upstream fixture change was made. The selector used the existing
+coordinator binary through `tools/integration/bun_corpus_runner.py` with three
+bounded jobs, a 30-second per-file timeout, and missing Node modules allowed.
+No full corpus or workspace-wide test was run; the selector and raw runner
+output were removed after recording the result.
 
 ## W132 Node VM and WebStreams owner split
 

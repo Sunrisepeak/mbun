@@ -5,6 +5,7 @@
 
 ## 2026-08-01
 
+- W213 fresh Bun VM/TLS/zlib leaf probe（3 jobs、复用现有 coordinator binary、无构建）**2/3 files green、5 passed、3 failed、8 ran、262 expects、0 timeout**：`vm-sourceUrl` 3/3、`node-tls-internals` 2/2 通过；zlib native handle 重入叶子 3/3 失败，稳定停在子进程 native handle 缺少 `write` 方法的 exposure owner，未归因到生命周期重入；单文件耗时 201–502ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W212 fresh Node DNS contract probe（3 jobs、复用现有 coordinator binary、无构建）**3/5 files pass、2 fail、0 timeout**：get-server、lookup-promises options、setServers type-check 通过；dns/promises 缺 `ENODATA` 常量，Resolver maxTimeout 停在校验 error code/shape；单文件耗时 166–317ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W211 fresh Bun Node crypto probe（3 jobs、复用现有 coordinator binary、无构建）**5/5 files green、72 passed、0 failed、72 ran、383 expects、0 timeout**：LazyHash、one-shot hash/verify、RSA sign variants、X509 subclass 与 random API 全部通过；单文件耗时 170–1423ms，random API 最慢但仍在 bounded limit 内。未发现 source owner，未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W210 fresh Node dgram UDP lifecycle probe（3 jobs、复用现有 coordinator binary、无构建）**5/5 files pass、0 fail、0 timeout**：address、asyncDispose、default bind address、AbortSignal close 与 send bytes-length 全部通过；单文件耗时 165–247ms。未发现 source owner，未修改 source/fixture，未跑全量 corpus/workspace-wide test。
