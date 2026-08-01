@@ -82,6 +82,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W132 | Node VM/WHATWG streams/URL leaves | 5 | 3/5 pass; 2 fail; 0 timeout; no build | issues #66/#67; retain VM ownpropertynames, URLSearchParams entries, WritableStream close; park VM readonly wording and TextDecoderStream invalid receivers |
 | W133 | Bun.Terminal native leaves | 3 | 3/3 green; 129 passed / 0 failed / 130 ran / 334 expects; no build | retain all three terminal leaves; no source owner |
 | W134 | Node HTTP low-coupling leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five HTTP leaves; no source owner |
+| W135 | Bun spawn/io low-coupling leaves | 5 | 3/5 green; 58 passed / 14 failed / 75 ran / 1391 expects; 0 timeout; no build | retain exit-code, empty stdin, kill-signal; park Bun.write and spawnSync multi-owner failures |
 
 ## W133 Bun.Terminal green cluster
 
@@ -109,6 +110,28 @@ with three bounded jobs and a 30-second per-file timeout. An initial path-only
 selector validation was rejected before dispatch and is excluded from the
 result. No full corpus or workspace-wide test was run; the selector and raw
 runner output were removed after recording the result.
+
+## W135 Bun spawn/io owner split
+
+The bounded three-job selector covered five low-coupling Bun spawn/io leaves.
+The result was **3/5 files green**, with **58 passed / 14 failed / 75 ran / 1391
+expects / 0 timeouts**. Green coverage came from `exit-code.test.ts`
+(**5/5**), `spawn-empty-arrayBufferOrBlob.test.ts` (**3/3**), and
+`spawn-kill-signal.test.ts` (**16/16**). Their durations were 215–683ms.
+
+`bun-write.test.js` took 2793ms and had **28 passed / 7 failed / 35 ran / 1316
+expects**. Its failures span file-to-file/content behavior, last-modified
+updates, Blob/GC retention, copyFileRange fallback, fd/createPath handling, and
+timed output, so it is not one safe owner. `spawnSync.test.ts` took 7029ms and
+had **6 passed / 7 failed / 16 ran / 16 expects**; its failures split across
+timeout-zero behavior, memfd/counter optimizations, and uid/gid validation.
+Both files are parked without a speculative source change or issue.
+
+No source or upstream fixture change was made. The selector used the existing
+coordinator binary through `tools/integration/bun_corpus_runner.py` with three
+bounded jobs, a 30-second per-file timeout, and missing Node modules allowed.
+No full corpus or workspace-wide test was run; the selector and raw runner
+output were removed after recording the result.
 
 ## W132 Node VM and WebStreams owner split
 
