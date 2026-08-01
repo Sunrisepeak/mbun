@@ -199,6 +199,30 @@ the observed Linux limits; the coordinator owns the only root build.
 | W249 | Node process identity/memory plain-script leaves | 3 | 3/3 pass; 0 fail; 0 timeout; no build | retain process.ppid child relation, process.release LTS/version contract, and availableMemory numeric guard; no source owner |
 | W250 | Node process queue/mask/CPU plain-script leaves | 3 | 3/3 pass; 0 fail; 0 timeout; no build | retain nextTick uncaught propagation, umask mask coercion, and cpuUsage result/argument guards; no source owner |
 | W251 | Node process exec/argv/umask plain-script leaves | 3 | 3/3 pass; 0 fail; 0 timeout; no build | retain symlink execPath, child argv[0], and full umask read/write/error guards; no source owner |
+| W252 | Bun base64/highlighter/UUID leaves | 3 | 2/3 green; 28 passed / 11 failed / 39 ran / 575 expects; 0 timeout; no build | retain base64url 5/5 and highlighter 16/16; park randomUUIDv7 timestamp validation, rollover/order, and counter-seeding owners |
+
+## W252 Bun base64/highlighter/UUID leaf probe
+
+The bounded three-job Bun selector covered `base64-url-safe-encode.test.ts`,
+`highlighter.test.ts`, and `randomUUIDv7.test.ts`. It measured **2/3 files
+green**, with **28 passed / 11 failed / 39 ran / 575 expects / 0 runner
+timeouts**. Per-file durations were 252–855ms.
+
+`base64-url-safe-encode.test.ts` passed all 5 tests, including scalar RFC
+4648 reference vectors through length 513, large byte-exact output, Node
+crypto, and Bun CryptoHasher. `highlighter.test.ts` passed all 16 tests,
+including end-of-input safety, redacting highlighter behavior, and bunfig
+error handling.
+
+`randomUUIDv7.test.ts` passed 7/18 tests. Its 11 failures split into four
+semantic owners: 12-bit counter rollover ordering, invalid timestamp/range
+validation and error shape, older explicit timestamp ordering, and
+per-millisecond counter seeding. No mixed UUID patch was attempted.
+
+No source or upstream fixture change was made. The selector reused the
+coordinator binary through `tools/integration/bun_corpus_runner.py` with
+three bounded jobs, a 30-second per-file timeout, and missing Node modules
+allowed. No full corpus, build, or workspace-wide test was run.
 
 ## W251 Node process exec/argv/umask plain-script probe
 
