@@ -113,6 +113,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W163 | Node fs pure-contract leaves | 5 | 4/5 pass; 1 fail; 0 timeout; no build | retain constants/mkdir/mkdtemp/open-flags; park fs.promises.access stack-shape owner |
 | W164 | Node fs I/O pure-contract leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five read/write leaves; no source owner |
 | W165 | Node fs error/read leaves | 5 | 3/3 executable pass; 2 Linux-inapplicable skips; 0 fail; 0 timeout; no build | retain all three executable leaves; exclude two Windows-only skips |
+| W166 | Bun util/file low-coupling leaves | 4 | 3/4 green; 28 passed / 4 failed / 32 ran / 73 expects; 0 timeout; no build | retain fileUrl/bun-file-read/concat; reconfirm Bun.file async-stack and JSON-message owners |
 
 ## W133 Bun.Terminal green cluster
 
@@ -580,6 +581,22 @@ coordinator binary through `tools/integration/node_corpus_runner.py` with
 three bounded jobs and a 30-second per-file timeout. No full corpus or
 workspace-wide test was run; the selector and raw runner output were removed
 after recording the result.
+
+## W166 Bun util/file owner split
+
+The bounded three-job selector covered `fileUrl`, Bun.file read behavior,
+`Bun.file()` broad error/JSON behavior, and concat. It reached **3/4 files
+green**, with **28 passed / 4 failed / 32 ran / 73 expects** and **0 timeouts**.
+The green leaves were `fileUrl` (**20/20**), Bun.file read (**1/1**), and
+concat (**5/5**). The four failures in `bun-file.test.ts` reconfirm the
+already parked async-stack and empty-JSON-message owners; no new issue or
+mixed fix was opened.
+
+No source or upstream fixture change was made. The selector used the existing
+coordinator binary through `tools/integration/bun_corpus_runner.py` with
+three bounded jobs, a 30-second per-file timeout, and missing Node modules
+allowed. No full corpus or workspace-wide test was run; the selector and raw
+runner output were removed after recording the result.
 
 ## W132 Node VM and WebStreams owner split
 
