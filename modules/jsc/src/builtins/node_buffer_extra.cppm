@@ -105,12 +105,11 @@ inline constexpr std::string_view kNodeBufferExtraJS = R"JS(
     // would exceed it must throw ERR_STRING_TOO_LONG *before* any allocation
     // (jsc/bindings/JSBuffer.cpp:jsBufferToStringFromBytes); otherwise a 2 GiB
     // buffer drags the process into an OOM instead of a catchable error.
-    // node lib/buffer.js: kStringMaxLength (V8 String::kMaxLength on 64-bit) is
-    // strictly below kMaxLength, so a Buffer larger than a string is allocatable
-    // yet un-stringifiable (ERR_STRING_TOO_LONG). Our engine's real string max is
-    // INT32_MAX, but exposing the node value keeps toString's cap below the
-    // buffer cap so test-buffer-tostring-rangeerror can allocate-then-fail.
-    const MAX_STRING_LENGTH = 536870888;
+    // Bun's 64-bit node:buffer surface keeps the engine's INT32_MAX string cap
+    // and permits a full uint32 buffer. Node's wrapper retains its published
+    // V8-compatible string cap and the existing compatibility buffer value.
+    const bunDialect = G.__mbunDialect !== "node";
+    const MAX_STRING_LENGTH = bunDialect ? 0x7fffffff : 536870888;
     const errStringTooLong = () => {
       const e = new Error("Cannot create a string longer than " + MAX_STRING_LENGTH + " characters");
       e.code = "ERR_STRING_TOO_LONG";
@@ -118,7 +117,7 @@ inline constexpr std::string_view kNodeBufferExtraJS = R"JS(
     };
     // node's assertSize (lib/buffer.js): non-number -> ERR_INVALID_ARG_TYPE;
     // negative / NaN / Infinity / > kMaxLength -> ERR_OUT_OF_RANGE.
-    const K_MAX_LENGTH = 0x7fffffff;
+    const K_MAX_LENGTH = bunDialect ? 0x100000000 : 0x7fffffff;
     const assertSize = (size) => {
       if (typeof size !== "number") throw errArgType("size", "number", size);
       if (!(size >= 0 && size <= K_MAX_LENGTH))
@@ -1419,7 +1418,7 @@ inline constexpr std::string_view kNodeBufferExtraJS = R"JS(
     // entry a Buffer/Uint8Array; totalLength must be a non-negative integer.
     // Sizes/copies use byteLength so a spoofed `.length` getter cannot expose
     // uninitialized memory (test-buffer-concat).
-    const kMaxLength = 0x7fffffff;
+    const kMaxLength = K_MAX_LENGTH;
     BufferW.concat = function concat(list, length) {
       if (!Array.isArray(list)) throw errArgInstance("list", "Array", list);
       if (list.length === 0) return OrigBuffer.alloc(0);
@@ -1500,9 +1499,13 @@ inline constexpr std::string_view kNodeBufferExtraJS = R"JS(
         // node buffer.constants.MAX_STRING_LENGTH / kStringMaxLength: the V8
         // string cap, strictly below kMaxLength (test-buffer-constants /
         // test-buffer-tostring-rangeerror). process_web seeds MAX_LENGTH only.
-        if (mod.kStringMaxLength === undefined) mod.kStringMaxLength = MAX_STRING_LENGTH;
-        if (mod.constants && typeof mod.constants === "object" && mod.constants.MAX_STRING_LENGTH === undefined) {
-          try { mod.constants.MAX_STRING_LENGTH = MAX_STRING_LENGTH; } catch (_) {}
+        if (mod.kMaxLength !== K_MAX_LENGTH) mod.kMaxLength = K_MAX_LENGTH;
+        if (mod.kStringMaxLength !== MAX_STRING_LENGTH) mod.kStringMaxLength = MAX_STRING_LENGTH;
+        if (mod.constants && typeof mod.constants === "object") {
+          try {
+            mod.constants.MAX_LENGTH = K_MAX_LENGTH;
+            mod.constants.MAX_STRING_LENGTH = MAX_STRING_LENGTH;
+          } catch (_) {}
         }
         M["buffer"] = M["node:buffer"] = mod;
       }
