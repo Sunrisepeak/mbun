@@ -60,9 +60,11 @@ inline constexpr char kBootstrapJS_[] = R"JS(
   // still rejected; message reports typeof for the simplified template.
   const validatePathObject = (o) => {
     if (o === null || typeof o !== "object") {
-      // node path._format calls validateObject(pathObject, 'pathObject') ->
-      // ERR_INVALID_ARG_TYPE(name, 'Object', value).
-      const e = nodeArgTypeError("pathObject", "Object", o);
+      // Bun's node:path compatibility surface keeps its historical property /
+      // typeof wording, while the Node dialect follows internal/errors.js.
+      const e = G.__mbunDialect === "node"
+        ? nodeArgTypeError("pathObject", "Object", o)
+        : new TypeError('The "pathObject" property must be of type object, got ' + typeof o);
       e.code = "ERR_INVALID_ARG_TYPE";
       throw e;
     }
