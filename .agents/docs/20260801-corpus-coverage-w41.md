@@ -163,6 +163,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W213 | Bun VM/TLS/zlib leaves | 3 | 2/3 green; 5 passed / 3 failed / 8 ran / 262 expects; 0 timeout; no build | retain vm-sourceURL and Node TLS internals; park zlib native handle `write` exposure owner; no source/fixture change |
 | W214 | Bun process/TLS/HTTP leaves | 3 | 1/3 green; 4 passed / 2 failed / 6 ran / 6 expects; 0 timeout; no build | retain process stdio stack-limit guard; park TLS `allowHalfOpen` propagation and HTTP internal-handle bootstrap owners |
 | W215 | Bun TLS leaves | 3 | 3/3 green; 7 passed / 0 failed / 7 ran / 33 expects; 0 timeout; no build | retain rootCertificates immutability, no-cipher-match error shape, and createSecureContext argument validation; no source owner |
+| W216 | Bun VM leak/integration leaves | 3 | 2/3 green; 5 passed / 1 failed / 6 ran / 1 expect; 0 timeout; no build | retain vm-script-fetcher and vm.Script leak guards; park happy-dom DOM integration owner |
 
 ## W133 Bun.Terminal green cluster
 
@@ -170,6 +171,24 @@ The bounded three-job selector covered the core terminal contract, explicit
 POSIX/Windows platform gaps, and terminal subprocess integration. All **3/3
 files were green**, reaching **129 passed / 0 failed / 130 ran / 334 expects**.
 Per-file durations were 1.233–3.694s, with no timeout.
+
+No source or upstream fixture change was made. The selector used the existing
+coordinator binary through `tools/integration/bun_corpus_runner.py` with three
+bounded jobs, a 30-second per-file timeout, and missing Node modules allowed.
+No full corpus or workspace-wide test was run; the selector and raw runner
+output were removed after recording the result.
+
+## W216 Bun VM leak/integration owner split
+
+The bounded three-job selector covered NodeVMScriptFetcher object-count guards,
+the vm.Script RSS leak guard, and a happy-dom VM reproduction. It reached
+**2/3 files green: 5 passed / 1 failed / 6 ran / 1 expect / 0 timeouts**;
+per-file durations were 182–887ms.
+
+`vm-script-fetcher-leak.test.ts` was **4/4** and `script-leak.test.ts` was
+**1/1**. The happy-dom reproduction stopped in DOM integration because
+`ParentNodeUtility.getElementByTagName` was unavailable; no VM leak conclusion
+was inferred from that failure.
 
 No source or upstream fixture change was made. The selector used the existing
 coordinator binary through `tools/integration/bun_corpus_runner.py` with three

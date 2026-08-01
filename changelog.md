@@ -5,6 +5,7 @@
 
 ## 2026-08-01
 
+- W216 fresh Bun VM leak/integration probe（3 jobs、复用现有 coordinator binary、无构建）**2/3 files green、5 passed、1 failed、6 ran、1 expect、0 timeout**：`vm-script-fetcher-leak` 4/4 与 `script-leak` 1/1 通过；happy-dom VM 复现停在缺少 `ParentNodeUtility.getElementByTagName` 的 DOM integration owner。单文件耗时 182–887ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W215 fresh Bun TLS leaf probe（3 jobs、复用现有 coordinator binary、无构建）**3/3 files green、7 passed、0 failed、7 ran、33 expects、0 timeout**：rootCertificates immutable、no-cipher-match error shape、createSecureContext extra-argument validation 全部通过；初选的 top-level HTTP script 只报告 0 tests，已排除并替换，未计入覆盖。单文件耗时 202–206ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W214 fresh Bun process/TLS/HTTP leaf probe（3 jobs、复用现有 coordinator binary、无构建）**1/3 files green、4 passed、2 failed、6 ran、6 expects、0 timeout**：`process-stdio-stack-overflow` 4/4 通过；TLS `allowHalfOpen` contract 得到 `true` 而非 Node 期望的 `false`，HTTP ondata leak guard 在 fixture bootstrap 停在 internal handle 缺失；两者分别保留为 TLS option propagation 与 HTTP internal-handle owners。单文件耗时 235–686ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W213 fresh Bun VM/TLS/zlib leaf probe（3 jobs、复用现有 coordinator binary、无构建）**2/3 files green、5 passed、3 failed、8 ran、262 expects、0 timeout**：`vm-sourceUrl` 3/3、`node-tls-internals` 2/2 通过；zlib native handle 重入叶子 3/3 失败，稳定停在子进程 native handle 缺少 `write` 方法的 exposure owner，未归因到生命周期重入；单文件耗时 201–502ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
