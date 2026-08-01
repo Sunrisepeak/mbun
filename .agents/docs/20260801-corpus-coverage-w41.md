@@ -72,6 +72,21 @@ the observed Linux limits; the coordinator owns the only root build.
 | W122 | Bun util file/stream leaves | 5 | 4/5 green; 12 passed / 2 failed / 14 ran / 432 expects; no build | issue #62; retain four green leaves, park `readableStreamToArrayBuffer` intrinsic Promise plumbing |
 | W123 | Node fs error/HTTP lifecycle leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five green leaves; no source owner |
 | W124 | Bun util object/string/file/GC/stdin leaves | 5 | 2/5 green; 11 passed / 6 failed / 17 ran / 250 expects; no build | retain stdin + error-GC; park internal helper exports, Bun.file async-stack/JSON message owners separately |
+| W125 | Node HTTP/fs stream lifecycle leaves | 5 | 5/5 pass; 0 fail; 0 timeout; no build | retain all five green leaves; no source owner |
+
+## W125 Node HTTP and fs green leaves
+
+The bounded three-job selector covered HTTP agent error/close handling, empty
+HTTP writes, a recursive `cpSync` symlink error, file WriteStream uncorking,
+and an uncaught request-callback path. All **5/5 files passed**, with **0
+failures** and **0 timeouts**. Four files took 215–234ms; the empty-write HTTP
+file took 4.289s and remained below the 30-second bound.
+
+No source or upstream fixture change was made. The selector used the existing
+coordinator binary through `tools/integration/node_corpus_runner.py` with three
+bounded jobs and a 30-second per-file timeout. No full corpus or workspace-wide
+test was run; the selector and raw runner output were removed after recording
+the result.
 
 ## W124 Bun util owner triage
 

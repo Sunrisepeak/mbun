@@ -5,6 +5,7 @@
 
 ## 2026-08-01
 
+- W125 fresh Node HTTP/fs stream lifecycle probe（3 jobs、复用现有 coordinator binary、无构建）**5/5 files pass、0 fail、0 timeout**：HTTP agent error/close、empty write、cpSync symlink error、WriteStream uncork、uncaught request callback 全部通过；四个叶子耗时 215–234ms，empty-write HTTP 为 4.289s，仍在 30s bound 内。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W124 fresh Bun util object/string/file/GC/stdin probe（3 jobs、复用现有 coordinator binary、无构建）**2/5 files green、11 passed、6 failed、17 ran、250 expects、0 timeout**：stdin slice **2/2**、Error GC **4/4** 保留；BunObject 缺 `hasNonReifiedStatic` internal helper、BunString 缺 refcount-delta helper、Bun.file 的 async stack 与 empty-JSON message 为分离 owners，暂不混修或猜测性开 issue。原始 runner log 仅本地诊断且含环境展开，未进入文档、commit 或 PR；未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W123 fresh Node fs error/HTTP lifecycle probe（3 jobs、复用现有 coordinator binary、无构建）**5/5 files pass、0 fail、0 timeout**：WriteStream 参数校验、两个 `cpSync` 错误契约、HTTP 无 Content-Length response、HTTP agent timeout 全部通过；单文件耗时 215–265ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
 - W122 fresh Bun util file/stream probe（3 jobs、复用现有 coordinator binary、无构建）**4/5 files green、12 passed、2 failed、14 ran、432 expects**：Bun.file offset、fd-backed read、ArrayBufferSink、file MIME type 通过；`readablestreamtoarraybuffer` 两个测试观察到 patched `Promise.prototype.then` 各调用 6 次（期望 0/1），issue [#62](https://github.com/Sunrisepeak/mbun/issues/62) 已创建，停车为 intrinsic Promise plumbing owner。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
