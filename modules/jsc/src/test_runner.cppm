@@ -1082,8 +1082,25 @@ inline constexpr std::string_view HARNESS = R"JS(
       G.__mbunNativeModules["node:" + name] = native;
       // A module already in the CommonJS cache is mutated rather than replaced:
       // its identity is what every existing binding and namespace points at.
-      let live;
-      try { live = G.__mbun_module_cache_get(key); } catch (e) {}
+      let live, liveKey = key;
+      try { live = G.__mbun_module_cache_get(liveKey); } catch (e) {}
+      // Package managers commonly expose node_modules entries as symlinks.
+      // require.resolve() preserves that lexical path, while the native loader
+      // canonicalises before inserting into moduleCache_. On a lexical miss,
+      // retry the pure cache lookup with the real path; do not require() here,
+      // because registering a mock must never evaluate an unloaded module.
+      if (live === undefined && key.charCodeAt(0) === 47 /* / */) {
+        const fs = G.__mbunNativeModules && (G.__mbunNativeModules.fs || G.__mbunNativeModules["node:fs"]);
+        if (fs && typeof fs.realpathSync === "function") {
+          try {
+            const canonical = fs.realpathSync(key);
+            if (canonical !== key) {
+              liveKey = canonical;
+              live = G.__mbun_module_cache_get(liveKey);
+            }
+          } catch (e) {}
+        }
+      }
       if (live !== undefined && live !== null && (typeof live === "object" || typeof live === "function") && m !== null && typeof m === "object") {
         const subs = G.__mbun_link_subs ? G.__mbun_link_subs.get(live) : undefined;
         for (const k of Object.keys(m)) {
@@ -1093,6 +1110,7 @@ inline constexpr std::string_view HARNESS = R"JS(
           if (list) for (let i = 0; i < list.length; i++) { try { list[i](v); } catch (e) {} }
         }
         mocks.set(key, live);
+        if (liveKey !== key) mocks.set(liveKey, live);
       } else {
         mocks.set(key, m);
       }
