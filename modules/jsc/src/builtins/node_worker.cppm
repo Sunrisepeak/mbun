@@ -1852,9 +1852,17 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
       // reaches the child's real fd 1 without passing through its
       // process.stdout (the runtime's own fatal-error printer, a grandchild
       // process, a native write) has no frame and would otherwise vanish.
+      // A plain Readable that is PUSHED into, not a PassThrough that is written
+      // to: a Transform queues its writes and hands them on together, and a
+      // byte-mode Readable's read() CONCATENATES whatever is sitting in its
+      // buffer — so two frames that arrive in one IPC batch came back out as one
+      // 'data' event and the boundary this whole change exists to keep was lost
+      // again (measured: "1 threadId: 1\n2 threadId: 1\n" as a single chunk).
+      // push() on a flowing Readable emits each chunk as it lands, which is what
+      // node's ReadableWorkerStdio does.
       const mkStdioStream = () => {
-        if (!streamM || typeof streamM.PassThrough !== "function") return null;
-        try { return new streamM.PassThrough(); } catch (e) { return null; }
+        if (!streamM || typeof streamM.Readable !== "function") return null;
+        try { return new streamM.Readable({ read() {} }); } catch (e) { return null; }
       };
       const outStream = mkStdioStream();
       const errStream = mkStdioStream();
@@ -1863,11 +1871,11 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
       this.stdout = outStream || child.stdout;
       this.stderr = errStream || child.stderr;
       if (child.stdout) child.stdout.on("data", (d) => {
-        if (outStream) { try { outStream.write(d); return; } catch (e) {} }
+        if (outStream) { try { outStream.push(d); return; } catch (e) {} }
         if (!options.stdout) { try { proc.stdout.write(d); } catch (e) {} }
       });
       if (child.stderr) child.stderr.on("data", (d) => {
-        if (errStream) { try { errStream.write(d); return; } catch (e) {} }
+        if (errStream) { try { errStream.push(d); return; } catch (e) {} }
         if (!options.stderr) { try { proc.stderr.write(d); } catch (e) {} }
       });
       // node pipes the worker's stdio into the parent's unless the caller asked
@@ -1927,7 +1935,7 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
           let buf = null;
           try { buf = G.Buffer.from(String(m.d), "base64"); } catch (e) { buf = null; }
           if (buf === null) return;
-          if (s) { try { s.write(buf); } catch (e) {} }
+          if (s) { try { s.push(buf); } catch (e) {} }
           else { try { (m.t === "so" ? proc.stdout : proc.stderr).write(buf); } catch (e) {} }
         } else if (m.t === "me") {
           self.emit("messageerror", new Error(String(m.d)));
@@ -1967,8 +1975,8 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
         if (self._tempFile) { try { fsM.unlinkSync(self._tempFile); } catch (e) {} self._tempFile = null; }
         // The synthetic stdio streams have no fd to close themselves on: end
         // them with the thread, so a reader waiting on 'end' is not left open.
-        if (self._outStream) { try { self._outStream.end(); } catch (e) {} }
-        if (self._errStream) { try { self._errStream.end(); } catch (e) {} }
+        if (self._outStream) { try { self._outStream.push(null); } catch (e) {} }
+        if (self._errStream) { try { self._errStream.push(null); } catch (e) {} }
         self.emit("exit", self._exitCode);
         const rs = self._exitResolvers.splice(0);
         for (const r of rs) r(self._exitCode);
