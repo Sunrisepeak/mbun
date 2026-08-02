@@ -32,6 +32,27 @@ inline constexpr std::string_view kZlibStreamJS = R"JS(
   const zmod = M["zlib"] || M["node:zlib"];
   const streamMod = M["stream"] || M["node:stream"];
   if (!zmod || !streamMod || !streamMod.Transform) return;
+  // Node captures buffer.kMaxLength when require('zlib') initializes its module.
+  // mbun pre-registers native modules at bootstrap, so retain the same visible
+  // load edge with an accessor that arms the cap whenever zlib is required.
+  let zlibMaxOutputLength = 0x7fffffff;
+  const armZlibMaxOutputLength = () => {
+    const bufferModule = M["buffer"] || M["node:buffer"];
+    const value = bufferModule && bufferModule.kMaxLength;
+    if (typeof value === "number" && Number.isFinite(value) && value > 0)
+      zlibMaxOutputLength = value;
+    return zmod;
+  };
+  for (const name of ["zlib", "node:zlib"]) {
+    try {
+      Object.defineProperty(M, name, {
+        get: armZlibMaxOutputLength,
+        enumerable: true,
+        configurable: true,
+      });
+    } catch (_) {}
+  }
+  G.__mbunZlibArmKMax = armZlibMaxOutputLength;
   const Transform = streamMod.Transform;
   const finished = streamMod.finished;
   const Buffer = G.Buffer;
@@ -715,6 +736,21 @@ inline constexpr std::string_view kZlibStreamJS = R"JS(
     zstdDecompressSync: { kind: K_ZDEC, Engine: ZstdDecompress },
   };
   const asyncOf = { inflateSync: "inflate", inflateRawSync: "inflateRaw", gunzipSync: "gunzip", unzipSync: "unzip", brotliDecompressSync: "brotliDecompress", zstdDecompressSync: "zstdDecompress" };
+  const enforceDefaultOutputLimit = (result, opts) => {
+    // An explicit maxOutputLength is already passed to the native one-shot
+    // helper. This branch supplies Node's captured default for bootstrap-backed
+    // modules, whose native facade otherwise has no require-time cap.
+    if (opts && typeof opts === "object" && opts.maxOutputLength !== undefined)
+      return result;
+    if (result && typeof result.byteLength === "number" &&
+        result.byteLength > zlibMaxOutputLength) {
+      const error = new RangeError("Cannot create a Buffer larger than " +
+                                   zlibMaxOutputLength + " bytes");
+      error.code = "ERR_BUFFER_TOO_LARGE";
+      throw error;
+    }
+    return result;
+  };
   for (const name of Object.keys(decoderOneShots)) {
     const cfg = decoderOneShots[name];
     const orig = zmod[name];
@@ -726,7 +762,7 @@ inline constexpr std::string_view kZlibStreamJS = R"JS(
         const buf = decodeThroughHandle(cfg, data, opts, F_SYNC);
         return opts.info ? { buffer: buf, engine: Object.create(cfg.Engine.prototype) } : buf;
       }
-      try { return orig(data, opts); }
+      try { return enforceDefaultOutputLimit(orig(data, opts), opts); }
       catch (e) {
         // The whole-buffer natives collapse every decode failure into one generic
         // message; node distinguishes truncated input ("unexpected end of file")
