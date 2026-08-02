@@ -1476,26 +1476,32 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
   // follows the target stream's isTTY. ref bun src/js/node/console.ts formatWithOptions.
   // ---- Console#table (https://console.spec.whatwg.org/#table) --------------
   // Blueprint: bun src/js/builtins/ConsoleObject.ts:180-250 (tableChars +
-  // renderRow/table) and :645-739 (the `table` method). Bun centers each cell
-  // within its display-width column; Node's cli_table keeps cells left-aligned.
-  // The process dialect selects the native contract without inspecting tests.
+  // renderRow/table) and :645-739 (the `table` method). Node's cli_table keeps
+  // every cell left-aligned; Console#table centers. `bunNative` is a THIRD
+  // contract, not a synonym for either: bun's native TablePrinter right-aligns
+  // column 0 (row label/index) and left-aligns the rest. Ground truth is bun's
+  // own committed snapshot, not inference -- test/js/bun/console/__snapshots__/
+  // console-table.test.ts.snap has "|   foo |" / "| 10 |" against "| 42     |".
+  // Opt-in, so consoleTableImpl's centering stays as it is.
   const tableChars = { middleMiddle: "─", rowMiddle: "┼", topRight: "┐", topLeft: "┌", leftMiddle: "├",
                        topMiddle: "┬", bottomRight: "┘", bottomLeft: "└", bottomMiddle: "┴",
                        rightMiddle: "┤", left: "│ ", right: " │", middle: " │ " };
   // Display width, not code-unit length: a CJK/emoji cell occupies two columns.
   const tableCellWidth = (s) => (G.Bun && typeof G.Bun.stringWidth === "function" ? G.Bun.stringWidth(String(s)) : String(s).length);
-  const renderTableRow = (row, widths, measure = row) => {
+  const renderTableRow = (row, widths, measure = row, bunNative = false) => {
     let out = tableChars.left;
     for (let i = 0; i < row.length; i++) {
       const cell = row[i];
-      const needed = Math.max(0, (widths[i] - tableCellWidth(measure[i])) / 2);
-      if (G.__mbunDialect === "node") out += cell + " ".repeat(Math.max(0, widths[i] - tableCellWidth(measure[i])));
+      const pad = Math.max(0, widths[i] - tableCellWidth(measure[i]));
+      const needed = pad / 2;
+      if (G.__mbunDialect === "node") out += cell + " ".repeat(pad);
+      else if (bunNative) out += i === 0 ? " ".repeat(pad) + cell : cell + " ".repeat(pad);
       else out += " ".repeat(needed) + cell + " ".repeat(Math.ceil(needed));
       if (i !== row.length - 1) out += tableChars.middle;
     }
     return out + tableChars.right;
   };
-  const renderTable = (head, columns, formatCell) => {
+  const renderTable = (head, columns, formatCell, bunNative = false) => {
     const format = (value, row, column) => formatCell ? formatCell(value, row, column) : { text: value, width: value };
     const renderedHead = head.map((value, column) => format(value, -1, column));
     const widths = renderedHead.map((cell) => tableCellWidth(cell.width));
@@ -1512,9 +1518,9 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     }
     const divider = widths.map((w) => tableChars.middleMiddle.repeat(w + 2));
     let result = tableChars.topLeft + divider.join(tableChars.topMiddle) + tableChars.topRight + "\n" +
-                 renderTableRow(renderedHead.map((cell) => cell.text), widths, renderedHead.map((cell) => cell.width)) + "\n" +
+                 renderTableRow(renderedHead.map((cell) => cell.text), widths, renderedHead.map((cell) => cell.width), bunNative) + "\n" +
                  tableChars.leftMiddle + divider.join(tableChars.rowMiddle) + tableChars.rightMiddle + "\n";
-    for (const row of rows) result += renderTableRow(row.map((cell) => cell.text), widths, row.map((cell) => cell.width)) + "\n";
+    for (const row of rows) result += renderTableRow(row.map((cell) => cell.text), widths, row.map((cell) => cell.width), bunNative) + "\n";
     return result + tableChars.bottomLeft + divider.join(tableChars.bottomMiddle) + tableChars.bottomRight;
   };
   // `logFn` is the console's own log (stream routing + formatting stay the
@@ -1612,7 +1618,7 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
       }
       const text = String(value);
       return { text, width: text };
-    }) + "\n";
+    }, /*bunNative*/ true) + "\n";
     if (tabularData instanceof Map) {
       const index = [], keys = [], values = [];
       let i = 0;
