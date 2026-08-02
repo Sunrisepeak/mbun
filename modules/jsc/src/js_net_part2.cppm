@@ -2344,6 +2344,297 @@ export constexpr std::string_view kNetJS_part2 = R"JS(
     try { NN.close(e.fd); } catch (x) {}
   };
 
+  // Bun fetch.rs maps an explicit protocol:"http2"/"h2" option to
+  // force_http2; HTTPContext then offers only h2 through ALPN and dispatches
+  // the request to its HTTP/2 client. The ordinary fetch path below is an H1
+  // client and must not advertise h2: it serializes an HTTP/1.1 request. Reuse
+  // the already-installed node:http2 transport for the explicit-H2 surface
+  // instead of growing a second HPACK/frame implementation here (#89).
+  const h2AbortReason = (signal) =>
+    signal && signal.reason !== undefined && signal.reason !== null
+      ? signal.reason
+      : new G.DOMException("The operation was aborted.", "AbortError");
+
+  async function readH2RequestBody(body, signal) {
+    if (body == null) return null;
+    if (signal && signal.aborted) {
+      if (body && typeof body.cancel === "function") {
+        try { await body.cancel(h2AbortReason(signal)); } catch (e) {}
+      }
+      throw h2AbortReason(signal);
+    }
+    if (G.Blob && body instanceof G.Blob) return new Uint8Array(await body.arrayBuffer());
+    if (typeof body === "string" || body instanceof Uint8Array ||
+        ArrayBuffer.isView(body) || body instanceof ArrayBuffer ||
+        (body && body._u8 instanceof Uint8Array)) return u8(body).slice();
+
+    const reader = body && typeof body.getReader === "function" ? body.getReader() : null;
+    if (!reader) return u8(body).slice();
+    const chunks = [];
+    let rejectAbort;
+    let onAbort;
+    const aborted = new Promise((resolve, reject) => { rejectAbort = reject; });
+    if (signal && typeof signal.addEventListener === "function") {
+      onAbort = () => {
+        const why = h2AbortReason(signal);
+        try { Promise.resolve(reader.cancel(why)).catch(() => {}); } catch (e) {}
+        rejectAbort(why);
+      };
+      signal.addEventListener("abort", onAbort, { once: true });
+    }
+    try {
+      for (;;) {
+        const step = signal ? await Promise.race([reader.read(), aborted]) : await reader.read();
+        if (step.done) break;
+        const value = step.value;
+        if (!(value instanceof Uint8Array) && !ArrayBuffer.isView(value) &&
+            !(value instanceof ArrayBuffer))
+          throw new TypeError("ReadableStream yielded a non-BufferSource value");
+        chunks.push(u8(value).slice());
+      }
+    } finally {
+      if (signal && onAbort) {
+        try { signal.removeEventListener("abort", onAbort); } catch (e) {}
+      }
+      try { reader.releaseLock(); } catch (e) {}
+    }
+    return concatU8(chunks);
+  }
+
+  async function doFetchH2(url, init, depth) {
+    if (depth > 20) throw mkErr("redirect count exceeded", "ERR_TOO_MANY_REDIRECTS");
+    const h2 = M["http2"] || M["node:http2"];
+    if (!h2 || typeof h2.connect !== "function")
+      throw mkErr("HTTP/2 fetch is unavailable", "HTTP2Unsupported");
+
+    const parsed = new G.URL(String(url));
+    if (parsed.protocol !== "https:")
+      throw mkErr("HTTP/2 fetch requires HTTPS", "HTTP2Unsupported");
+    const signal = init && init.signal;
+    if (signal && signal.aborted) throw h2AbortReason(signal);
+    const method = String((init && init.method) || "GET").toUpperCase();
+    const originalBody = init && init.body;
+    const bodyIsStream = !!(originalBody && typeof originalBody.getReader === "function");
+    const body = await readH2RequestBody(originalBody, signal);
+
+    const requestHeaders = {
+      ":method": method,
+      ":scheme": "https",
+      ":authority": parsed.host,
+      ":path": parsed.pathname + parsed.search,
+    };
+    let hasLength = false;
+    for (const pair of collectHeaders(init, null)) {
+      const name = String(pair[0]).toLowerCase();
+      // RFC 9113 8.2.2: connection-specific fields are forbidden in H2.
+      if (name === "connection" || name === "proxy-connection" ||
+          name === "keep-alive" || name === "transfer-encoding" ||
+          name === "upgrade") continue;
+      if (name === "host") { requestHeaders[":authority"] = String(pair[1]); continue; }
+      if (name === "content-length") hasLength = true;
+      requestHeaders[name] = String(pair[1]);
+    }
+    if (!hasLength && body !== null) requestHeaders["content-length"] = String(body.length);
+    else if (!hasLength && (method === "POST" || method === "PUT" || method === "PATCH"))
+      requestHeaders["content-length"] = "0";
+
+    const tlsOpt = (init && init.tls) || {};
+    // mbun's node:http2 forwards its complete connect options object to
+    // tls.connect, so preserve every TLS credential/policy option instead of
+    // hand-picking CA and servername. The one exception is a custom identity
+    // callback: this runtime cannot enforce it when rejectUnauthorized is false
+    // (node:tls admits the peer before invoking the callback), so forced-H2
+    // fetch must fail before sending a request rather than bypass user policy.
+    if (typeof tlsOpt.checkServerIdentity === "function")
+      throw mkErr("HTTP/2 fetch cannot enforce tls.checkServerIdentity", "HTTP2Unsupported");
+    const connectOptions = Object.assign({}, tlsOpt, {
+      rejectUnauthorized: tlsOpt.rejectUnauthorized !== false &&
+        !(G.process && G.process.env && G.process.env.NODE_TLS_REJECT_UNAUTHORIZED === "0"),
+    });
+    delete connectOptions.serverName;
+    if (tlsOpt.serverName !== undefined) connectOptions.servername = tlsOpt.serverName;
+
+    return new Promise((resolve, reject) => {
+      let session;
+      let stream;
+      let headResolved = false;
+      let redirecting = false;
+      let bodyController = null;
+      let bodyDone = false;
+      let onAbort;
+      const release = () => {
+        if (signal && onAbort) {
+          try { signal.removeEventListener("abort", onAbort); } catch (e) {}
+          onAbort = null;
+        }
+        try { if (session && !session.destroyed) session.close(); } catch (e) {}
+      };
+      const cancelTransport = () => {
+        try {
+          if (stream && !stream.destroyed) {
+            if (typeof stream.close === "function") stream.close(h2.constants.NGHTTP2_CANCEL);
+            else stream.destroy();
+          }
+        } catch (e) { try { if (stream && !stream.destroyed) stream.destroy(); } catch (e2) {} }
+        release();
+      };
+      const failBody = (error) => {
+        if (bodyDone) return;
+        bodyDone = true;
+        try { if (bodyController) bodyController.error(error); } catch (e) {}
+        cancelTransport();
+      };
+      const fail = (error) => {
+        if (redirecting) return;
+        if (!headResolved) {
+          headResolved = true;
+          cancelTransport();
+          reject(error);
+        } else {
+          failBody(error);
+        }
+      };
+      try {
+        session = h2.connect(parsed.origin, connectOptions);
+        session.once("error", fail);
+        stream = session.request(requestHeaders, { endStream: false });
+        stream.once("error", fail);
+        stream.once("aborted", () => fail(mkErr("HTTP/2 response stream was aborted", "ECONNRESET")));
+        stream.once("response", (responseHeaders) => {
+          if (headResolved || redirecting) return;
+          const status = Number(responseHeaders && responseHeaders[":status"]) || 200;
+          const headers = new G.Headers();
+          if (responseHeaders) {
+            for (const name of Object.keys(responseHeaders)) {
+              if (name[0] === ":") continue;
+              const value = responseHeaders[name];
+              if (Array.isArray(value)) for (const item of value) headers.append(name, String(item));
+              else if (value !== undefined) headers.append(name, String(value));
+            }
+          }
+          const location = headers.get("location");
+          if (location && (status === 301 || status === 302 || status === 303 ||
+                           status === 307 || status === 308)) {
+            const mode = (init && init.redirect) || "follow";
+            if (mode === "error") {
+              headResolved = true;
+              cancelTransport();
+              reject(new TypeError("fetch redirect is not allowed"));
+              return;
+            }
+            if (mode === "follow") {
+              if (bodyIsStream && status !== 303) {
+                headResolved = true;
+                cancelTransport();
+                reject(new TypeError("Cannot follow redirect with a streaming request body"));
+                return;
+              }
+              const nextURL = new G.URL(location, parsed.href);
+              const next = nextURL.href;
+              const nextInit = Object.assign({}, init);
+              const nextHeaders = new G.Headers(nextInit.headers || undefined);
+              // Fetch redirect step 13 / bun CROSS_ORIGIN_STRIPPED_REQUEST_HEADERS:
+              // credentials and an explicit Host belong only to the old origin.
+              if (nextURL.origin !== parsed.origin) {
+                nextHeaders.delete("authorization");
+                nextHeaders.delete("proxy-authorization");
+                nextHeaders.delete("cookie");
+                nextHeaders.delete("host");
+              }
+              if (status === 303 || ((status === 301 || status === 302) && method === "POST")) {
+                nextInit.method = "GET";
+                nextInit.body = null;
+                nextHeaders.delete("content-length");
+                nextHeaders.delete("content-type");
+              }
+              nextInit.headers = nextHeaders;
+              // WHATWG redirect fetch acts on response metadata. Do not drain an
+              // attacker-controlled or long-lived redirect body before following.
+              redirecting = true;
+              cancelTransport();
+              doFetchH2(next, nextInit, depth + 1).then((res) => {
+                res.redirected = true;
+                resolve(res);
+              }, reject);
+              return;
+            }
+          }
+
+          // Fetch responses to HEAD and null-body statuses never expose a body,
+          // even if a peer sends payload bytes. This H2 fetch owns its session,
+          // so cancel the stream after resolving the metadata instead of leaving
+          // an unobservable payload buffered behind a synthetic ReadableStream.
+          if (method === "HEAD" || status === 204 || status === 205 || status === 304) {
+            let response;
+            try { response = new G.Response(null, { status, statusText: "", headers }); }
+            catch (error) { fail(error); return; }
+            response.url = parsed.href;
+            response.redirected = depth > 0;
+            headResolved = true;
+            bodyDone = true;
+            cancelTransport();
+            resolve(response);
+            return;
+          }
+
+          const rawBody = new G.ReadableStream({
+            start(controller) {
+              bodyController = controller;
+              stream.on("data", (chunk) => {
+                if (bodyDone) return;
+                try {
+                  controller.enqueue(u8(chunk).slice());
+                  if (controller.desiredSize !== null && controller.desiredSize <= 0 &&
+                      typeof stream.pause === "function") stream.pause();
+                } catch (error) { failBody(error); }
+              });
+              stream.once("end", () => {
+                if (bodyDone) return;
+                bodyDone = true;
+                try { controller.close(); } catch (e) {}
+                release();
+              });
+              stream.once("close", () => {
+                if (!bodyDone) failBody(mkErr("HTTP/2 response stream closed before END_STREAM", "ECONNRESET"));
+              });
+            },
+            pull() {
+              if (!bodyDone && stream && typeof stream.resume === "function") stream.resume();
+            },
+            cancel() {
+              if (!bodyDone) bodyDone = true;
+              cancelTransport();
+            },
+          });
+          let responseBody = rawBody;
+          const encoding = String(headers.get("content-encoding") || "").trim().toLowerCase();
+          if (encoding && encoding !== "identity" && (!init || init.decompress !== false)) {
+            const format = encoding === "x-gzip" ? "gzip" : encoding;
+            if (format === "gzip" || format === "deflate" || format === "br" || format === "zstd") {
+              try { responseBody = rawBody.pipeThrough(new G.DecompressionStream(format)); }
+              catch (error) { fail(error); return; }
+              headers.delete("content-encoding");
+              headers.delete("content-length");
+            }
+          }
+          let response;
+          try { response = new G.Response(responseBody, { status, statusText: "", headers }); }
+          catch (error) { fail(error); return; }
+          response.url = parsed.href;
+          response.redirected = depth > 0;
+          headResolved = true;
+          resolve(response);
+        });
+        if (signal && typeof signal.addEventListener === "function") {
+          onAbort = () => fail(h2AbortReason(signal));
+          signal.addEventListener("abort", onAbort, { once: true });
+        }
+        if (body && body.length) stream.write(body);
+        stream.end();
+      } catch (e) { fail(e); }
+    });
+  }
+
   // bun existing_socket HTTPContext.rs:790 -- a closed or errored slot is
   // dropped and the scan continues; it is never handed to a caller.
   const poolTake = (key) => {
@@ -2388,6 +2679,8 @@ export constexpr std::string_view kNetJS_part2 = R"JS(
     }
     const m = /^(https?):\/\/([^/:?#]+)(?::(\d+))?([^#]*)/.exec(url);
     if (!m) return Promise.reject(new TypeError("fetch() URL is invalid: " + url));
+    if (init.protocol === "http2" || init.protocol === "h2")
+      return doFetchH2(url, init, depth);
     const secure = m[1] === "https";
     const host = m[2];
     const port = m[3] ? +m[3] : (secure ? 443 : 80);
@@ -2438,8 +2731,16 @@ export constexpr std::string_view kNetJS_part2 = R"JS(
       lines.push("User-Agent: " + (ovUA || ("Bun/" + ((G.Bun && G.Bun.version) || "1.0"))));
     }
     if (!haveAccept) lines.push("Accept: */*");
-    for (const kv of hdrs) lines.push(kv[0] + ": " + kv[1]);
+    // This H1 client materializes every request body before serialization, so
+    // it is always bun's non-streaming build_request branch. That branch drops
+    // a caller Transfer-Encoding and emits one Content-Length framing mode;
+    // forwarding TE here produced TE: chunked + CL: 0 with no terminal chunk.
+    for (const kv of hdrs) {
+      if (kv[0].toLowerCase() !== "transfer-encoding") lines.push(kv[0] + ": " + kv[1]);
+    }
     if (bodyBytes && !haveCL) lines.push("Content-Length: " + bodyBytes.length);
+    else if (!haveCL && method !== "GET" && method !== "HEAD" && method !== "OPTIONS" && method !== "TRACE")
+      lines.push("Content-Length: 0");
     const reqBytes = bodyBytes
       ? concatU8([te.encode(lines.join("\r\n") + "\r\n\r\n"), bodyBytes])
       : te.encode(lines.join("\r\n") + "\r\n\r\n");
