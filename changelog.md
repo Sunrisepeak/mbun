@@ -5,6 +5,12 @@
 
 ## 2026-08-02
 
+- W410 Node global-console warning stderr-routing source fix：修复默认 warning printer 绕过 live
+  `process.stderr.write` 的问题；issue #68。post-W409 W329 selector 从 **4/5 pass、1 fail** 到
+  **5/5 pass、0 fail、0 timeout**，focused target **1/1 pass**，W410 五文件回归 **5/5 pass**，
+  direct ordering smoke 为 `ORDER 1`，serial release build **59.74s**。未修改 upstream fixture、
+  未跑全量 corpus。
+
 - W409 Node WebCrypto internal/global constructor identity source fix：loader 保留 vendored
   `internal/crypto/webcrypto` 的实现，但把 `Crypto`、`CryptoKey`、`SubtleCrypto` 与 `crypto`
   的公开导出统一到 runtime-owned global 对象。fresh W329 probe 从 **3/5 pass、2 fail** 到

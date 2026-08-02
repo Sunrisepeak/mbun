@@ -355,6 +355,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W407 | Node HTTP/2 server trailer max-block error source fix | 5 | baseline focused target timeout; direct frame-error lifecycle primitive passed; after fix focused target 1/1 pass; W404 regression 5/5 pass; W403 regression 5/5 pass; serial release builds 59.72s + 59.49s | reject server trailer blocks above default/explicit `maxSendHeaderBlockLength` before CONTINUATION splitting, emit `frameError`, reset with `NGHTTP2_FRAME_SIZE_ERROR`, and gracefully close the session |
 | W408 | Node HTTP/2 socket proxy and Timer/TimersList shape source fix | 5 | baseline owner selector 4/5 pass + 1 fail at timer inspect; focused target 1/1 pass; final proxy/socket regression 5/5 pass; independent timer guards 5/5 pass; `test-timers-refresh.js` remains an independent internal-timer-pump failure; final serial release build 59.51s | expose Node-shaped `TimersList` links and inspect output, preserve timer ref state across refresh, expose handle `hasRef()`, ignore user-mutated public socket writable/readable flags when framing, and return `undefined` from `session.socket` after teardown |
 | W409 | Node WebCrypto internal/global constructor identity source fix | 5 | fresh W329 probe 3/5 pass + 2 fail; focused target 1/1 pass; W409 five-file regression 5/5 pass; post W329 selector 4/5 pass with only console warning-order owner; serial release build 58.97s | publish the runtime-owned `Crypto`, `CryptoKey`, `SubtleCrypto`, and `crypto` objects from `internal/crypto/webcrypto`; keep global-console warning ordering as a separate owner |
+| W410 | Node global-console warning stderr-routing source fix | 5 | baseline W329 post-W409 4/5 pass + 1 fail; focused target 1/1 pass; W410 five-file regression 5/5 pass; W329 selector 5/5 pass; direct ordering smoke `ORDER 1`; serial release build 59.74s | route the default warning printer through live `process.stderr.write`, preserving console fallback when no writable stderr exists; issue #68 |
 
 ## W305 Bun/Deno Event/Performance/URL/crypto leaf probe
 
@@ -1993,6 +1994,26 @@ no-op, which leaves compat `setUnrefTimeout()` outside the runtime pump; that
 is a separate internal-timer integration owner. The final serial release build
 took **59.51s**. No upstream fixture changed and no full corpus/workspace-wide
 test ran.
+
+## W410 Node global-console warning stderr-routing source fix
+
+The post-W409 W329 selector had **4/5 passes, 1 failure, and 0 timeout**; the
+only remaining file was `test-global-console-exists.js`. The failure was
+reproduced as `ORDER 0 1`: the warning event arrived, but the default warning
+printer's `console.error()` path bypassed the live `process.stderr.write`
+replacement. System Node produced `ORDER 1 1` for the same reduced probe.
+
+Issue [#68](https://github.com/Sunrisepeak/mbun/issues/68) records the
+redacted environment, reproduction, and root-cause boundary. The narrow fix in
+`node_process_extra.cppm` writes the default warning text through the current
+`process.stderr.write` when available, with the existing console path retained
+as a fallback. Warning event scheduling and the upstream fixture are unchanged.
+
+The focused target moved to **1/1 pass**; a five-file W410 target/regression
+wave was **5/5 pass, 0 fail, 0 timeout**; the original W329 five-file selector
+is now **5/5 pass, 0 fail, 0 timeout**. A direct ordering smoke reports
+`ORDER 1`. The serial release build took **59.74s**. No upstream fixture
+changed and no full corpus/workspace-wide test ran.
 
 ## W409 Node WebCrypto internal/global constructor identity source fix
 

@@ -1225,6 +1225,15 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
             if (fs && typeof fs.appendFileSync === "function") { fs.appendFileSync(file, msg + "\n"); return; }
           } catch (e) {}
         }
+        // Node's global console writes warnings through the live stderr
+        // stream. Keep that observable seam here so replacing
+        // process.stderr.write remains visible to the default warning
+        // printer; use the console only when no writable stderr exists.
+        const stderr = proc.stderr;
+        if (stderr && typeof stderr.write === "function") {
+          try { stderr.write(msg + "\n"); } catch (e) {}
+          return;
+        }
         try { G.console.error(msg); } catch (e) {}
       };
 
