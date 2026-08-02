@@ -967,8 +967,21 @@ private:
             }
         }
         while (true) {
-            // skip a node_modules segment as its own parent (node walks dirs, not
-            // node_modules-of-node_modules); simplest: just probe every dir.
+            // node NODE_MODULES_PATHS drops any ancestor whose own last segment
+            // is "node_modules", so `<x>/node_modules/node_modules/<name>` is
+            // never a candidate. Probing it anyway used to be harmless (such a
+            // directory is not a package), but LOAD_AS_FILE below would now
+            // reach the decoy file test/fixtures/node_modules/node_modules/bar.js.
+            const std::string_view lastSeg{dir.data() + dir.find_last_of('/') + 1,
+                                           dir.data() + dir.size()};
+            if (lastSeg == "node_modules") {
+                const std::string up{paths::dirname(dir)};
+                if (up == dir) {
+                    break;
+                }
+                dir = up;
+                continue;
+            }
             const std::string pkgRoot{paths::join({dir, "node_modules", ps.name})};
             const std::string pkgJsonPath{join_target(pkgRoot, "package.json")};
             if (auto pkg{read_package_json(pkgJsonPath)}) {
@@ -982,6 +995,18 @@ private:
                 const std::string target{ps.subpath.empty() ? pkgRoot
                                                             : join_target(pkgRoot, ps.subpath.substr(1))};
                 if (auto r{load_as_file_or_dir(target)}) {
+                    return ok(*r);
+                }
+            }
+            // node LOAD_NODE_MODULES runs LOAD_AS_FILE(DIR/X) alongside
+            // LOAD_AS_DIRECTORY(DIR/X), so a bare specifier is also satisfied by
+            // a plain file sitting directly in node_modules: `require('bar')`
+            // resolves `node_modules/bar.js` (test/fixtures/node_modules/bar.js,
+            // exercised by test-repl-require).
+            {
+                const std::string target{ps.subpath.empty() ? pkgRoot
+                                                            : join_target(pkgRoot, ps.subpath.substr(1))};
+                if (auto r{load_as_file(target)}) {
                     return ok(*r);
                 }
             }
