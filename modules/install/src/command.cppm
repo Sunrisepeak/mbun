@@ -103,6 +103,11 @@ export struct InstallSummary {
     // the root package too (install_with_manager.rs:1767-1782).
     bool savedLockfile{false};
     std::size_t lockPackageCount{0};
+    // Non-fatal install diagnostics (registry_install::Summary::warnings), which
+    // the caller prints as `warn: <message>` on stderr. Today this is only the
+    // optional-dependency fetch failure bun logs as a warning instead of an
+    // error (runTasks.rs:498 / :848).
+    std::vector<std::string> warnings;
 };
 
 export using InstallResult = std::expected<InstallSummary, InstallError>;
@@ -1425,6 +1430,7 @@ export InstallResult install_project(const std::filesystem::path& startDirectory
 
     std::size_t installedCount{plans.size() + workspaceLinks.size()};
     std::vector<std::string> installedPackages;
+    std::vector<std::string> installWarnings;
     if (!registryDeps.empty()) {
         auto registryOptions{detail::resolve_registry_options(
             options, bunfig->has_value() ? &**bunfig : nullptr)};
@@ -1461,6 +1467,7 @@ export InstallResult install_project(const std::filesystem::path& startDirectory
         }
         installedCount += registryResult->installed;
         installedPackages = std::move(registryResult->packages);
+        installWarnings = std::move(registryResult->warnings);
     }
 
     // Save the lockfile after a successful install (install_with_manager.rs:
@@ -1468,6 +1475,7 @@ export InstallResult install_project(const std::filesystem::path& startDirectory
     // does — its drift check already ran above).
     InstallSummary summary{root, installedCount, lockfile->has_value(),
                            std::move(installedPackages)};
+    summary.warnings = std::move(installWarnings);
     const bool shouldSave{!options.frozenLockfile &&
                           (options.lockfileOnly || lockOutOfDate || lockNeedsMigration)};
     if (shouldSave) {
