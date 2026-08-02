@@ -356,6 +356,29 @@ the observed Linux limits; the coordinator owns the only root build.
 | W408 | Node HTTP/2 socket proxy and Timer/TimersList shape source fix | 5 | baseline owner selector 4/5 pass + 1 fail at timer inspect; focused target 1/1 pass; final proxy/socket regression 5/5 pass; independent timer guards 5/5 pass; `test-timers-refresh.js` remains an independent internal-timer-pump failure; final serial release build 59.51s | expose Node-shaped `TimersList` links and inspect output, preserve timer ref state across refresh, expose handle `hasRef()`, ignore user-mutated public socket writable/readable flags when framing, and return `undefined` from `session.socket` after teardown |
 | W409 | Node WebCrypto internal/global constructor identity source fix | 5 | fresh W329 probe 3/5 pass + 2 fail; focused target 1/1 pass; W409 five-file regression 5/5 pass; post W329 selector 4/5 pass with only console warning-order owner; serial release build 58.97s | publish the runtime-owned `Crypto`, `CryptoKey`, `SubtleCrypto`, and `crypto` objects from `internal/crypto/webcrypto`; keep global-console warning ordering as a separate owner |
 | W410 | Node global-console warning stderr-routing source fix | 5 | baseline W329 post-W409 4/5 pass + 1 fail; focused target 1/1 pass; W410 five-file regression 5/5 pass; W329 selector 5/5 pass; direct ordering smoke `ORDER 1`; serial release build 59.74s | route the default warning printer through live `process.stderr.write`, preserving console fallback when no writable stderr exists; issue #68 |
+| W411 | Node perf_hooks stale-owner revalidation | 5 + 5 | W330 5/5 pass and W331 5/5 pass; 0 timeout; no build | close stale ResourceTiming BigInt and nodeTiming milestone inventory rows; select the remaining W145 timer owner |
+| W412 | Node non-integer timer bucket source fix | 5 | baseline W145 4/5 pass + 1 fail; focused target 1/1 pass; W145/W327/W335 regressions each 5/5 pass; serial release build 59.88s | normalize real-time queue deadlines and interval periods to integer millisecond buckets while preserving public delay metadata; issue #69; no upstream fixture change |
+
+## W412 Node non-integer timer bucket source fix
+
+W411 first revalidated two historical performance owners with bounded five-job
+waves: W330 and W331 both measured **5/5 pass, 0 fail, 0 timeout**, so their
+ResourceTiming BigInt and `nodeTiming` milestone entries are stale on this
+Linux build. The remaining W145 probe measured **4/5 pass, 1 fail, 0 timeout**;
+`test-timers-non-integer-delay.js` consistently reported ordering `1,4,3,2`
+instead of Node's `1,2,3,4`.
+
+Issue [#69](https://github.com/Sunrisepeak/mbun/issues/69) records the redacted
+reproduction and root cause. `process_web.cppm` now keeps the timer facade's
+public delay values unchanged while storing integer-millisecond deadlines and
+interval periods in the real-time queue. This restores registration order for
+delays in one Node timer bucket without changing the upstream test.
+
+The focused target moved to **1/1 pass**. The five-file W145 selector then
+measured **5/5 pass, 0 fail, 0 timeout**. Two additional five-job timer
+regressions, W327 clear/refresh/tampering and W335 API/primitive guards, also
+measured **5/5 pass** each. The final serial release build took **59.88s**.
+No upstream fixture changed and no full corpus/workspace-wide test ran.
 
 ## W305 Bun/Deno Event/Performance/URL/crypto leaf probe
 

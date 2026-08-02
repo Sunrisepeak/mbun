@@ -5,6 +5,7 @@ import std;
 
 export namespace mbun::jsc::builtins::detail {
 
+// Keep Node timer metadata precise while using integer millisecond queue buckets.
 inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (real: spawnSync/execSync + async spawn/exec/execFile/fork)
   // Async children run over __mbunProcNative.spawnEx (fork/exec with live pipe
   // fds) and are driven by __mbun_io_tick(), which the event-loop pump calls each
@@ -2471,21 +2472,12 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     refresh() { const it = findT(id); if (it) it.at = Date.now() + (it.iv || it.d || 0); return this; },
     close() { G.clearTimeout(id); return this; }, [Symbol.dispose]() { G.clearTimeout(id); } });
   const timerId = (t) => (t && typeof t === "object" ? t._id : t);
-  G.setTimeout = function (fn, delay) { const a = Array.prototype.slice.call(arguments, 2); const id = T.id++; const d = +delay || 0; T.q.push({ id: id, fn: fn, at: Date.now() + d, d: d, a: a, iv: 0, refd: true }); return mkTimer(id); };
-  G.setInterval = function (fn, delay) { const a = Array.prototype.slice.call(arguments, 2); const id = T.id++; const d = +delay || 1; T.q.push({ id: id, fn: fn, at: Date.now() + d, d: d, a: a, iv: d, refd: true }); return mkTimer(id); };
+  // Node timer buckets use integer milliseconds.
+  G.setTimeout = function (fn, delay) { const a = Array.prototype.slice.call(arguments, 2); const id = T.id++; const d = +delay >= 1 ? Math.trunc(+delay) : 1; T.q.push({ id: id, fn: fn, at: Date.now() + d, d: d, a: a, iv: 0, refd: true }); return mkTimer(id); };
+  G.setInterval = function (fn, delay) { const a = Array.prototype.slice.call(arguments, 2); const id = T.id++; const d = +delay >= 1 ? Math.trunc(+delay) : 1; T.q.push({ id: id, fn: fn, at: Date.now() + d, d: d, a: a, iv: d, refd: true }); return mkTimer(id); };
   G.clearTimeout = function (t) { const id = timerId(t); for (let i = 0; i < T.q.length; i++) if (T.q[i].id === id) { T.q.splice(i, 1); return; } };
   G.clearInterval = G.clearTimeout;
-  // `imm` marks an Immediate; `b` stamps the drain batch it was queued in, so a
-  // setImmediate scheduled FROM an immediate callback waits for the next batch
-  // (node: the check phase runs the immediates present when the phase began,
-  // newly queued ones go to the next loop iteration). Without that stamp a
-  // self-reposting .on('message')/postMessage pair re-queued into the batch it
-  // was running in and starved every timer forever
-  // (test-worker-message-port-infinite-message-loop), and a chained setImmediate
-  // walked all its links inside ONE drain call, so the microtask checkpoint the
-  // pump performs between calls never landed in the middle of the chain
-  // (test-worker-message-port-transfer-self: a port closed from a message
-  // handler stayed "active" for all 10 ticks of common/tick.js).
+  // `b` keeps Immediates queued from a callback in the next drain batch.
   G.setImmediate = function (fn) { const a = Array.prototype.slice.call(arguments, 1); const id = T.id++; T.q.push({ id: id, fn: fn, at: 0, d: 0, a: a, iv: 0, refd: true, imm: true, b: T.batch }); return mkTimer(id); };
   G.clearImmediate = G.clearTimeout;
   // Fire up to `budget` DUE timers (earliest deadline first); returns the count

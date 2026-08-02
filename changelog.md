@@ -5,6 +5,13 @@
 
 ## 2026-08-02
 
+- W412 Node non-integer timer bucket source fix：`process_web.cppm` 保留 timer facade 的公开 delay metadata，
+  但将 real-time queue 的 deadline 和 interval period 归一到整数毫秒 bucket，修复 Node
+  `test-timers-non-integer-delay.js` 的注册顺序。issue #69；baseline W145 **4/5 pass、1 fail**，focused
+  target **1/1 pass**，W145/W327/W335 三个五文件回归均 **5/5 pass、0 fail、0 timeout**，serial release
+  build **59.88s**。W411 同时将 W330/W331 两个旧 performance owner 各复核为 **5/5 pass**。未修改 upstream
+  fixture、未跑全量 corpus。
+
 - W410 Node global-console warning stderr-routing source fix：修复默认 warning printer 绕过 live
   `process.stderr.write` 的问题；issue #68。post-W409 W329 selector 从 **4/5 pass、1 fail** 到
   **5/5 pass、0 fail、0 timeout**，focused target **1/1 pass**，W410 五文件回归 **5/5 pass**，
