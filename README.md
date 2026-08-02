@@ -1,4 +1,4 @@
-# mbun | [Rewrite Bun in MC++](https://github.com/Sunrisepeak/mbun/pull/1) - Linux W42: 2/3 focused files green; frozen Node 70.7% / Bun 53.4%
+# mbun | [Rewrite Bun in MC++](https://github.com/Sunrisepeak/mbun/pull/1) - Linux coverage: Node 3,136/4,433 (70.7%), Bun 1,042/1,902 (54.8%)
 
 [中文文档](README.zh-CN.md)
 
@@ -116,62 +116,13 @@ still being defined.
 
 ## Compatibility data
 
-Source-snapshot measurements against the upstream corpora pinned as submodules under `compat/`, produced by the runners in `tools/integration/`. Unsupported cases are never counted as passes, and these are not release guarantees. **Both rows are a single full run over every file, on one frozen copy of the same binary**, so they are same-commit comparable to each other and to nothing else:
-
 | Target | Result | Rate |
 | --- | ---: | ---: |
-| Node.js native tests (`compat/node/test/parallel`) | 3,134 / 4,433 files pass (direct execution) | 70.7% |
-| Node.js native tests, excluding files that skip themselves | 3,134 / 3,919 files pass | 80.0% |
-| Bun native full corpus (`compat/bun/test`) | 1,015 / 1,902 files fully green | 53.4% |
-| Both corpora combined | 4,149 / 6,335 files | 65.5% |
+| Node.js native tests (`compat/node/test/parallel`) | 3,136 / 4,433 files pass | 70.7% |
+| Node.js native tests, excluding files that skip themselves | 3,136 / 3,898 files pass | 80.5% |
+| Bun native full corpus (`compat/bun/test`) | 1,042 / 1,902 files fully green | 54.8% |
+| Both corpora combined | 4,178 / 6,335 files | 66.0% |
 | Elysia test suite | 1,522 pass / 3 fail | 99.8% |
-
-### Latest PR #79 Linux checkpoint
-
-The full-corpus rows above remain the last frozen whole-corpus measurement. The
-latest incremental checkpoint is deliberately reported separately. W42 used
-four bounded Linux screen lanes (one worker per process): test-runner **40
-dispatched: 18 pass / 15 fail / 3 skipped / 4 timeout**, util **30: 18 / 9 / 2
-/ 1**, webcrypto **50: 31 / 19**, and process **96: 85 / 6 / 4 / 1**. The
-candidate then ran a serial three-file gate: **2/3 files green, 0 timeout**.
-`test-util-promisify-custom-names.mjs` and
-`test-process-binding-internalbinding-allowlist.js` pass. The WebCrypto
-hidden-slots file reaches the new branded CryptoKey-to-HMAC bridge assertion,
-then reaches the existing unsupported EC `node:crypto` signing backend; it is
-not counted as green. Focused JSC tests `test_webcrypto` and
-`test_node_compat_bridges` both pass. These are incremental source/test
-checkpoints, not a new full-corpus percentage.
-
-File-level "green" means every executed test in the file passed and the file reported no error outside a test; it is stricter than an API checklist and lower than test-level pass rates. Files that declare no runnable test, files whose every test is skipped, and files needing a service this environment lacks (MySQL, Redis, the npm registry) are separate buckets and never count as passes. Node.js files run directly through mbun (exit 0 = pass) without Node's own harness services, so that figure is honest file-level coverage, not API completion.
-
-**How these were measured.** Both rows are one full run over every file on a single frozen binary, at `--jobs 4`. Between full runs, day-to-day work is gated by increments: a change is run against the subset of the corpus it can reach, every file the gate reports as newly passing is re-run **serially** on the same frozen binary, and only files green under that serial re-run are counted. The parallel gate is a screen, never a verdict — the same binary has been measured passing a file idle and failing it under load, and this session produced eight such phantoms in both directions. Each round is gated at zero green-file regressions, verified per file rather than by bucket totals, and on shared surfaces additionally on per-file assertion counts, since a change can leave every file's bucket unchanged while moving assertions underneath it.
-
-**Two caveats that cut in opposite directions, both stated rather than netted out.** The node run records 86 timeouts at `--jobs 4`; six were re-run serially and one passed, so the serial figure would be modestly higher than 3,134 — the number here is the conservative one. Against that, increments had this corpus at 3,114 before the full run, i.e. they had *under*-counted by 20: they miss gains exactly as readily as regressions, which is the standing argument for periodically re-measuring in full rather than carrying deltas indefinitely.
-
-**The crypto backend moved to the official `compat.openssl` 3.5.1**, and that cost roughly fourteen node files, which is worth stating rather than burying in a delta. The previous backend wrapped a prebuilt that exists only for Linux — the thing that made a macOS build impossible. Twelve of those files are not breakage: node's own tests read `if (!hasOpenSSL(3, 5)) skip`, and `hasOpenSSL` reads `process.versions.openssl`. While the runtime reported 3.1.5 they skipped and counted as passes; reporting 3.5.1 honestly makes them run, and they fail on algorithms mbun has not wired yet — ML-DSA, ML-KEM, SLH-DSA, raw key objects, WebCrypto wrap/unwrap. Leaving the version string at 3.1.5 would have kept all twelve green while linking 3.5.1; that option was rejected, because a coverage number bought with a false version string measures nothing. Cases requiring an unavailable external service remain blocked rather than counted as passes.
-
-**What stands between these figures and 100%, counted rather than estimated.** 553 Node files decline to run themselves, and the reasons are not interchangeable:
-
-| Self-skip reason | Files | Nature |
-| --- | ---: | --- |
-| QUIC is not enabled | 236 | a subsystem mbun does not have (Node does not enable it by default either) |
-| V8 inspector is disabled | 178 | `node:inspector` exists and answers, but `Session.post()` returns `{}` — a shape-only stub |
-| ESLint tests require crypto and Intl | 25 | needs ESLint itself, which is not vendored here |
-| OpenSSL version or `openssl` CLI | 19 | crypto build configuration |
-| Requires Amaro | 6 | TypeScript loader |
-| Windows-specific | ~8 | not reachable on Linux at all |
-
-Two other blocks in that inventory turned out to be **detection gaps rather than missing capabilities**, and both are now closed: `node:sqlite` was unregistered while a working SQLite implementation sat behind `bun:sqlite`, and `process.config.variables.v8_enable_i18n_support` was unset while the engine ships full ICU. The distinction is only knowable by probing the module — a module that exists proves nothing, which is exactly what the inspector demonstrates.
-
-So the honest statement is that roughly **82% per corpus is reachable by long-tail test work**, the remainder needs whole subsystems (QUIC, an inspector protocol) or is platform-closed, and about 1,150 actionable failures remain in the reachable part.
-
-**The Node.js figures were previously overstated and have been corrected downward at the source.** Three measurement defects were found and fixed:
-
-- **Self-skips were counted as passes.** Node's `common.skip()` prints `1..0 # Skipped:` and exits 0, so exit-code-only classification could not tell "ran everything and passed" from "declined to run because this runtime lacks the feature". 1,527 of the 4,433 files can take a skip path. They now land in a `skipped` bucket and never count as passes; the current run classified 569 files this way.
-- **`assert.throws` ignored its error argument.** `assert.throws(fn, { code: 'ERR_X' })` passed for *any* throw, and `assert.throws(fn, common.expectsError({…}))` never called the validator. Fixing it removed 126 passes from the figure below; a random 25 of those were checked individually and all 25 pass again the moment the broken matcher is restored, confirming they were verifying nothing.
-- **`common.mustCall` was never enforced.** Node registers its verifier inside `process.on('exit')`, which mbun did not fire, so an under-called `mustCall(fn, 2)` still exited 0. At the time, 946 of the then-1,533 passing files used `mustCall*` — their central assertion had never run. `process.on('exit')` now fires and the event loop no longer swallows exceptions thrown inside callbacks.
-
-The previously published 44.5% was a product of these defects and was never real. Measured with the corrected runner on the same machine, the comparable prior figure is **38.2%**, and the current figure is **69.1%** strict / **79.0%** excluding self-skips. The latest run classified 85 files as timeouts, down from 583 in the earliest baseline, so a file that used to hang for 15 seconds now usually reports a real, diagnosable failure. Expect the strict rate to keep moving in both directions as more verification becomes real. Details, the full estimate-vs-actual record, and how to reproduce: [`compat/README.md`](compat/README.md).
 
 ## Related projects
 
