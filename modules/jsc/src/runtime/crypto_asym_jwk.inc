@@ -137,6 +137,35 @@ JSC_DEFINE_HOST_FUNCTION(node_asym_jwk_export_host,
         if (!isPublic && asym_octet_param(pkey.get(), OSSL_PKEY_PARAM_PRIV_KEY, priv)) {
             set_prop(ctx, obj, "d", static_cast<JSValueRef>(asym_u8(ctx, priv)));
         }
+    } else if (const std::string canonical{asym_pqc_canonical(pkey.get())}; !canonical.empty()) {
+        // AKP ("Algorithm Key Pair", draft-ietf-cose-dilithium / RFC 9794 family):
+        // one opaque `pub` plus one opaque `priv`, with the parameter set carried
+        // by `alg` rather than by a `crv`. `alg` is OpenSSL's canonical name
+        // verbatim — see asym_pqc_canonical for why that is the right source and
+        // not an uppercase() of node's spelling.
+        set_prop(ctx, obj, "kty", make_string(ctx, "AKP"));
+        set_prop(ctx, obj, "alg", make_string(ctx, canonical));
+        std::vector<std::uint8_t> pub;
+        if (!asym_octet_param(pkey.get(), OSSL_PKEY_PARAM_PUB_KEY, pub)) {
+            return hasher_throw(global, "jwkExport: PQC public key unavailable");
+        }
+        set_prop(ctx, obj, "pub", static_cast<JSValueRef>(asym_u8(ctx, pub)));
+        if (!isPublic) {
+            // node's `priv` is the SEED where the family has one (ML-DSA's is 32
+            // bytes, ML-KEM's 64), because the seed regenerates the expanded key
+            // and is what the JWK round-trip is defined over. SLH-DSA has no seed
+            // form, so its private key bytes are the only representation.
+            //
+            // Nothing is emitted for a key that carries neither: a public-only
+            // handle must never grow a `priv` member, and silently omitting it is
+            // exactly what keeps `export({format:'jwk'})` on a key derived with
+            // createPublicKey() from leaking private material.
+            std::vector<std::uint8_t> priv;
+            if (asym_octet_param(pkey.get(), "seed", priv) ||
+                asym_octet_param(pkey.get(), OSSL_PKEY_PARAM_PRIV_KEY, priv)) {
+                set_prop(ctx, obj, "priv", static_cast<JSValueRef>(asym_u8(ctx, priv)));
+            }
+        }
     } else {
         return hasher_throw(global, "jwkExport: unsupported key type");
     }
@@ -350,6 +379,69 @@ JSC_DEFINE_HOST_FUNCTION(node_asym_jwk_import_host,
         // import to succeed; that file is green 23/0 and the node file is blocked
         // elsewhere, so enforcing this today is a measured -1 for +0. struck.tsv.
         (void)haveX;
+    } else if (kty == "AKP") {
+        // The parameter set lives in `alg`, so it is load-bearing here in a way
+        // `alg` normally is not: without it there is no way to know which
+        // provider to hand the opaque bytes to.
+        const std::string alg{asym_str(global, toJS(global, get_prop(ctx, jwk, "alg")))};
+        if (alg.empty() || !asym_is_pqc_name(asym_lower(alg))) {
+            return throw_coded_error(global, kErrInvalidJwk, "Invalid JWK \"alg\" Parameter");
+        }
+        std::vector<std::uint8_t> pub;
+        std::vector<std::uint8_t> priv;
+        const bool havePub{asym_jwk_part(global, ctx, jwk, "pub", pub)};
+        const bool havePriv{isPrivate && asym_jwk_part(global, ctx, jwk, "priv", priv)};
+        // A private import REQUIRES `priv`: a JWK carrying only `pub` describes a
+        // public key, and quietly returning one from createPrivateKey would hand
+        // back a key whose `type` lies about what it holds.
+        if (isPrivate && !havePriv) {
+            return throw_coded_error(global, kErrInvalidJwk, "Invalid JWK AKP key");
+        }
+        if (!isPrivate && !havePub) {
+            return throw_coded_error(global, kErrInvalidJwk, "Invalid JWK AKP key");
+        }
+        // One fromdata attempt with a caller-chosen parameter set.
+        const auto attempt{[&](bool asSeed) -> EVP_PKEY* {
+            OSSL_PARAM_BLD* bld{OSSL_PARAM_BLD_new()};
+            if (bld == nullptr) { return nullptr; }
+            if (!havePriv) {
+                OSSL_PARAM_BLD_push_octet_string(bld, OSSL_PKEY_PARAM_PUB_KEY, pub.data(),
+                                                 pub.size());
+            } else if (asSeed) {
+                OSSL_PARAM_BLD_push_octet_string(bld, "seed", priv.data(), priv.size());
+            } else {
+                OSSL_PARAM_BLD_push_octet_string(bld, OSSL_PKEY_PARAM_PRIV_KEY, priv.data(),
+                                                 priv.size());
+                if (havePub) {
+                    OSSL_PARAM_BLD_push_octet_string(bld, OSSL_PKEY_PARAM_PUB_KEY, pub.data(),
+                                                     pub.size());
+                }
+            }
+            OSSL_PARAM* params{OSSL_PARAM_BLD_to_param(bld)};
+            EVP_PKEY* raw{nullptr};
+            PkeyCtxPtr pctx{EVP_PKEY_CTX_new_from_name(nullptr, alg.c_str(), nullptr)};
+            if (pctx && params != nullptr && EVP_PKEY_fromdata_init(pctx.get()) > 0) {
+                EVP_PKEY_fromdata(pctx.get(), &raw,
+                                  havePriv ? EVP_PKEY_KEYPAIR : EVP_PKEY_PUBLIC_KEY, params);
+            }
+            if (params != nullptr) { OSSL_PARAM_free(params); }
+            OSSL_PARAM_BLD_free(bld);
+            return raw;
+        }};
+        // ML-DSA/ML-KEM `priv` is the SEED, which the provider expands into both
+        // halves itself — so a seeded import needs nothing else and cannot
+        // disagree with `pub`. SLH-DSA has no seed form, so its bytes ARE the
+        // private key. The two are told apart by asking, not by a size table:
+        // a seed of the wrong length is rejected by the provider, and the fall
+        // back then offers the same bytes as a private key, which the provider
+        // rejects in turn if they are not one. Nothing is accepted that OpenSSL
+        // itself would not accept.
+        EVP_PKEY* raw{attempt(true)};
+        if (raw == nullptr && havePriv) {
+            ERR_clear_error();
+            raw = attempt(false);
+        }
+        pkey.reset(raw);
     } else {
         return throw_coded_error(global, kErrInvalidJwk, "Invalid JWK \"kty\" Parameter");
     }

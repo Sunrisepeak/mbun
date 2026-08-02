@@ -334,6 +334,45 @@ inline bool asym_enc_map(std::string_view type, bool priv, int& sel, const char*
     return false;
 }
 
+// --- post-quantum key types (OpenSSL >= 3.5) -------------------------------
+// node's asymmetricKeyType spelling for these families is exactly OpenSSL's own
+// algorithm name lowercased, and the JWK "alg" is that canonical name VERBATIM.
+// That is why SLH-DSA's trailing f/s stays lowercase in the JWK while ML-DSA and
+// ML-KEM look fully uppercase — it is not a special case, it is the provider's
+// own casing showing through. So one list of node names is enough for both
+// directions: OpenSSL resolves a name through its namemap case-insensitively on
+// the way in, and EVP_PKEY_get0_type_name() supplies the canonical form on the
+// way out. A second hand-written table mapping node → OpenSSL spelling would be
+// a thing to keep in sync for no gain, and would get SLH-DSA's casing wrong.
+// ref: node lib/internal/crypto/keys.js + src/crypto/crypto_keys.cc (AKP JWK).
+inline bool asym_is_pqc_name(std::string_view lower) {
+    static constexpr std::string_view kNames[]{
+        "ml-dsa-44", "ml-dsa-65", "ml-dsa-87",
+        "ml-kem-512", "ml-kem-768", "ml-kem-1024",
+        "slh-dsa-sha2-128s", "slh-dsa-sha2-128f", "slh-dsa-sha2-192s", "slh-dsa-sha2-192f",
+        "slh-dsa-sha2-256s", "slh-dsa-sha2-256f",
+        "slh-dsa-shake-128s", "slh-dsa-shake-128f", "slh-dsa-shake-192s", "slh-dsa-shake-192f",
+        "slh-dsa-shake-256s", "slh-dsa-shake-256f",
+    };
+    return std::ranges::find(kNames, lower) != std::ranges::end(kNames);
+}
+
+inline std::string asym_lower(std::string_view s) {
+    std::string out;
+    out.reserve(s.size());
+    for (char c : s) { out.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c)))); }
+    return out;
+}
+
+// The key's canonical OpenSSL name when it is one of the PQC families, else "".
+// Used both to gate the PQC arms and to fill the JWK "alg" with the exact casing
+// node reports.
+inline std::string asym_pqc_canonical(EVP_PKEY* pkey) {
+    const char* name{EVP_PKEY_get0_type_name(pkey)};
+    if (name == nullptr) { return {}; }
+    return asym_is_pqc_name(asym_lower(name)) ? std::string{name} : std::string{};
+}
+
 #include "crypto_asym_keygen.inc"
 
 // __mbunCryptoAsymNative.generateKeyPair(type, modLen, namedCurve, pubType,
@@ -382,6 +421,16 @@ JSC_DEFINE_HOST_FUNCTION(node_asym_generate_host,
         pkey.reset(EVP_PKEY_Q_keygen(nullptr, nullptr, "X25519"));
     } else if (type == "x448") {
         pkey.reset(EVP_PKEY_Q_keygen(nullptr, nullptr, "X448"));
+    } else if (asym_is_pqc_name(type)) {
+        // Nothing to configure: ML-DSA/ML-KEM/SLH-DSA parameter sets are chosen
+        // by the algorithm NAME, not by a keygen parameter, which is why node
+        // exposes twelve SLH-DSA "types" rather than one type plus options.
+        const std::string osslName{[&] {
+            std::string u{type};
+            for (char& c : u) { c = static_cast<char>(std::toupper(static_cast<unsigned char>(c))); }
+            return u;
+        }()};
+        pkey.reset(EVP_PKEY_Q_keygen(nullptr, nullptr, osslName.c_str()));
     } else {
         return hasher_throw(global, "Unsupported key type: " + type);
     }
@@ -1382,7 +1431,16 @@ JSC_DEFINE_HOST_FUNCTION(node_asym_key_type_host,
         case EVP_PKEY_ED448: type = "ed448"; break;
         case EVP_PKEY_X25519: type = "x25519"; break;
         case EVP_PKEY_X448: type = "x448"; break;
-        default: type = "unknown"; break;
+        default: {
+            // The PQC families have no stable legacy NID to switch on, so they
+            // are identified by provider name. Deliberately gated on the known
+            // list rather than reporting any provider name lowercased: an
+            // unrecognised key must stay "unknown", which is what node reports
+            // and what the JS layer's RAW_ASYM_TYPES check keys off.
+            const std::string canonical{asym_pqc_canonical(pkey.get())};
+            type = canonical.empty() ? "unknown" : asym_lower(canonical);
+            break;
+        }
     }
     JSObjectRef obj{JSObjectMake(ctx, nullptr, nullptr)};
     set_prop(ctx, obj, "type", make_string(ctx, type));

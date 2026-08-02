@@ -468,7 +468,7 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
   // AN.jwkExport/jwkImport speak raw component bytes; node's surface is
   // base64url strings. Component order is preserved from the native object
   // (kty,n,e,d,p,q,dp,dq,qi / kty,x,y,crv,d) to match node's key order.
-  const JWK_PARTS = ["n", "e", "d", "p", "q", "dp", "dq", "qi", "x", "y"];
+  const JWK_PARTS = ["n", "e", "d", "p", "q", "dp", "dq", "qi", "x", "y", "pub", "priv"];
   // NOTE: decoding goes through atob rather than Buffer.from(s,"base64url").
   // Buffer.from / Buffer.byteLength do not recognize the "base64url" encoding in
   // this build (they fall back to latin1 and yield the string's ASCII bytes —
@@ -510,7 +510,18 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
   // point is the parameters JWK cannot carry — so node refuses at the export
   // boundary instead of silently downgrading them to a bare "RSA" document.
   // ref: node src/crypto/crypto_keys.cc ExportJWKInner (default arm).
-  const JWK_EXPORTABLE = { rsa: 1, ec: 1, ed25519: 1, ed448: 1, x25519: 1, x448: 1 };
+  // The PQC families serialize as RFC 9794 "AKP" documents (one opaque `pub`,
+  // one opaque `priv`, parameter set in `alg`), so they ARE JWK-exportable.
+  const PQC_TYPES = {
+    "ml-dsa-44": 1, "ml-dsa-65": 1, "ml-dsa-87": 1,
+    "ml-kem-512": 1, "ml-kem-768": 1, "ml-kem-1024": 1,
+    "slh-dsa-sha2-128s": 1, "slh-dsa-sha2-128f": 1, "slh-dsa-sha2-192s": 1,
+    "slh-dsa-sha2-192f": 1, "slh-dsa-sha2-256s": 1, "slh-dsa-sha2-256f": 1,
+    "slh-dsa-shake-128s": 1, "slh-dsa-shake-128f": 1, "slh-dsa-shake-192s": 1,
+    "slh-dsa-shake-192f": 1, "slh-dsa-shake-256s": 1, "slh-dsa-shake-256f": 1,
+  };
+  const JWK_EXPORTABLE = { rsa: 1, ec: 1, ed25519: 1, ed448: 1, x25519: 1, x448: 1,
+    ...PQC_TYPES };
   const jwkUnsupportedType = () => {
     const e = new Error("Unsupported JWK Key Type.");
     e.code = "ERR_CRYPTO_JWK_UNSUPPORTED_KEY_TYPE";
@@ -532,6 +543,9 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
     if (jwk == null || typeof jwk !== "object") throw new TypeError("Invalid JWK");
     const parts = { kty: jwk.kty };
     if (jwk.crv != null) parts.crv = jwk.crv;
+    // AKP carries its parameter set in `alg`; without it the importer has no way
+    // to know which provider the opaque `pub`/`priv` bytes belong to.
+    if (jwk.alg != null) parts.alg = jwk.alg;
     for (const k of JWK_PARTS) {
       if (typeof jwk[k] === "string") parts[k] = b64uDecode(jwk[k]);
     }
@@ -549,13 +563,15 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
   const RAW_FORMATS = { "raw-public": 1, "raw-private": 1, "raw-seed": 1 };
   // The OKP curve names JWK uses, keyed by node's asymmetricKeyType spelling.
   const OKP_JWK_CRV = { ed25519: "Ed25519", x25519: "X25519", ed448: "Ed448", x448: "X448" };
-  // Key types with a raw form in this build. The PQC families (ml-dsa/ml-kem/
-  // slh-dsa) also have one in node, but they need an OpenSSL >= 3.5 provider
-  // that is absent here, so they never become loadable keys in the first place.
-  const RAW_KEY_TYPES = { ec: 1, ed25519: 1, x25519: 1, ed448: 1, x448: 1 };
-  // Every asymmetric type this build can name. Anything else — including the PQC
-  // types, on an OpenSSL without them — is an unknown asymmetricKeyType.
-  const RAW_ASYM_TYPES = { rsa: 1, "rsa-pss": 1, dsa: 1, dh: 1, ec: 1, ed25519: 1, x25519: 1, ed448: 1, x448: 1 };
+  // Key types with a raw form in this build. This USED to exclude the PQC
+  // families on the premise that the OpenSSL >= 3.5 provider was absent — that
+  // premise was stale: the vendored OpenSSL is 3.5.1 and exports ML-DSA, ML-KEM
+  // and SLH-DSA. They have raw forms and are included.
+  const RAW_KEY_TYPES = { ec: 1, ed25519: 1, x25519: 1, ed448: 1, x448: 1, ...PQC_TYPES };
+  // Every asymmetric type this build can name. Anything else is an unknown
+  // asymmetricKeyType.
+  const RAW_ASYM_TYPES = { rsa: 1, "rsa-pss": 1, dsa: 1, dh: 1, ec: 1, ed25519: 1, x25519: 1, ed448: 1, x448: 1,
+    ...PQC_TYPES };
   // node accepts both the NIST and the OpenSSL spelling of a curve; the native
   // helpers only know the OpenSSL one.
   const EC_NIST_ALIAS = { "P-256": "prime256v1", "P-384": "secp384r1", "P-521": "secp521r1" };
@@ -581,7 +597,17 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
       e.code = "ERR_CRYPTO_INCOMPATIBLE_KEY_OPTIONS"; throw e;
     }
     if (!RAW_KEY_TYPES[keyType]) throw rawIncompat(fmt);
-    // Seeds exist only for the PQC families, which this build cannot load.
+    // The PQC families are the only ones with a seed form, and their raw members
+    // are the AKP JWK's `pub`/`priv` rather than an EC point or an OKP x/d.
+    if (PQC_TYPES[keyType]) {
+      if (fmt === "raw-public") return Buffer.from(b64uDecode(jwk.pub));
+      // raw-private and raw-seed both name the private member. A public key has
+      // no `priv` in its JWK at all — that omission, not a length check, is what
+      // stops a public handle from yielding private bytes here.
+      if (kind !== "private" || jwk.priv == null) throw rawIncompat(fmt);
+      return Buffer.from(b64uDecode(jwk.priv));
+    }
+    // Seeds exist only for the PQC families handled above.
     if (fmt === "raw-seed") throw rawIncompat(fmt);
     if (fmt === "raw-private") {
       if (kind !== "private") throw rawIncompat(fmt);
@@ -620,7 +646,7 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
       throw rawInvalidValue("The property 'options.format' is invalid. Received 'raw-public'");
     }
     if (!RAW_KEY_TYPES[type]) throw rawIncompat(fmt);
-    if (fmt === "raw-seed") throw rawIncompat(fmt);
+    if (fmt === "raw-seed" && !PQC_TYPES[type]) throw rawIncompat(fmt);
     // Raw input is bytes: node does not decode a string here even when an
     // `encoding` is supplied, because the raw forms are not textual.
     const key = opts.key;
@@ -668,6 +694,18 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
       if (bytes.length !== half) throw rawInvalidValue("Invalid raw-private key data for curve " + nc);
       return toJwkDer({ kty: "EC", crv: jwkCrv, x: unc.subarray(1, 1 + half), y: unc.subarray(1 + half), d: bytes },
                       true, nc);
+    }
+    if (PQC_TYPES[type]) {
+      // `alg` is the canonical OpenSSL spelling; node's type name is its
+      // lowercase form, and SLH-DSA keeps a lowercase f/s, so uppercasing all
+      // but the last character reproduces it for every family.
+      const alg = type.startsWith("slh-dsa-")
+        ? type.slice(0, -1).toUpperCase() + type.slice(-1)
+        : type.toUpperCase();
+      const parts = fmt === "raw-public"
+        ? { kty: "AKP", alg, pub: bytes }
+        : { kty: "AKP", alg, priv: bytes };
+      return toJwkDer(parts, fmt !== "raw-public", type);
     }
     const crv = OKP_JWK_CRV[type];
     const parts = fmt === "raw-public" ? { kty: "OKP", crv, x: bytes } : { kty: "OKP", crv, d: bytes };
@@ -1309,7 +1347,8 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
   // node validates the key type synchronously; unknown types (incl. the PQC
   // ml-dsa/ml-kem/slh-dsa families on an OpenSSL build without them) throw
   // ERR_INVALID_ARG_VALUE before any async work. ref node lib/internal/crypto/keygen.js.
-  const KEYPAIR_TYPES = { rsa: 1, "rsa-pss": 1, dsa: 1, ec: 1, ed25519: 1, ed448: 1, x25519: 1, x448: 1, dh: 1 };
+  const KEYPAIR_TYPES = { rsa: 1, "rsa-pss": 1, dsa: 1, ec: 1, ed25519: 1, ed448: 1, x25519: 1, x448: 1, dh: 1,
+    ...PQC_TYPES };
   const validateKeyPairType = (type) => {
     if (typeof type !== "string" || !KEYPAIR_TYPES[type]) {
       const e = new TypeError("The argument 'type' must be a supported key type. Received " +
@@ -1342,7 +1381,7 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
         e.code = "ERR_CRYPTO_INCOMPATIBLE_KEY_OPTIONS"; throw e;
       }
       if (!RAW_KEY_TYPES[type]) throw rawIncompat(pubRawEnc ? pubRawEnc.format : privRawEnc.format);
-      if (privRawEnc && privRawEnc.format === "raw-seed") throw rawIncompat("raw-seed");
+      if (privRawEnc && privRawEnc.format === "raw-seed" && !PQC_TYPES[type]) throw rawIncompat("raw-seed");
       const pair = genKeyPair(type, Object.assign({}, options, {
         publicKeyEncoding: pubRawEnc ? undefined : options.publicKeyEncoding,
         privateKeyEncoding: privRawEnc ? undefined : options.privateKeyEncoding,
