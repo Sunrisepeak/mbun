@@ -8583,23 +8583,26 @@ inline constexpr char kBootstrapJS_[] = R"JS(
         const fd = this._use("read");
         // node kIoMaxLength: a file larger than 2**31-1 cannot be read into one
         // buffer (ERR_FS_FILE_TOO_LARGE, a RangeError).
-        try {
-          // node's readFileHandle resolves the live binding row on every
-          // operation. Internal tests replace fstat to model files whose stat
-          // size is zero while reads still produce bytes, so bypassing this
-          // seam through fsMod.fstatSync loses both the hook and that contract.
-          const binding = typeof G.__mbunInternalBinding === "function"
-            ? G.__mbunInternalBinding("fs") : null;
-          const statFields = binding && typeof binding.fstat === "function"
-            ? await binding.fstat(fd, false, binding.kUsePromises) : null;
-          const size = statFields === null
-            ? fsMod.fstatSync(fd).size : Number(statFields[8]);
-          if (size > 2147483647) {
-            const e = new RangeError("File size (" + size + ") is greater than 2 GiB");
-            e.code = "ERR_FS_FILE_TOO_LARGE";
-            throw e;
-          }
-        } catch (e) { if (e && e.code === "ERR_FS_FILE_TOO_LARGE") throw e; }
+        // node's readFileHandle resolves the live binding row on every
+        // operation. Internal tests replace fstat to model files whose stat
+        // size is zero while reads still produce bytes, so bypassing this
+        // seam through fsMod.fstatSync loses both the hook and that contract.
+        const binding = typeof G.__mbunInternalBinding === "function"
+          ? G.__mbunInternalBinding("fs") : null;
+        const statFields = binding && typeof binding.fstat === "function"
+          ? await binding.fstat(fd, false, binding.kUsePromises) : null;
+        // fstat is an asynchronous boundary in node. An abort raised from
+        // inside that operation must win before the first read advances the
+        // handle cursor, while an fstat rejection must remain the operation
+        // error so fsHandleFdClose can apply path-form close aggregation.
+        fsThrowIfAborted(signal);
+        const size = statFields === null
+          ? fsMod.fstatSync(fd).size : Number(statFields[8]);
+        if (size > 2147483647) {
+          const e = new RangeError("File size (" + size + ") is greater than 2 GiB");
+          e.code = "ERR_FS_FILE_TOO_LARGE";
+          throw e;
+        }
         const chunks = []; const tmp = Buffer.alloc(65536); let n;
         // Same synthetic-allocation guard readFileSync carries: a character
         // device stats as size 0, so this read-to-EOF loop never terminates on

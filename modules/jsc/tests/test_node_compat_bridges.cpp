@@ -85,6 +85,93 @@ int main() {
         "try{x.fail(original)}catch(e){return e===original&&!Object.prototype.hasOwnProperty.call(e,'diff')?1:0}"
         "return 0}catch{return -1}})()",
         1, "Assert methods preserve non-AssertionError objects");
+    expect_number(
+        R"JS((()=>{
+          globalThis.__fstatRejectDone=0;
+          globalThis.__fstatRejectOk=0;
+          (async()=>{
+            const fs=require("node:fs");
+            const fsp=fs.promises;
+            const dir=fs.mkdtempSync("/tmp/mbun-fstat-reject-");
+            const path=dir+"/payload";
+            const binding=globalThis.__mbunInternalBinding("fs");
+            const originalFstat=binding.fstat;
+            const originalOpen=fsp.open;
+            const sentinel=new Error("sentinel fstat rejection");
+            let closeCalls=0;
+            try {
+              fs.writeFileSync(path,"abc");
+              fsp.open=async(...args)=>{
+                const handle=await originalOpen(...args);
+                const originalClose=handle.close.bind(handle);
+                handle.close=async()=>{++closeCalls;return originalClose();};
+                return handle;
+              };
+              binding.fstat=async()=>{throw sentinel;};
+              try { await fsp.readFile(path); }
+              catch(error) {
+                globalThis.__fstatRejectOk=(error===sentinel&&closeCalls===1)?1:0;
+              }
+            } finally {
+              binding.fstat=originalFstat;
+              fsp.open=originalOpen;
+              fs.rmSync(dir,{recursive:true,force:true});
+              globalThis.__fstatRejectDone=1;
+            }
+          })().catch((error)=>{
+            globalThis.__fstatRejectDetail=String(error&&error.stack||error);
+            globalThis.__fstatRejectDone=1;
+          });
+          return 0;
+        })())JS",
+        0, "schedule FileHandle live fstat rejection probe");
+    mbun::jsc::runtime::pump_event_loop("globalThis.__fstatRejectDone===1");
+    expect_number(
+        "globalThis.__fstatRejectOk",
+        1, "FileHandle readFile propagates live fstat rejection and closes path handles");
+    expect_number(
+        R"JS((()=>{
+          globalThis.__fstatAbortDone=0;
+          globalThis.__fstatAbortOk=0;
+          (async()=>{
+            const fs=require("node:fs");
+            const dir=fs.mkdtempSync("/tmp/mbun-fstat-abort-");
+            const path=dir+"/payload";
+            const binding=globalThis.__mbunInternalBinding("fs");
+            const originalFstat=binding.fstat;
+            const controller=new AbortController();
+            let handle;
+            try {
+              fs.writeFileSync(path,"abc");
+              handle=await fs.promises.open(path,"r");
+              binding.fstat=async(...args)=>{
+                controller.abort();
+                return originalFstat.apply(binding,args);
+              };
+              let aborted=false;
+              try { await handle.readFile({signal:controller.signal}); }
+              catch(error) { aborted=error&&error.name==="AbortError"; }
+              binding.fstat=originalFstat;
+              const probe=Buffer.alloc(1);
+              const result=await handle.read(probe,0,1,null);
+              globalThis.__fstatAbortOk=(aborted&&result.bytesRead===1&&probe[0]===97)?1:0;
+            } finally {
+              binding.fstat=originalFstat;
+              if(handle) await handle.close();
+              fs.rmSync(dir,{recursive:true,force:true});
+              globalThis.__fstatAbortDone=1;
+            }
+          })().catch((error)=>{
+            globalThis.__fstatAbortDetail=String(error&&error.stack||error);
+            globalThis.__fstatAbortDone=1;
+          });
+          return 0;
+        })())JS",
+        0, "schedule FileHandle abort-from-fstat cursor probe");
+    mbun::jsc::runtime::pump_event_loop("globalThis.__fstatAbortDone===1");
+    expect_number(
+        "globalThis.__fstatAbortOk",
+        1, "FileHandle readFile observes abort after fstat without advancing cursor");
 
     if (failures != 0) {
         std::println("test_node_compat_bridges: {} failed", failures);
