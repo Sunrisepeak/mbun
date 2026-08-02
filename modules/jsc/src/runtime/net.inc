@@ -165,8 +165,21 @@ JSValueRef netn_listen_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_
         return JSValueMakeUndefined(ctx);
     const auto port{static_cast<std::uint16_t>(
         argc > 1 ? JSValueToNumber(ctx, args[1], nullptr) : 0)};
-    const bool ipv6Only{argc > 3 && JSValueToBoolean(ctx, args[3]) && host.find(':') != std::string::npos};
-    if (ipv6Only) {
+    const bool v6OnlyRequested{argc > 3 && JSValueToBoolean(ctx, args[3])};
+    // A NON-wildcard IPv6 literal has to take the AF_INET6 path whether or not
+    // the caller asked for ipv6Only: that flag selects the IPV6_V6ONLY sockopt,
+    // it does not select the address family. Gating the whole branch on it sent
+    // `listen("::1", 0)` into net_parse_addr, whose inet_pton(AF_INET, "::1")
+    // cannot succeed, so it threw "invalid address" -- which the Bun.serve JS
+    // layer reports as "Failed to start server. Is port 0 in use?"
+    // (js/bun/http/serve-listen.test.ts, the tls + "::1" case; the plaintext one
+    // never reached here because it binds through the native epoll transport).
+    // The wildcard forms stay on the v4 path deliberately: `net_parse_addr` maps
+    // them to INADDR_ANY, and flipping the default listener's family is a
+    // separate, much wider behaviour change than fixing an explicit address.
+    const bool ipv6Literal{host.find(':') != std::string::npos && host != "::" &&
+                           host != "::0" && host != "*"};
+    if (ipv6Literal || (v6OnlyRequested && host.find(':') != std::string::npos)) {
         sockaddr_in6 addr{};
         addr.sin6_family = AF_INET6;
         addr.sin6_port = htons(port);

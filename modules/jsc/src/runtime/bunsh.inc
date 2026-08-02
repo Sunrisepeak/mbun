@@ -144,15 +144,79 @@ bool collect_simple_segments(const SimpleAtom& atom, LowerCtx& ctx,
     }
 }
 
+// Read one variable out of the environment the lowered plan will run under.
+// `have_env` means the caller supplied an explicit envp (`$\`...\`.env({...})`),
+// in which case the process environment is NOT what the command will see.
+// Returns nullopt when the value cannot be read *as the command will see it*.
+// `state_mutated` is the same guard eval_cmdsubst uses and is load-bearing here
+// for the same reason: `HOME=lmao && echo ~` lowers the assignment stage first,
+// so a lookup performed while building the plan would still observe the pre-
+// assignment value and bake it into the argv (bunshell.test.ts tilde_expansion
+// "modified $HOME or $USERPROFILE"). After a mutation the word punts, as before.
+std::optional<std::string> lookup_env(const LowerCtx& ctx, std::string_view name) {
+    if (ctx.state_mutated) return std::nullopt;
+    if (ctx.have_env && ctx.envp != nullptr) {
+        for (char* entry : *ctx.envp) {
+            if (entry == nullptr) continue;
+            std::string_view kv{entry};
+            const auto eq = kv.find('=');
+            if (eq != std::string_view::npos && kv.substr(0, eq) == name) {
+                return std::string{kv.substr(eq + 1)};
+            }
+        }
+        return std::nullopt;
+    }
+    const char* value = ::getenv(std::string{name}.c_str());
+    return value != nullptr ? std::optional<std::string>{value} : std::nullopt;
+}
+
+// A leading `~` expands to $HOME only when its *tilde-prefix* -- the characters
+// between the `~` and the first `/` -- is empty. `~user` is a passwd lookup the
+// lowering does not model, so it still punts.
+//
+// The prefix is empty for a bare `~`, for `~/path`, and also for `~""` / `~''`:
+// quote removal leaves nothing between the tilde and the end of the word. That
+// last shape is why this exists. The parser records an empty quoted token as its
+// own `QuotedEmpty` atom precisely so it stays distinguishable from "no atom at
+// all", and every POSIX shell stops tilde expansion the moment it sees one --
+// `bash -c 'echo ~""'` prints `~`. bun does not: its lexer performs tilde
+// expansion during tokenisation, before quote handling, so the empty quotes
+// cannot suppress it. Punting the word to /bin/sh therefore produced the POSIX
+// answer where the corpus wants bun's (regression/issue/17294).
+bool tilde_prefix_is_empty(const std::vector<SimpleAtom>& atoms) {
+    for (std::size_t i = 1; i < atoms.size(); ++i) {
+        if (atoms[i].kind == SAKind::QuotedEmpty) continue;
+        return atoms[i].kind == SAKind::Text && !atoms[i].text.empty() &&
+               atoms[i].text.front() == '/';
+    }
+    return true;
+}
+
 bool collect_atom_segments(const Atom& atom, LowerCtx& ctx, std::vector<WordSegment>& out) {
     if (atom.kind == AtomKind::Simple) {
+        if (atom.simple.kind == SAKind::Tilde) {
+            auto home = lookup_env(ctx, "HOME");
+            if (!home) return false;
+            out.push_back(WordSegment{std::move(*home), false});
+            return true;
+        }
         return collect_simple_segments(atom.simple, ctx, out);
     }
     if (atom.compound.glob_hint || atom.compound.brace_expansion_hint) {
         return false;
     }
-    for (const auto& sub : atom.compound.atoms) {
-        if (!collect_simple_segments(sub, ctx, out)) {
+    std::size_t first = 0;
+    if (!atom.compound.atoms.empty() && atom.compound.atoms.front().kind == SAKind::Tilde) {
+        if (!tilde_prefix_is_empty(atom.compound.atoms)) {
+            return false;
+        }
+        auto home = lookup_env(ctx, "HOME");
+        if (!home) return false;
+        out.push_back(WordSegment{std::move(*home), false});
+        first = 1;
+    }
+    for (std::size_t i = first; i < atom.compound.atoms.size(); ++i) {
+        if (!collect_simple_segments(atom.compound.atoms[i], ctx, out)) {
             return false;
         }
     }
