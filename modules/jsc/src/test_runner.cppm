@@ -1743,6 +1743,10 @@ inline constexpr std::string_view HARNESS = R"JS(
     // how many the body makes (verified after it settles, below).
     S.assertExpected = null; S.assertHas = false;
     S.curLabel = t.name;  // toMatchSnapshot keys off the test's own name (not the full path)
+    // …and the per-name counter restarts on EVERY attempt: a { retry } / { repeats }
+    // re-run must resolve to the same `<name> 1`, `<name> 2`, … keys as the first
+    // one, not keep counting into snapshots that were never recorded (issue 23705).
+    if (S.snapCounters) delete S.snapCounters[t.name];
     const expectBaseline = S.expectCalls;
     // bun prints thrown (non-assertion) errors as "error: <message>"; assertion
     // failures print the expect() message directly.
