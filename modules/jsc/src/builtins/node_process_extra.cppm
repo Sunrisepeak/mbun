@@ -1650,6 +1650,24 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
             const original = fsMod[method];
             if (typeof original === "function") { try { fsMod[method] = wrapAsync(original, FS_ASYNC_OPS[method]); } catch (e) {} }
           }
+          // fs.realpathSync.native and fs.realpath.native are separate
+          // functions hanging off the ones just wrapped. node routes them to
+          // the same syscall and traces them under the same "realpath" name
+          // (src/node_file.cc), and carryOwn only carries the UNwrapped
+          // original across -- so they have to be wrapped in their own right.
+          const wrapNative = (holder, wrap) => {
+            if (!holder || typeof holder.native !== "function") return;
+            const wrapped = wrap(holder.native, ["realpath"]);
+            try { holder.native = wrapped; } catch (e) {}
+            if (holder.native !== wrapped) {
+              try {
+                Object.defineProperty(holder, "native",
+                                      { value: wrapped, writable: true, enumerable: true, configurable: true });
+              } catch (e) {}
+            }
+          };
+          wrapNative(fsMod.realpathSync, wrapSync);
+          wrapNative(fsMod.realpath, wrapAsync);
           const oOpendir = fsMod.opendir;
           if (typeof oOpendir === "function") {
             try {
