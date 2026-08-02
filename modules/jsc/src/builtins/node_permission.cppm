@@ -251,6 +251,29 @@ inline constexpr std::string_view kNodePermissionJS = R"JS(
   // while the model is on rather than trying to map an fd back to a path. The
   // list and the message are node's (lib/fs.js).
   const fsMod = (G.__mbunNativeModules || {})["fs"] || (G.__mbunNativeModules || {})["node:fs"];
+  // node's fs wrappers convert a valid path-like value before it reaches
+  // node_file.cc's permission check. Keep this adapter deliberately narrow:
+  // invalid values still go to the original function and its full validator.
+  const permissionPath = (value) => {
+    if (typeof value === "string") return value;
+    if (isBuffer(value) || ArrayBuffer.isView(value)) {
+      try { return G.Buffer.from(value.buffer, value.byteOffset, value.byteLength).toString("utf8"); }
+      catch (e) { return undefined; }
+    }
+    if (value && typeof value === "object" && value.protocol === "file:") {
+      try {
+        const url = G.require && G.require("url");
+        return url && typeof url.fileURLToPath === "function" ? url.fileURLToPath(value) : undefined;
+      } catch (e) { return undefined; }
+    }
+    return undefined;
+  };
+  const deniedFsError = (scope, value, suffix = "") => {
+    const path = permissionPath(value);
+    if (path === undefined) return undefined;
+    const resource = path + suffix;
+    return PN.has(scope, resource) ? undefined : PN.denyError(scope, resource);
+  };
   // EXACTLY node's list (lib/fs.js + internal/fs/promises.js): fsync, fdatasync,
   // fchmod, fchown, futimes. Notably NOT read/write/close — those take an fd that
   // could only have come from a gated open(), so gating them again would break
@@ -258,6 +281,74 @@ inline constexpr std::string_view kNodePermissionJS = R"JS(
   // without adding any protection.
   const disabledUnderModel = ["fsync", "fdatasync", "fchmod", "fchown", "futimes"];
   if (fsMod) {
+    // node node_file.cc keeps these checks outside the filesystem operation's
+    // async branch. mbun's load-bearing C++ gates already deny access, but the
+    // JS adapters used to mask access's denial as ENOENT and defer utimes /
+    // lutimes until a microtask. These thin wrappers restore node's public
+    // timing/error contract; direct calls to __mbunFsNative remain gated too.
+    const origAccessSync = fsMod.accessSync;
+    if (typeof origAccessSync === "function") {
+      fsMod.accessSync = function (path, ...rest) {
+        const err = deniedFsError("fs.read", path);
+        if (err) throw err;
+        return origAccessSync.call(this, path, ...rest);
+      };
+    }
+    const origAccess = fsMod.access;
+    if (typeof origAccess === "function") {
+      fsMod.access = function (path, mode, callback) {
+        const cb = typeof mode === "function" ? mode : callback;
+        const err = typeof cb === "function" ? deniedFsError("fs.read", path) : undefined;
+        if (err) { G.queueMicrotask(() => cb(err)); return; }
+        return origAccess.apply(this, arguments);
+      };
+    }
+    for (const name of ["utimes", "lutimes", "mkdir", "chmod"]) {
+      const original = fsMod[name];
+      if (typeof original === "function") {
+        fsMod[name] = function (path, ...rest) {
+          const err = deniedFsError("fs.write", path);
+          if (err) throw err;
+          return original.call(this, path, ...rest);
+        };
+      }
+    }
+    // chown/lchown are no-op compatibility stubs on this runtime, so there is
+    // no syscall capability to protect. They still report node's sync/callback
+    // refusal contracts while the model is enabled.
+    for (const name of ["chownSync", "lchownSync"]) {
+      const original = fsMod[name];
+      if (typeof original === "function") {
+        fsMod[name] = function (path, ...rest) {
+          const err = deniedFsError("fs.write", path);
+          if (err) throw err;
+          return original.call(this, path, ...rest);
+        };
+      }
+    }
+    for (const name of ["chown", "lchown"]) {
+      const original = fsMod[name];
+      if (typeof original === "function") {
+        fsMod[name] = function (path, uid, gid, callback) {
+          const err = typeof callback === "function" ? deniedFsError("fs.write", path) : undefined;
+          if (err) { G.queueMicrotask(() => callback(err)); return; }
+          return original.apply(this, arguments);
+        };
+      }
+    }
+    const FileHandle = fsMod.promises && fsMod.promises.FileHandle;
+    if (FileHandle && FileHandle.prototype && typeof FileHandle.prototype.chown === "function") {
+      const original = FileHandle.prototype.chown;
+      FileHandle.prototype.chown = function (...args) {
+        // Run the original first for its fd/uid/gid validation. It has no
+        // fchown syscall behind it, so success is replaced with node's model-on
+        // refusal without exposing an operation between validation and denial.
+        return Promise.resolve(original.apply(this, args)).then(() => {
+          throw PN.denyError("", "", "fchown API is disabled when Permission Model is enabled.");
+        });
+      };
+    }
+
     for (const base of disabledUnderModel) {
       for (const name of [base, base + "Sync"]) {
         const original = fsMod[name];

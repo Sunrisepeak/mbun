@@ -1481,7 +1481,10 @@ JSValueRef fsn_readdirRecursive_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, s
 JSValueRef fsn_mkdtemp_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t argc,
                           const JSValueRef args[], JSValueRef* exc) {
     std::string prefix{fs_arg(ctx, argc, args, 0)};
-    if (permission_deny_fs(ctx, exc, prefix, true)) return JSValueMakeUndefined(ctx);
+    // node appends its six-character template before checking permission, so a
+    // denial reports the exact resource it considered rather than the prefix.
+    // Keep the check at this native boundary: the JS adapter is not a sandbox.
+    if (permission_deny_fs(ctx, exc, prefix + "XXXXXX", true)) return JSValueMakeUndefined(ctx);
     // create <prefix><suffix> with a clock-seeded counter — a plain 0-based
     // counter collides with directories left behind by previous runs.
     static std::atomic<std::uint64_t> counter{static_cast<std::uint64_t>(
