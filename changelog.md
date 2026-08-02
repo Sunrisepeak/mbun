@@ -5,6 +5,13 @@
 
 ## 2026-08-02
 
+- W423 Bun.file conditional-request response source fix：Bun.serve 现在对 BunFile
+  按 `If-None-Match → If-Modified-Since → Range` 顺序处理 GET/HEAD 条件请求，匹配
+  validator 返回无 body 的 304，非匹配 `If-None-Match` 保持 200 并跳过 IMS，非
+  GET/HEAD 不误触发条件响应；issue #78。五个独立 Linux lane 的 **9 active checks
+  全部通过、0 failed、0 timeout**，串行 release build 通过。README 同步记录这次
+  增量 checkpoint；未修改 upstream fixture、未跑全量 corpus。
+
 - W422 Bun.file single-range response source fix：Bun.serve 现在对 BunFile 的单一
   GET/HEAD byte range 返回 206 与 Content-Range，越界返回 416，同时保留多区间、
   显式 Content-Range、普通 Blob 和非 GET/HEAD 的原有边界；issue #77。serial

@@ -7033,6 +7033,28 @@ surface on Linux:
   混修；下一轮必须从 fresh bounded measurement 选单一 owner。W55 无构建、无全量
   corpus，资源策略继续保持 3–5 jobs，并在 swap/disk 低水位时只做小型 probe。
 
+### W423 Bun.file conditional-request response source fix
+
+- W423 fresh five-lane measurement isolated one shared conditional-response
+  owner: custom `Last-Modified` returned 200 instead of 304, `If-Modified-Since`
+  combined with Range returned 206 instead of 304, `If-None-Match: *` failed on
+  four GET/HEAD file-route cases, and a matching user `ETag` returned 200.
+  The non-GET/HEAD guard and the user-ETag non-match behavior were already
+  correct. Issue [#78](https://github.com/Sunrisepeak/mbun/issues/78) records the
+  sanitized relative reproduction and the required precondition order.
+- The source fix adds a shared BunFile response transform to both native and
+  fallback Bun.serve transports. It evaluates `If-None-Match` before
+  `If-Modified-Since`, returns a bodyless 304 for a matching validator, skips
+  IMS when INM is present but does not match, and only then allows W422's
+  single-range transform to run. Non-GET/HEAD, non-BunFile responses, and
+  invalid/nonmatching validators retain the previous response.
+- Final post-fix verification used five independent Linux processes: **9 active
+  checks passed, 0 failed, 0 timeout** (custom IMS 1/1, IMS-before-Range 1/1,
+  INM wildcard 4/4, matching user ETag 1/1, and non-GET/nonmatch guards 2/2).
+  The serial release build passed after the source change. The two Range todo
+  cases remain todo and are not included in the active verdict. No upstream
+  fixture was modified and no full corpus was run.
+
 ### W422 Bun.file single-range response source fix
 
 - W422 先用 fresh active probes 复核 Range owner：固定区间、开放区间、后缀区间、

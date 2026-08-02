@@ -44,6 +44,41 @@ export constexpr std::string_view kNetJS_part2 = R"JS(
   // Serialize a Response onto a socket. `type: "direct"` ReadableStream bodies
   // stream chunked (writeDirectStreamResponse); other streams are drained first
   // and sent with Content-Length.
+  const applyFileConditionalResponse = (req, res) => {
+    if (!req || !res || typeof res !== "object" || res.status !== 200) return res;
+    const method = String(req.method || "").toUpperCase();
+    if (method !== "GET" && method !== "HEAD") return res;
+    const b = res._b;
+    if (!b || !b.__isBunFile || !res.headers || typeof res.headers.get !== "function") return res;
+    ensureFileLastModifiedHeader(res);
+    const getRequestHeader = (name) => req.headers && typeof req.headers.get === "function"
+      ? req.headers.get(name) : null;
+    const inm = getRequestHeader("if-none-match");
+    if (inm !== null) {
+      const etag = res.headers.get("etag");
+      const weakTag = (tag) => String(tag).trim().replace(/^W\//i, "");
+      const matches = String(inm).trim() === "*" ||
+        (etag && String(inm).split(",").some((tag) => weakTag(tag) === weakTag(etag)));
+      if (matches) {
+        const headers = new G.Headers(res.headers);
+        headers.delete("content-length");
+        headers.delete("content-range");
+        return new G.Response(null, { status: 304, statusText: "Not Modified", headers });
+      }
+      // If-None-Match is present, a non-matching value suppresses the
+      // If-Modified-Since check (RFC 9110 §13.2.2).
+      return res;
+    }
+    const ims = getRequestHeader("if-modified-since");
+    if (ims === null || ims === "") return res;
+    const requestMs = Date.parse(String(ims));
+    const modifiedMs = Date.parse(String(res.headers.get("last-modified") || ""));
+    if (!Number.isFinite(requestMs) || !Number.isFinite(modifiedMs) || requestMs < modifiedMs) return res;
+    const headers = new G.Headers(res.headers);
+    headers.delete("content-length");
+    headers.delete("content-range");
+    return new G.Response(null, { status: 304, statusText: "Not Modified", headers });
+  };
   const applyFileRangeResponse = (req, res) => {
     if (!req || !res || typeof res !== "object" || res.status !== 200) return res;
     const method = String(req.method || "").toUpperCase();
@@ -692,7 +727,8 @@ export constexpr std::string_view kNetJS_part2 = R"JS(
             for (const c of _cd.value.toSetCookieHeaders()) res.headers.append("Set-Cookie", c);
           }
         } catch (e) {}
-        const ranged = applyFileRangeResponse(req, res);
+        const conditional = applyFileConditionalResponse(req, res);
+        const ranged = applyFileRangeResponse(req, conditional);
         writeHttpResponse(sock, ranged, ev.method, keepAlive && !sock.destroyed, () => {
           serverObj.pendingRequests--;
           conns.delete(ev.id);
@@ -978,7 +1014,8 @@ export constexpr std::string_view kNetJS_part2 = R"JS(
               out = new G.Response("", { status: 404 });   // routes-only server, no match
             }
             const finish = (res) => {
-              const ranged = applyFileRangeResponse(req, res);
+              const conditional = applyFileConditionalResponse(req, res);
+              const ranged = applyFileRangeResponse(req, conditional);
               writeHttpResponse(sock, ranged, parser.method, keepAlive && !sock.destroyed, () => {
                 serverObj.pendingRequests--;
                 sock._httpBusy = false;
