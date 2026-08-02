@@ -83,9 +83,12 @@ int main() {
         })())JS",
         "schedule focused async callback boundaries");
     expect_eval("0", "drain promise and microtask reactions");
-    // Timers are real wall-clock now: a 0ms deadline is due immediately, so a
-    // single drain fires it (the old 1ms delay made this drain racy).
-    expect_eval("__mbun_drain_timers(20)", "drain due timers");
+    // Host timers use real wall-clock deadlines and clamp a 0ms timeout to 1ms.
+    // A single non-waiting drain can run before that deadline. Use the runtime's
+    // bounded pump so it parks until the timer is due instead of racing it or
+    // hiding the race behind an arbitrary sleep.
+    mbun::jsc::runtime::pump_event_loop(
+        "globalThis.__asyncHooksSeen.includes('timeout:value')");
     expect_eval("0", "drain timer-created reactions");
     expect_num(
         R"JS((["then","catch","finally","microtask","nextTick","timeout","immediate","event"]
