@@ -11,6 +11,7 @@
 #include <JavaScriptCore/JSTypedArrays.h>
 #include <JavaScriptCore/TypedArrayType.h>
 #include <wtf/SharedTask.h>
+#include <limits>
 #include <JavaScriptCore/IdentifierInlines.h>
 
 namespace mbun::napi_rt {
@@ -67,6 +68,20 @@ inline bool jscTypeToNapiType(JSC::TypedArrayType type, napi_typedarray_type& ou
     case JSC::TypeBigInt64: out = napi_bigint64_array; return true;
     case JSC::TypeBigUint64: out = napi_biguint64_array; return true;
     default: return false;  // TypeDataView / NotTypedArray
+    }
+}
+
+inline size_t elementSizeOf(JSC::TypedArrayType type) {
+    switch (type) {
+    case JSC::TypeInt8:
+    case JSC::TypeUint8:
+    case JSC::TypeUint8Clamped: return 1;
+    case JSC::TypeInt16:
+    case JSC::TypeUint16: return 2;
+    case JSC::TypeInt32:
+    case JSC::TypeUint32:
+    case JSC::TypeFloat32: return 4;
+    default: return 8;  // Float64 / BigInt64 / BigUint64
     }
 }
 
@@ -249,6 +264,29 @@ extern "C" napi_status napi_create_typedarray(napi_env env, napi_typedarray_type
                                napi_invalid_arg);
     JSC::JSArrayBuffer* wrapper = mbun::napi_rt::asArrayBufferObject(toJSValue(arraybuffer));
     NAPI_RETURN_EARLY_IF_FALSE(env, wrapper, napi_arraybuffer_expected);
+    JSC::ArrayBuffer* impl = wrapper->impl();
+    NAPI_RETURN_EARLY_IF_FALSE(env, impl, napi_arraybuffer_expected);
+    // port: node_api.cc napi_create_typedarray — a window past the end of the
+    // buffer is ERR_NAPI_INVALID_TYPEDARRAY_LENGTH, a *thrown* RangeError, not
+    // a status code. Same for a misaligned offset.
+    const size_t elementSize = mbun::napi_rt::elementSizeOf(jscType);
+    if (length > (std::numeric_limits<size_t>::max() - byte_offset) / elementSize
+        || (length * elementSize) + byte_offset > impl->byteLength()) {
+        auto scope = DECLARE_THROW_SCOPE(env->vm());
+        JSC::throwException(env->globalObject(), scope,
+                            JSC::createRangeError(env->globalObject(),
+                                                  "Invalid typed array length"_s));
+        return setLastError(env, napi_pending_exception);
+    }
+    if (byte_offset % elementSize != 0) {
+        auto scope = DECLARE_THROW_SCOPE(env->vm());
+        JSC::throwException(
+            env->globalObject(), scope,
+            JSC::createRangeError(
+                env->globalObject(),
+                makeString("start offset should be a multiple of "_s, elementSize)));
+        return setLastError(env, napi_pending_exception);
+    }
     JSValueRef exception = nullptr;
     JSC::JSValue view =
         mbun::napi_rt::makeTypedArrayOverBuffer(env, type, wrapper, byte_offset, length, &exception);
@@ -559,13 +597,11 @@ extern "C" napi_status napi_create_bigint_words(napi_env env, int sign_bit, size
     NAPI_PREAMBLE(env);
     NAPI_CHECK_ARG(env, result);
     NAPI_RETURN_EARLY_IF_FALSE(env, words != nullptr || word_count == 0, napi_invalid_arg);
-    // node caps the payload at INT_MAX words and throws a RangeError past it.
-    if (word_count > INT_MAX) {
-        auto scope = DECLARE_THROW_SCOPE(env->vm());
-        JSC::throwException(env->globalObject(), scope,
-                            JSC::createRangeError(env->globalObject(), "Maximum BigInt size exceeded"_s));
-        return setLastError(env, napi_pending_exception);
-    }
+    // port: node_api.cc napi_create_bigint_words. Past INT_MAX words the call
+    // is simply malformed (napi_invalid_arg, nothing thrown); AT INT_MAX it is
+    // well-formed and the engine's own RangeError/OOM is forwarded as
+    // napi_pending_exception. test_bigint asserts both halves separately.
+    NAPI_RETURN_EARLY_IF_FALSE(env, word_count <= static_cast<size_t>(INT_MAX), napi_invalid_arg);
     JSC::JSBigInt* bigint = JSC::JSBigInt::createFromWords(
         env->globalObject(), std::span<const uint64_t>{words, word_count}, sign_bit != 0);
     NAPI_RETURN_IF_EXCEPTION(env);
