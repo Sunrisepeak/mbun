@@ -343,6 +343,38 @@ std::vector<std::string> derive_runtime_preloads(std::span<const std::string_vie
 }
 
 // ─── `mbun test` flags ──────────────────────────────────────────────────────
+// Shared required-value parser for TRANSPILER_PARAMS_'s explicit tsconfig.
+// The raw value is retained until --cwd has been applied; Bun parses the whole
+// option table, changes cwd, and only then joins this path to absolute_working_dir.
+struct TsconfigOverrideArg {
+    std::optional<std::string> value{};
+    std::string parseError{};
+};
+
+std::size_t take_tsconfig_override(std::span<const std::string_view> args, std::size_t i,
+                                   TsconfigOverrideArg& out) {
+    constexpr std::string_view flag{"--tsconfig-override"};
+    const std::string_view arg{args[i]};
+    if (arg.starts_with(flag) && arg.size() > flag.size() && arg[flag.size()] == '=') {
+        out.value = std::string{arg.substr(flag.size() + 1)};
+        return 1;
+    }
+    if (arg != flag) return 0;
+    if (i + 1 >= args.size()) {
+        out.parseError = "Missing value for \"--tsconfig-override\"";
+        return 1;
+    }
+    out.value = std::string{args[i + 1]};
+    return 2;
+}
+
+std::string resolve_tsconfig_override_path(std::string_view value,
+                                           const std::filesystem::path& cwd) {
+    std::filesystem::path path{value};
+    if (!path.is_absolute()) path = cwd / path;
+    return path.lexically_normal().string();
+}
+
 // Flag names/arity are transcribed from bun's TEST_ONLY_PARAMS table
 // (ref: bun-ref/src/cli/Arguments.rs:560-615) and the semantics from the test
 // arm at :1647-1649 (--only-failures), :1788 (--randomize) and :1831-1841
@@ -403,6 +435,7 @@ struct TestFlags {
     // value (`../../src/jsx`) was silently swallowed as a dangling operand.
     std::optional<std::string> jsxImportSource {};  // --jsx-import-source <STR>
     std::optional<std::string> jsxRuntime {};       // --jsx-runtime <STR>
+    std::optional<std::string> tsconfigOverride {}; // --tsconfig-override <STR>
 
     // Fatal parse problem (bad --seed / --jsx-runtime value); empty when clean.
     std::string parseError {};
@@ -460,6 +493,18 @@ TestFlags parse_test(std::span<const std::string_view> args) {
 
         if (name == "--randomize") {
             out.randomize = true;
+            continue;
+        }
+
+        if (name == "--tsconfig-override") {
+            TsconfigOverrideArg parsed{};
+            const std::size_t consumed{take_tsconfig_override(args, i, parsed)};
+            if (!parsed.parseError.empty()) {
+                out.parseError = std::move(parsed.parseError);
+                return out;
+            }
+            out.tsconfigOverride = std::move(parsed.value);
+            i += consumed - 1;
             continue;
         }
         if (name == "--only-failures") {
@@ -565,6 +610,7 @@ struct BuildFlags {
 
     std::vector<std::string> external {};    // -e/--external (ref: Arguments.rs :475)
     std::vector<std::string> conditions {};  // --conditions   (ref: Arguments.rs :515)
+    std::optional<std::string> tsconfigOverride {}; // shared TRANSPILER_PARAMS_
 
     // ── the shared transpiler flags (TRANSPILER_PARAMS_, Arguments.rs :139-182) ──
     // `--define K=V` / `-d K:V`. Both separators are accepted, first one wins, and
@@ -634,7 +680,6 @@ inline constexpr std::array BUILD_VALUE_FLAGS {
     // TRANSPILER_PARAMS_ (Arguments.rs :139-181) — every `bun build` accepts these
     // too, because BUILD_PARAMS concatenates them (Arguments.rs :545).
     std::string_view { "--main-fields" },      std::string_view { "--extension-order" },
-    std::string_view { "--tsconfig-override" },
     std::string_view { "--drop" },             std::string_view { "--feature" },
     std::string_view { "--jsx-factory" },      std::string_view { "--jsx-fragment" },
     std::string_view { "--jsx-import-source" },std::string_view { "--jsx-runtime" },
@@ -742,6 +787,17 @@ BuildFlags parse_build(std::span<const std::string_view> args) {
         // `--jsx-side-effects` is the only boolean among the JSX pragma flags.
         if (name == "--jsx-side-effects") {
             out.jsxSideEffects = true;
+            continue;
+        }
+        if (name == "--tsconfig-override") {
+            TsconfigOverrideArg parsed{};
+            const std::size_t consumed{take_tsconfig_override(args, i, parsed)};
+            if (!parsed.parseError.empty()) {
+                out.parseError = std::move(parsed.parseError);
+                return out;
+            }
+            out.tsconfigOverride = std::move(parsed.value);
+            i += consumed - 1;
             continue;
         }
         if (name == "--no-bundle") {

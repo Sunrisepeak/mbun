@@ -1644,6 +1644,16 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
       try { env.MBUN_WORKER_ENVDATA = JSON.stringify(Array.from(environmentData)); }
       catch (e) { env.MBUN_WORKER_ENVDATA = "[]"; }
 
+      // mbun implements Worker with a child process. Inherited execArgv must
+      // remain byte-for-byte public API, but replaying its relative tsconfig
+      // after process.chdir() would resolve against the wrong cwd. Pass the
+      // normalized parse-time value out of band only when execArgv is inherited;
+      // child startup consumes and erases this key before process.env exists.
+      if (options.execArgv === undefined && typeof proc.__mbunTsconfigOverride === "string" &&
+          proc.__mbunTsconfigOverride !== "") {
+        env.MBUN_INTERNAL_TSCONFIG_OVERRIDE = proc.__mbunTsconfigOverride;
+      }
+
       // node's execArgv KEEPS the eval flag and its code (`node -e "…"` reports
       // ["-e", "…"]), because node starts a worker as a thread and never replays
       // that command line. mbun starts one as a child mbun process, so handing

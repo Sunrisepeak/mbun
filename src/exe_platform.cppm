@@ -42,6 +42,10 @@ void set_no_addons_env();
 // otherwise talk to (mbun::app::publish_dialect).
 void set_env_var(const char* name, const char* value);
 
+// Remove an environment variable from THIS process. Internal one-hop handoff
+// values are consumed before the JS process.env snapshot is installed.
+void unset_env_var(const char* name);
+
 // Path of the running executable, or nullopt when the platform cannot report it.
 // `bun build --compile` copies these bytes to build the standalone executable,
 // and startup reads them back looking for an embedded program. argv[0] is NOT a
@@ -85,6 +89,14 @@ inline void set_env_var_impl(const char* name, const char* value) {
 #endif
 }
 
+inline void unset_env_var_impl(const char* name) {
+#if defined(_WIN32)
+    (void)::_putenv_s(name, "");
+#else
+    (void)::unsetenv(name);
+#endif
+}
+
 } // namespace detail
 
 void raise_file_descriptor_limit() {
@@ -110,6 +122,11 @@ void set_no_addons_env() {
 void set_env_var(const char* name, const char* value) {
     if (name == nullptr || value == nullptr) return;
     detail::set_env_var_impl(name, value);
+}
+
+void unset_env_var(const char* name) {
+    if (name == nullptr) return;
+    detail::unset_env_var_impl(name);
 }
 
 std::optional<std::filesystem::path> self_executable_path() {

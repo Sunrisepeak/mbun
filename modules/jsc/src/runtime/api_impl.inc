@@ -61,6 +61,10 @@ void add_env_file(std::string spec) { gEnvFiles.push_back(std::move(spec)); }
 // bunfig `preload`: modules to import before the entry point.
 void set_preloads(std::vector<std::string> paths) { gPreloads = std::move(paths); }
 
+// `--tsconfig-override <path>`: explicit runtime resolver config, already made
+// absolute by the CLI against the option-parse cwd.
+void set_tsconfig_override(std::string path) { gTsconfigOverride = std::move(path); }
+
 // `--user-agent <STR>`: default User-Agent for fetch (bun Arguments.rs:1062).
 void set_user_agent(std::string ua) { gUserAgent = std::move(ua); }
 

@@ -199,6 +199,13 @@ public:
     // can require() local helpers and see Bun.*/node globals.
     std::expected<void, std::string> install_cjs_env(const std::string& dir,
                                                      const std::string& file) {
+        // Bun parses an explicit override while constructing the runtime's
+        // transpiler, before user code. Missing/read/malformed diagnostics are
+        // global log errors, not a reason to abort command execution. Cache the
+        // null result so later imports do not print the diagnostic twice.
+        if (!gTsconfigOverride.empty()) {
+            (void)load_tsconfig_(std::filesystem::path{gTsconfigOverride});
+        }
         const bool pendingDeprecation{
             std::find(gExecArgv.begin(), gExecArgv.end(), "--pending-deprecation") != gExecArgv.end()};
         std::string js{"globalThis.__dirname = " + json_quote_(dir) + ";\n" +
@@ -1129,45 +1136,41 @@ public:
         return out;
     }
 
+    const mbun::resolver::TsconfigPaths* load_tsconfig_(const std::filesystem::path& config) {
+        const std::string cfg{config.lexically_normal().string()};
+        if (auto it{tsconfigCache_.find(cfg)}; it != tsconfigCache_.end()) {
+            return it->second ? &*it->second : nullptr;
+        }
+
+        auto loaded{mbun::resolver::load_tsconfig_override(os_fs(), cfg)};
+        std::optional<mbun::resolver::TsconfigPaths> parsed{std::move(loaded.config)};
+        if (!parsed && cfg == gTsconfigOverride && !loaded.error.empty()) {
+            std::println(std::cerr, "error: {}", loaded.error);
+        }
+        auto& slot{tsconfigCache_[cfg]};
+        slot = std::move(parsed);
+        return slot ? &*slot : nullptr;
+    }
+
     const mbun::resolver::TsconfigPaths* find_tsconfig_(const std::string& fromDir) {
-        std::error_code ec;
-        std::filesystem::path d{fromDir};
-        for (int depth = 0; depth < 64; ++depth) {
-            const std::string cfg{(d / "tsconfig.json").string()};
-            if (auto it{tsconfigCache_.find(cfg)}; it != tsconfigCache_.end()) {
-                return it->second ? &*it->second : nullptr;
-            }
-            if (std::filesystem::is_regular_file(d / "tsconfig.json", ec)) {
-                std::optional<mbun::resolver::TsconfigPaths> parsed;
-                if (auto content{read_file(cfg)}) {
-                    parsed = mbun::resolver::parse_tsconfig(*content, d.string());
-                    // Follow `extends`: when this config declares no paths of its own
-                    // but extends another, inherit the parent's baseDir + entries
-                    // (a nested config that only `extends` a parent otherwise loses
-                    // the parent's path aliases like "harness"). Bounded chain walk.
-                    std::filesystem::path base{d};
-                    for (int hop = 0; parsed && parsed->entries.empty() &&
-                                      !parsed->extends_from.empty() && hop < 16; ++hop) {
-                        std::string ext{parsed->extends_from};
-                        if (!ext.ends_with(".json")) ext += "/tsconfig.json";
-                        std::filesystem::path parentCfg{(base / ext).lexically_normal()};
-                        std::error_code pec;
-                        if (!std::filesystem::is_regular_file(parentCfg, pec)) break;
-                        auto pcontent{read_file(parentCfg.string())};
-                        if (!pcontent) break;
-                        base = parentCfg.parent_path();
-                        parsed = mbun::resolver::parse_tsconfig(*pcontent, base.string());
-                    }
-                }
-                auto& slot{tsconfigCache_[cfg]};
-                slot = std::move(parsed);
-                return slot ? &*slot : nullptr;
-            }
-            std::filesystem::path parent{d.parent_path()};
-            if (parent == d || parent.empty()) {
-                break;
-            }
-            d = std::move(parent);
+        // An explicit CLI config is process resolution context: it wins for
+        // every importing directory and uses its own absolute path as the cache
+        // key. With no override, retain the existing nearest-config walk.
+        if (!gTsconfigOverride.empty()) {
+            return load_tsconfig_(std::filesystem::path{gTsconfigOverride});
+        }
+
+        std::error_code ec{};
+        std::filesystem::path dir{fromDir};
+        for (int depth{0}; depth < 64; ++depth) {
+            const std::filesystem::path config{dir / "tsconfig.json"};
+            const std::string cacheKey{config.lexically_normal().string()};
+            if (tsconfigCache_.contains(cacheKey)) return load_tsconfig_(config);
+            ec.clear();
+            if (std::filesystem::is_regular_file(config, ec)) return load_tsconfig_(config);
+            std::filesystem::path parent{dir.parent_path()};
+            if (parent == dir || parent.empty()) break;
+            dir = std::move(parent);
         }
         return nullptr;
     }

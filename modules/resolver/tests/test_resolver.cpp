@@ -64,6 +64,11 @@ void report_failure(std::string_view what) {
     }
 }
 
+void check(bool condition, std::string_view what) {
+    ++gChecks;
+    if (!condition) report_failure(what);
+}
+
 // ---------------------------------------------------------------------------
 // In-memory filesystem fixture. Files are a set of absolute posix paths;
 // directories are derived from the file paths (every prefix ending in '/').
@@ -154,6 +159,7 @@ MemoryFs build_fixture() {
     fs.add_file("/proj/js/bun/resolve/baz.js");                 // foo/bar, @faasjs/baz
     fs.add_file("/proj/js/bun/resolve/bar/src/index.js");       // @faasjs/bar
     fs.add_file("/proj/js/bun/resolve/bar/larger-index.js");    // @faasjs/larger/bar
+    fs.add_file("/proj/src/utils/helpers.ts");                  // #/* tsconfig alias
 
     // --- package.json "exports" subpath map (package-json-exports) ---
     fs.add_file("/proj/node_modules/package-json-exports/foo/bar.js");
@@ -289,6 +295,12 @@ int main() {
                       "tsconfig * second target");
         check_resolve(r, "@faasjs/larger/bar", DIR, "/proj/js/bun/resolve/bar/larger-index.js",
                       "tsconfig longest-prefix wins");
+
+        TsconfigPaths hashAlias{ts};
+        hashAlias.entries.emplace_back("#/*", std::vector<std::string>{"./src/*"});
+        auto hashResolver{make_resolver(fs, &hashAlias, ResolveKind::Import)};
+        check_resolve(hashResolver, "#/utils/helpers", DIR, "/proj/src/utils/helpers.ts",
+                      "tsconfig hash alias precedes package imports");
     }
 
     // ============ package.json "exports" subpath map ============
@@ -379,6 +391,42 @@ int main() {
         // from a deeply nested importer that must walk up to /proj/node_modules.
         check_resolve(r, "node-path-test", "/proj/js/bun/resolve",
                       "/proj/node_modules/node-path-test/index.js", "bare pkg main upward");
+    }
+
+    // ============ node-shim entry LOAD_AS_FILE_OR_DIRECTORY ============
+    // RunAsNodeCommand boots its positional through Bun's resolver. The load
+    // path uses the pinned entry extension order, while package.json main and
+    // directory index fallback remain ordinary LOAD_AS_DIRECTORY behavior.
+    {
+        MemoryFs entryFs;
+        entryFs.add_file("/entry/pkg/package.json", R"({"main":"./start"})");
+        entryFs.add_file("/entry/pkg/start.jsx");
+        entryFs.add_file("/entry/pkg/start.tsx");
+        entryFs.add_file("/entry/index-only/index.mjs");
+
+        Options opts{};
+        opts.extension_order = {".tsx", ".jsx", ".mts", ".ts", ".mjs", ".js",
+                                ".cts", ".cjs", ".json"};
+        Resolver entryResolver{entryFs.make(), std::move(opts)};
+        check_resolve(entryResolver, "/entry/pkg", "/", "/entry/pkg/start.tsx",
+                      "node entry directory package main + pinned extension order");
+        check_resolve(entryResolver, "/entry/index-only", "/", "/entry/index-only/index.mjs",
+                      "node entry directory index fallback");
+    }
+
+    // An explicit override is not a nullable nearest-config probe: missing and
+    // malformed files carry stable diagnostics to the CLI boundary.
+    {
+        MemoryFs configFs;
+        configFs.add_file("/config/invalid.json", "{ invalid");
+        auto missing{load_tsconfig_override(configFs.make(), "/config/missing.json")};
+        check(!missing.config.has_value(), "missing explicit tsconfig does not parse as null success");
+        check(missing.error == "Cannot find tsconfig file \"/config/missing.json\"",
+              "missing explicit tsconfig diagnostic");
+        auto invalid{load_tsconfig_override(configFs.make(), "/config/invalid.json")};
+        check(!invalid.config.has_value(), "invalid explicit tsconfig does not parse as null success");
+        check(invalid.error == "Cannot parse tsconfig file \"/config/invalid.json\"",
+              "invalid explicit tsconfig diagnostic");
     }
 
     // ============ "browser" main-field override ============
