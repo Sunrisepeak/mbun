@@ -109,4 +109,63 @@ warn3=$( (cd "$main" && bash "$script" bash -c 'exit 3') 2>&1 || true )
 printf '%s' "$warn3" | grep -q 'sources are NEWER' \
   && fail "warned on a failed build" || pass "no staleness warning on a failed build"
 
+# --- staged libstdc++.a mismatch: repair and retry once ---------------------
+# A worktree staged with a different gcc's libstdc++.a links against it (that
+# directory is first on -L) and dies with `undefined reference to
+# std::__cow_string::__cow_string`. The staging happens during the FIRST build,
+# so no pre-check can see it -- the wrapper must recognise the signature, repair,
+# and retry. Everything here is fake: no compiler runs.
+gccdir="$tmp/fake/xim-x-gcc/16.1.0"
+mkdir -p "$gccdir/bin" "$gccdir/lib64"
+: >"$gccdir/bin/g++"
+echo pinned >"$gccdir/lib64/libstdc++.a"
+mkdir -p "$main/target/x86_64-linux-gnu/deadbeef"
+echo "  command = $gccdir/bin/g++ -c foo.cpp" >"$main/target/x86_64-linux-gnu/deadbeef/build.ninja"
+staged="$main/.mcpp/.xlings/data/xpkgs/mbun-x-mbun.jsc-prebuilt/20260706/bun-webkit/lib"
+mkdir -p "$staged"
+
+# Behaves like the real thing: the FIRST build stages the wrong archive and then
+# fails linking against it; a later build reuses what is already staged. So the
+# mismatch cannot exist before the build that trips over it.
+cat >"$tmp/fakelink" <<EOF
+#!/usr/bin/env bash
+echo "attempt" >>"\$ATTEMPTS"
+[ -f '$staged/libstdc++.a' ] || echo "wrong gcc" >'$staged/libstdc++.a'
+if [ "\$(cat '$staged/libstdc++.a')" = pinned ]; then exit 0; fi
+echo "ld: undefined reference to \\\`std::__cow_string::__cow_string(char const*)'" >&2
+exit 1
+EOF
+chmod +x "$tmp/fakelink"
+export ATTEMPTS="$tmp/attempts"; : >"$ATTEMPTS"
+out=$( (cd "$main" && bash "$script" "$tmp/fakelink") 2>&1 ); rc=$?
+[ "$rc" = 0 ] && pass "mismatched libstdc++.a repaired and the build retried" \
+  || fail "build not recovered (rc=$rc): $out"
+[ "$(wc -l <"$ATTEMPTS")" = 2 ] \
+  && pass "retried exactly once" || fail "expected 2 attempts, got $(wc -l <"$ATTEMPTS")"
+printf '%s' "$out" | grep -q 'repaired' \
+  && pass "repair is reported, not silent" || fail "repair was silent: $out"
+
+# An already-staged mismatch is repaired BEFORE the build, so it never fails at all.
+echo "wrong gcc" >"$staged/libstdc++.a"
+: >"$ATTEMPTS"
+(cd "$main" && bash "$script" "$tmp/fakelink") >/dev/null 2>&1; rc=$?
+[ "$rc" = 0 ] && [ "$(wc -l <"$ATTEMPTS")" = 1 ] \
+  && pass "a pre-existing mismatch is repaired without a failed build" \
+  || fail "pre-build repair did not happen (rc=$rc, attempts=$(wc -l <"$ATTEMPTS"))"
+
+# An unrelated failure must NOT be retried.
+cat >"$tmp/failother" <<'EOF'
+#!/usr/bin/env bash
+echo "attempt" >>"$ATTEMPTS"
+echo "error: something else entirely" >&2
+exit 4
+EOF
+chmod +x "$tmp/failother"
+: >"$ATTEMPTS"
+rc=0
+(cd "$main" && bash "$script" "$tmp/failother") >/dev/null 2>&1 || rc=$?
+[ "$rc" = 4 ] && [ "$(wc -l <"$ATTEMPTS")" = 1 ] \
+  && pass "an unrelated failure is not retried" \
+  || fail "unrelated failure retried or exit code lost (rc=$rc, attempts=$(wc -l <"$ATTEMPTS"))"
+
 echo "test_build_lock: ok"
