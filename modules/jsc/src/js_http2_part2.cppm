@@ -1016,7 +1016,9 @@ export constexpr std::string_view kHttp2JS_part2 = R"JS(
     _onSocketClose() { this._teardown(); }
     _teardown(hard) {
       if (this.destroyed) return;
-      this.destroyed = true; this.closed = true;
+      // See the client session's _teardown: node's SESSION_FLAGS_CLOSED is set by
+      // close() alone, never by a destroy.
+      this.destroyed = true;
       if (this._timer != null) { try { G.clearTimeout(this._timer); } catch (e) {} this._timer = null; }
       cancelSessionPings(this);
       closeSessionSocket(this._rawSocket, hard !== false);
@@ -1086,7 +1088,34 @@ export constexpr std::string_view kHttp2JS_part2 = R"JS(
       this._destroyPending = false;
       this._teardown(false);
     }
-    destroy(err, code) { if (this.destroyed) return; if (err) { const self = this; this._teardown(); G.queueMicrotask(() => self.emit("error", err)); } else this._teardown(); }
+    // See normalizeSessionDestroy / sessionFatalWithCode in part 1: node's
+    // `destroy(error = NGHTTP2_NO_ERROR, code)` treats a numeric first argument as
+    // the NGHTTP2 code, sends the GOAWAY that carries it, and resets every open
+    // stream with it.
+    destroy(err, code) {
+      if (this.destroyed) return;
+      ({ err, code } = normalizeSessionDestroy(err, code));
+      if (typeof code === "number") this._destroyCode = code;
+      if (!err) { this._teardown(); return; }
+      sessionFatalWithCode(this, err, code);
+    }
+    // The server session had no _fatal of its own; sessionFatalWithCode needs the
+    // same contract as the client's (tear down, then report on the session AND on
+    // the streams the teardown just took away, with the session's reset code).
+    _fatal(err, hard) {
+      if (this.destroyed) return;
+      const streams = Array.from(this.streams.values());
+      const self = this;
+      this._teardown(hard);
+      G.queueMicrotask(() => {
+        self.emit("error", err);
+        for (const s of streams) {
+          s.rstCode = typeof self._destroyCode === "number" ? self._destroyCode : constants.NGHTTP2_INTERNAL_ERROR;
+          s._closed = true;
+          try { s.emit("error", err); } catch (e) {}
+        }
+      });
+    }
     ref() { if (this._rawSocket && this._rawSocket.ref) this._rawSocket.ref(); return this; }
     unref() { if (this._rawSocket && this._rawSocket.unref) this._rawSocket.unref(); return this; }
     // PORT-SOURCE: compat/node/lib/internal/http2/core.js Http2Session `get socket()`
