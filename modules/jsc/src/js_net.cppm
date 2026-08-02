@@ -508,6 +508,7 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
     }
     ref() { const o = this.owner; if (o && typeof o.ref === "function") o.ref(); }
     unref() { const o = this.owner; if (o && typeof o.unref === "function") o.unref(); }
+    hasRef() { const o = this.owner; return !!(o && typeof o.hasRef === "function" && o.hasRef()); }
     readStart() { this.reading = true; return 0; }
     readStop() { this.reading = false; return 0; }
     // node's handle.close() closes the descriptor WITHOUT destroying the
@@ -542,6 +543,7 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
     listen() { return 0; }
     ref() { const o = this.owner; if (o && typeof o.ref === "function") o.ref(); }
     unref() { const o = this.owner; if (o && typeof o.unref === "function") o.unref(); }
+    hasRef() { const o = this.owner; return !!(o && typeof o.hasRef === "function" && o.hasRef()); }
     close(cb) {
       if (!this._closed) { this._closed = true; const o = this.owner; if (o && typeof o.close === "function") o.close(); this.fd = -1; }
       if (typeof cb === "function") G.queueMicrotask(cb);

@@ -674,7 +674,11 @@ export constexpr std::string_view kHttp2JS_part2 = R"JS(
       // 'error' listener on that path and "write after end" surfaced as an
       // uncaught exception. nghttp2 simply drops frames once the transport is
       // gone, so drop them here too.
-      if (this._rawSocket.destroyed || this._rawSocket.writable === false) return;
+      // The public socket proxy deliberately permits callers to assign
+      // `writable`/`readable` for Node parity. Those properties are not the
+      // protocol transport state: only the internal shutdown marker or actual
+      // destruction may suppress an HTTP/2 frame.
+      if (this._rawSocket.destroyed || this._rawSocket._shutW === true) return;
       payload = payload || Buffer.alloc(0);
       try { this._rawSocket.write(Buffer.concat([frameHeader(payload.length, type, flags, streamId), payload])); } catch (e) {}
     }
@@ -1086,7 +1090,7 @@ export constexpr std::string_view kHttp2JS_part2 = R"JS(
     ref() { if (this._rawSocket && this._rawSocket.ref) this._rawSocket.ref(); return this; }
     unref() { if (this._rawSocket && this._rawSocket.unref) this._rawSocket.unref(); return this; }
     // PORT-SOURCE: compat/node/lib/internal/http2/core.js Http2Session `get socket()`
-    get socket() { return sessionSocketProxy(this); }
+    get socket() { return this._rawSocket === undefined ? undefined : sessionSocketProxy(this); }
     set socket(v) { this._rawSocket = v; }
     // node Http2Session#setTimeout is on BOTH halves (it lives on the shared
     // Http2Session prototype); this one was a no-op stub, so an http2 SERVER

@@ -5,6 +5,14 @@
 
 ## 2026-08-02
 
+- W408 Node HTTP/2 socket proxy and Timer/TimersList shape source fix：修复 Node `Timeout` 的
+  `TimersList` 链接/inspect 形状、refresh 后 ref 状态与 interval 同延迟重排；补齐 TCP/server handle
+  `hasRef()`，让 HTTP/2 framing 使用内部 shutdown 状态而不是可被用户改写的 public `writable/readable`，并在
+  session teardown 后让 `session.socket` 返回 `undefined`。focused `test-http2-socket-proxy.js` **1/1 pass**；
+  proxy/socket 五文件回归 **5/5 pass、0 fail、0 timeout**；独立 timer guards **5/5 pass**。`test-timers-refresh.js`
+  的剩余 mismatch 属于现有 `internalBinding('timers').setupTimers()` no-op / `setUnrefTimeout()` pump owner，未计入
+  W408 gate；serial release build **59.51s**。未修改 upstream fixture、未跑全量 corpus。
+
 - W407 Node HTTP/2 server trailer max-block error source fix：`sendTrailers()` 现在在 server 侧先检查默认/显式
   `maxSendHeaderBlockLength`，超出 64 KiB 时发出 `frameError`，以 `NGHTTP2_FRAME_SIZE_ERROR` reset stream，
   并 graceful close session；合法 block 仍使用 HEADERS/CONTINUATION 拆分。focused 文件从 **1/1 timeout**

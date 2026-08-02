@@ -353,6 +353,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W405 | Node HTTP/2 autoselect readable-buffer source fix | 5 | focused target 1/1 timeout → 1/1 pass; W403 five-file regression 5/5 pass; W404 post selector 4/5 pass + 1 timeout; five HTTP/2 socket guards 4/5 pass + 1 known timeout-inspect failure; serial release build 59.05s | keep `read(0)` as a non-consuming probe, bound `read(3)` to the requested bytes, and notify `readable` listeners when parked socket data arrives; retain the independent trailer-size and timeout-inspect owners |
 | W406 | Node HTTP/2 NGHTTP2 error-code mapping revalidation | 5 | first five-job wave 5/5 pass; sixth confirmation 1/1 pass; 0 timeout; no build | inventory cause is stale on the current Linux build; no source owner and no speculative change |
 | W407 | Node HTTP/2 server trailer max-block error source fix | 5 | baseline focused target timeout; direct frame-error lifecycle primitive passed; after fix focused target 1/1 pass; W404 regression 5/5 pass; W403 regression 5/5 pass; serial release builds 59.72s + 59.49s | reject server trailer blocks above default/explicit `maxSendHeaderBlockLength` before CONTINUATION splitting, emit `frameError`, reset with `NGHTTP2_FRAME_SIZE_ERROR`, and gracefully close the session |
+| W408 | Node HTTP/2 socket proxy and Timer/TimersList shape source fix | 5 | baseline owner selector 4/5 pass + 1 fail at timer inspect; focused target 1/1 pass; final proxy/socket regression 5/5 pass; independent timer guards 5/5 pass; `test-timers-refresh.js` remains an independent internal-timer-pump failure; final serial release build 59.51s | expose Node-shaped `TimersList` links and inspect output, preserve timer ref state across refresh, expose handle `hasRef()`, ignore user-mutated public socket writable/readable flags when framing, and return `undefined` from `session.socket` after teardown |
 
 ## W305 Bun/Deno Event/Performance/URL/crypto leaf probe
 
@@ -1962,6 +1963,35 @@ from **1/1 timeout** to **1/1 pass**. W404's five-file selector and W403's
 five-file selector both remained **5/5 pass**. The two serial release builds
 took **59.72s** and **59.49s**. No upstream fixture changed and no full
 corpus/workspace-wide test ran.
+
+## W408 Node HTTP/2 socket proxy and Timer/TimersList shape source fix
+
+The next five-file owner probe measured **4/5 passes and 1 failure**. The sole
+failure was `test-http2-socket-proxy.js`: the HTTP/2 session timeout already
+had `_idleTimeout`, but the host Timeout had no Node `TimersList` links or
+Node-compatible inspect output. The same file then exposed two adjacent
+transport contracts after that assertion was repaired: `_handle.hasRef()` was
+missing, and protocol writes incorrectly treated user-assigned public
+`socket.writable = false` as a transport shutdown. Finally, `session.socket`
+continued returning a proxy after session teardown instead of `undefined`.
+
+The source changes are bounded to the actual owners. `node_timers.cppm` now
+attaches a stable Timeout facade to a `TimersList` sentinel, renders the two
+Node inspect shapes, preserves `ref()`/`unref()` state across refresh, and
+requeues refreshed intervals behind same-delay timers. `js_net.cppm` exposes
+`hasRef()` on TCP/server handles. The HTTP/2 session writers use the internal
+shutdown marker rather than mutable public socket flags, and both session
+getters return `undefined` after teardown while previously captured proxies
+retain their unbound error behavior.
+
+The focused proxy file moved to **1/1 pass**. The final five-file proxy/socket
+regression was **5/5 pass, 0 fail, 0 timeout**. A separate five-file timer guard
+wave was **5/5 pass**. `test-timers-refresh.js` is not counted as a W408 gate:
+its remaining mismatch is from the existing `internalBinding('timers').setupTimers()`
+no-op, which leaves compat `setUnrefTimeout()` outside the runtime pump; that
+is a separate internal-timer integration owner. The final serial release build
+took **59.51s**. No upstream fixture changed and no full corpus/workspace-wide
+test ran.
 
 ## W401 Node fs flush revalidation
 

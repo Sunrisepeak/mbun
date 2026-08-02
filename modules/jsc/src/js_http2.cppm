@@ -1974,7 +1974,11 @@ export constexpr std::string_view kHttp2JS_part1 = R"JS(
       // See the server session's _writeFrame: net.Socket.write() on an ended or
       // destroyed socket EMITS 'error' instead of throwing, so this try/catch
       // cannot contain it. nghttp2 drops frames once the transport is gone.
-      if (this._rawSocket.destroyed || this._rawSocket.writable === false) return;
+      // The public socket proxy deliberately permits callers to assign
+      // `writable`/`readable` for Node parity. Those properties are not the
+      // protocol transport state: only the internal shutdown marker or actual
+      // destruction may suppress an HTTP/2 frame.
+      if (this._rawSocket.destroyed || this._rawSocket._shutW === true) return;
       try { this._rawSocket.write(frame); } catch (e) { if (!this.closed && !this.destroyed) this._fatal(e); }
     }
 
@@ -2734,7 +2738,7 @@ export constexpr std::string_view kHttp2JS_part1 = R"JS(
     ref() { if (this._rawSocket && this._rawSocket.ref) this._rawSocket.ref(); return this; }
     unref() { if (this._rawSocket && this._rawSocket.unref) this._rawSocket.unref(); return this; }
     // PORT-SOURCE: compat/node/lib/internal/http2/core.js Http2Session `get socket()`
-    get socket() { return sessionSocketProxy(this); }
+    get socket() { return this._rawSocket === undefined ? undefined : sessionSocketProxy(this); }
     set socket(v) { this._rawSocket = v; }
     // node: an inactivity timeout that emits 'timeout' on the session and on
     // every open stream (lib/internal/http2/core.js Http2Session.setTimeout ->
