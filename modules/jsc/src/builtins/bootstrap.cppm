@@ -6234,6 +6234,22 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     if (x instanceof ArrayBuffer) return Buffer.from(x).toString("utf8");
     return x && x.toString ? x.toString() : String(x);
   };
+  // Permission enforcement remains in the native fs rows. This helper only
+  // translates a denial at the public validation-to-dispatch seam, where node
+  // makes the same decision. Callers must finish every public argument
+  // validator before asking it, so ERR_INVALID_ARG_* keeps precedence.
+  const fsPermissionError = (scope, path, suffix = "") => {
+    const permission = G.__mbunPermissionNative;
+    if (!permission || !permission.enabled) return undefined;
+    const resource = toStr(path) + suffix;
+    return permission.has(scope, resource)
+      ? undefined
+      : permission.denyError(scope, resource);
+  };
+  const fsThrowPermission = (scope, path, suffix = "") => {
+    const error = fsPermissionError(scope, path, suffix);
+    if (error) throw error;
+  };
   const recur = (o) => !!(o && (o === true || o.recursive));
   // fd → path registry. mbun's descriptors are virtual (no procfs mapping), so
   // fchmod/fchown/futimes — which take an fd but must touch the underlying inode
@@ -6331,10 +6347,10 @@ inline constexpr char kBootstrapJS_[] = R"JS(
   // (recursive, mode) tuple the native mkdir consumes; mode defaults to 0o777.
   const mkdirOpts = (o) => {
     let recursive = false, mode = 0o777;
-    if (typeof o === "number") mode = o;
+    if (typeof o === "number") mode = fsParseFileMode(o, "mode");
     // node accepts an octal-string mode as the positional arg (kernel masks the
     // high bits, e.g. "10644" → 0o644). ref test-fs-mkdir-mode-mask.
-    else if (typeof o === "string") mode = parseInt(o, 8);
+    else if (typeof o === "string") mode = fsParseFileMode(o, "mode");
     else if (o === true) recursive = true;
     else if (o && typeof o === "object") {
       if ("recursive" in o && o.recursive !== undefined) {
@@ -6342,7 +6358,7 @@ inline constexpr char kBootstrapJS_[] = R"JS(
           throw nodeArgTypeError("options.recursive", "boolean", o.recursive);
         recursive = o.recursive;
       }
-      if (o.mode != null) mode = typeof o.mode === "string" ? parseInt(o.mode, 8) : (Number(o.mode) & 0o7777);
+      if (o.mode !== undefined) mode = fsParseFileMode(o.mode, "options.mode");
     }
     return [recursive, mode];
   };
@@ -6865,7 +6881,7 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       }
       try { return F.exists(toStr(p)); } catch (e) { return false; }
     },
-    mkdirSync: (p, o) => { validatePath(p); const [rec, mode] = mkdirOpts(o); try { return F.mkdir(toStr(p), rec, mode); } catch (e) { e.path = toStr(p); throw e; } },
+    mkdirSync: (p, o) => { validatePath(p); const [rec, mode] = mkdirOpts(o); fsThrowPermission("fs.write", p); try { return F.mkdir(toStr(p), rec, mode); } catch (e) { e.path = toStr(p); throw e; } },
     rmSync: (p, o) => F.rm(toStr(p), recur(o), !!(o && o.force)),
     rmdirSync: (p, o) => F.rm(toStr(p), recur(o), true),
     readdirSync: (p, o) => {
@@ -6949,7 +6965,7 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     fsyncSync: () => {}, fdatasyncSync: () => {},
     // permission/owner/time metadata: no-ops (our fs has no perm model); access
     // checks existence; readlink resolves via realpath (we have no real symlinks).
-    chmodSync: (p, m) => { validatePath(p); return F.chmod(toStr(p), typeof m === "string" ? parseInt(m, 8) : (Number(m) & 0o7777)); }, fchmodSync: () => {}, lchmodSync: () => {},
+    chmodSync: (p, m) => { validatePath(p); const mode = fsParseFileMode(m, "mode"); fsThrowPermission("fs.write", p); return F.chmod(toStr(p), mode); }, fchmodSync: () => {}, lchmodSync: () => {},
     chownSync: () => {}, fchownSync: () => {}, lchownSync: () => {},
     utimesSync: (p, a, m) => { const s = (v) => v instanceof Date ? v.getTime() / 1000 : Number(v); F.utimes(toStr(p), s(a), s(m)); }, futimesSync: () => {}, lutimesSync: () => {},
     truncateSync: () => {}, ftruncateSync: () => {},
@@ -6960,7 +6976,7 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     // a microtask and write accumulates then flushes on end/close.
     createReadStream: (p, opts) => { const rs = new Readable(); rs.path = toStr(p); rs.bytesRead = 0; const enc = typeof opts === "string" ? opts : (opts && opts.encoding); const start = (opts && typeof opts === "object") ? opts.start : undefined; const end = (opts && typeof opts === "object") ? opts.end : undefined; if (start !== undefined && typeof start !== "number") throw fsArgTypeErr("start", "of type number", start); if (end !== undefined && typeof end !== "number") throw fsArgTypeErr("end", "of type number", end); G.queueMicrotask(() => { try { const data = fsMod.readFileSync(toStr(p)); rs.emit("open", 3); rs.emit("ready"); let buf = Buffer.from(data); if (typeof start === "number" || typeof end === "number") { const s = typeof start === "number" ? start : 0; const e2 = typeof end === "number" ? end + 1 : buf.length; buf = buf.subarray(s, e2); } rs.bytesRead = buf.length; rs.push(enc ? buf.toString(enc) : buf); rs.push(null); rs.emit("close"); } catch (e) { e.code = e.code || "ENOENT"; rs.emit("error", e); } }); rs.close = (cb) => { if (cb) cb(); return rs; }; return rs; },
     createWriteStream: (p, opts) => { const wstart = (opts && typeof opts === "object") ? opts.start : undefined; if (wstart !== undefined && typeof wstart !== "number") throw fsArgTypeErr("start", "of type number", wstart); const ws = new Writable(); ws.path = toStr(p); ws.bytesWritten = 0; const parts = []; const enc = (opts && opts.encoding) || "utf8"; ws._write = (chunk, e, cb) => { const b = typeof chunk === "string" ? Buffer.from(chunk, (typeof e === "string" && e && e !== "buffer") ? e : enc) : Buffer.from(chunk); parts.push(b); ws.bytesWritten += b.length; if (typeof (cb || e) === "function") (cb || e)(); }; const flush = () => { try { fsMod.writeFileSync(toStr(p), parts.length === 1 ? parts[0] : Buffer.concat(parts)); } catch (er) { ws.emit("error", er); } }; const superEnd = ws.end.bind(ws); ws.end = (chunk, e, cb) => { if (chunk != null && typeof chunk !== "function") ws._write(chunk, enc, null); flush(); G.queueMicrotask(() => { ws.emit("finish"); ws.emit("close"); }); const f = cb || (typeof e === "function" ? e : typeof chunk === "function" ? chunk : null); if (f) f(); return ws; }; ws.close = (cb) => { if (cb) cb(); return ws; }; G.queueMicrotask(() => { ws.emit("open", 3); ws.emit("ready"); }); return ws; },
-    chmod: (p, m, cb) => { validatePath(p); const fn = typeof m === "function" ? m : cb; try { if (typeof m !== "function") F.chmod(toStr(p), typeof m === "string" ? parseInt(m, 8) : (Number(m) & 0o7777)); if (typeof fn === "function") fn(null); } catch (e) { if (typeof fn === "function") fn(e); } },
+    chmod: (p, m, cb) => { validatePath(p); const mode = fsParseFileMode(m, "mode"); const fn = fsMakeCallback(cb); fsThrowPermission("fs.write", p); try { F.chmod(toStr(p), mode); fn(null); } catch (e) { fn(e); } },
     chown: (p, u, g, cb) => { const fn = cb || g; if (typeof fn === "function") fn(null); },
     utimes: (p, a, m, cb) => { const fn = cb || m; try { const s = (v) => v instanceof Date ? v.getTime() / 1000 : Number(v); F.utimes(toStr(p), s(a), s(m)); if (typeof fn === "function") fn(null); } catch (e) { if (typeof fn === "function") fn(e); } },
     access: (p, m, cb) => { const fn = cb || m; try { if (!F.exists(toStr(p))) throw Object.assign(new Error("ENOENT"), { code: "ENOENT" }); fn(null); } catch (e) { fn(e); } },
@@ -7084,7 +7100,7 @@ inline constexpr char kBootstrapJS_[] = R"JS(
         if (err !== null) cb(err); else if (!owns) cb(null);
       });
     },
-    mkdir: (p, a, b) => { validatePath(p); const cb = b || a; const [rec, mode] = mkdirOpts(typeof a === "object" || typeof a === "number" || typeof a === "string" ? a : null); try { const __r = F.mkdir(toStr(p), rec, mode); cb(null, __r); } catch (e) { e.path = toStr(p); cb(e); } },
+    mkdir: (p, a, b) => { const cb = typeof a === "function" ? a : b; const [rec, mode] = mkdirOpts(typeof a === "object" || typeof a === "number" || typeof a === "string" ? a : null); fsMakeCallback(cb); validatePath(p); fsThrowPermission("fs.write", p); try { const __r = F.mkdir(toStr(p), rec, mode); cb(null, __r); } catch (e) { e.path = toStr(p); cb(e); } },
     // callback-style async (node passes (err, result); mirror the *Sync impls).
     stat: (p, a, b) => { const cb = typeof a === "function" ? a : b; try { cb(null, fsMod.statSync(toStr(p))); } catch (e) { cb(e); } },
     lstat: (p, a, b) => { const cb = typeof a === "function" ? a : b; try { cb(null, fsMod.lstatSync(toStr(p))); } catch (e) { cb(e); } },
@@ -7554,14 +7570,16 @@ inline constexpr char kBootstrapJS_[] = R"JS(
   };
   const fsAsyncChown = (path, syscall, fn) => {
     const cb = fsMakeCallback(fn);
+    const denied = fsPermissionError("fs.write", path);
+    if (denied) { cb(denied); return; }
     let err = null;
     try { fsChownEnoent(path, syscall); } catch (e) { err = e; }
     G.queueMicrotask(() => cb(err));
   };
-  fsMod.lchownSync = (path, uid, gid) => { validatePath(path); fsIntU32(uid, "uid"); fsIntU32(gid, "gid"); fsChownEnoent(path, "lchown"); };
-  fsMod.lchown = (path, uid, gid, cb) => { validatePath(path); fsIntU32(uid, "uid"); fsIntU32(gid, "gid"); fsAsyncChown(path, "lchown", cb); };
-  fsMod.chownSync = (path, uid, gid) => { validatePath(path); fsIntU32(uid, "uid"); fsIntU32(gid, "gid"); fsChownEnoent(path, "chown"); };
-  fsMod.chown = (path, uid, gid, cb) => { validatePath(path); fsIntU32(uid, "uid"); fsIntU32(gid, "gid"); fsAsyncChown(path, "chown", cb); };
+  fsMod.lchownSync = (path, uid, gid) => { validatePath(path); fsIntU32(uid, "uid"); fsIntU32(gid, "gid"); fsThrowPermission("fs.write", path); fsChownEnoent(path, "lchown"); };
+  fsMod.lchown = (path, uid, gid, cb) => { fsMakeCallback(cb); validatePath(path); fsIntU32(uid, "uid"); fsIntU32(gid, "gid"); fsAsyncChown(path, "lchown", cb); };
+  fsMod.chownSync = (path, uid, gid) => { validatePath(path); fsIntU32(uid, "uid"); fsIntU32(gid, "gid"); fsThrowPermission("fs.write", path); fsChownEnoent(path, "chown"); };
+  fsMod.chown = (path, uid, gid, cb) => { fsMakeCallback(cb); validatePath(path); fsIntU32(uid, "uid"); fsIntU32(gid, "gid"); fsAsyncChown(path, "chown", cb); };
   fsMod.fsyncSync = (fd) => { fsValidateFd(fd); fsCheckFd(fd, "fsync"); };
   fsMod.fdatasyncSync = (fd) => { fsValidateFd(fd); fsCheckFd(fd, "fdatasync"); };
   fsMod.fsync = (fd, cb) => { fsValidateFd(fd); fsAsyncFd(fd, "fsync", cb); };
@@ -7659,12 +7677,14 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     else bits = stMode & 7;
     if ((m & ~bits) !== 0) throw fsErr("EACCES", "access", path2);
   };
-  fsMod.accessSync = (p, mode) => { validatePath(p); fsValidAccessMode(mode); fsAccessCheck(p, mode); };
+  fsMod.accessSync = (p, mode) => { validatePath(p); fsValidAccessMode(mode); fsThrowPermission("fs.read", p); fsAccessCheck(p, mode); };
   fsMod.access = (p, mode, cb) => {
     validatePath(p);
     const fn = fsMakeCallback(typeof mode === "function" ? mode : cb);
     const m = typeof mode === "function" ? 0 : mode;
     fsValidAccessMode(m);
+    const denied = fsPermissionError("fs.read", p);
+    if (denied) { fn(denied); return; }
     let err = null;
     try { fsAccessCheck(p, m); } catch (e) { err = e; }
     G.queueMicrotask(() => fn(err));
@@ -8274,17 +8294,21 @@ inline constexpr char kBootstrapJS_[] = R"JS(
   fsMod._toUnixTimestamp = fsToUnixTimestamp;
   fsMod.utimesSync = (p, atime, mtime) => {
     validatePath(p);
-    F.utimes(toStr(p), fsToUnixTimestamp(atime, "atime"), fsToUnixTimestamp(mtime, "mtime"));
+    const a = fsToUnixTimestamp(atime, "atime"), m = fsToUnixTimestamp(mtime, "mtime");
+    fsThrowPermission("fs.write", p);
+    F.utimes(toStr(p), a, m);
   };
   fsMod.utimes = (p, atime, mtime, cb) => {
+    const fn = fsMakeCallback(cb);
     validatePath(p);
     const a = fsToUnixTimestamp(atime, "atime"), m = fsToUnixTimestamp(mtime, "mtime");
-    const fn = fsMakeCallback(cb);
+    fsThrowPermission("fs.write", p);
     G.queueMicrotask(() => { try { F.utimes(toStr(p), a, m); fn(null); } catch (e) { fn(e); } });
   };
   fsMod.lutimesSync = (p, atime, mtime) => {
     validatePath(p);
     const a = fsToUnixTimestamp(atime, "atime"), m = fsToUnixTimestamp(mtime, "mtime");
+    fsThrowPermission("fs.write", p);
     // lutimes must stamp the SYMLINK, never its target: F.lutimes is
     // utimensat(AT_SYMLINK_NOFOLLOW). Falling back to F.utimes followed the
     // link, so a dangling symlink reported ENOENT and a live one moved the
@@ -8292,9 +8316,10 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     F.lutimes(toStr(p), a, m);
   };
   fsMod.lutimes = (p, atime, mtime, cb) => {
+    const fn = fsMakeCallback(cb);
     validatePath(p);
     const a = fsToUnixTimestamp(atime, "atime"), m = fsToUnixTimestamp(mtime, "mtime");
-    const fn = fsMakeCallback(cb);
+    fsThrowPermission("fs.write", p);
     G.queueMicrotask(() => { try { fsMod.lutimesSync(p, a, m); fn(null); } catch (e) { fn(e); } });
   };
   fsMod.futimesSync = (fd, atime, mtime) => {
@@ -9190,6 +9215,11 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     const ret = fn.apply(this, args);
     inFrame = false;
     if (fired) {
+      // Node's binding permission rejection invokes FSReqCallback immediately.
+      // Keep ordinary fs completions on this queue, but do not move a native-
+      // boundary denial behind nextTick or promise jobs.
+      if (out && out[0] && out[0].code === "ERR_ACCESS_DENIED")
+        return real.apply(undefined, out);
       // The completion carries the async context of the CALL, captured here at
       // push time — node's rule, and the same thing process.nextTick does a few
       // hundred lines away in runtime/bindings_install.inc. A batched drain runs
