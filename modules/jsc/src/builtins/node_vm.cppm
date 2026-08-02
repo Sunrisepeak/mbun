@@ -23,12 +23,25 @@
 // makeCachedDataBuffer): produce/consume/reject and cachedDataRejected are all
 // observably node's, but nothing is actually pre-compiled.
 //
-// DEFERRED: real timeout interruption (JSC does expose
-// JSContextGroupSetExecutionTimeLimit in JSContextRefPrivate.h -- unused so far
-// because the limit is per context GROUP and nested vm timeouts need a
-// save/restore stack), microtaskMode isolation, DONT_CONTEXTIFY realm identity,
-// and V8's readonly-assignment / redefine-property message wording (JSC's own
-// text escapes from the mirrored global's real descriptors).
+// DEFERRED: real timeout interruption, microtaskMode isolation, DONT_CONTEXTIFY
+// realm identity, and V8's readonly-assignment / redefine-property message
+// wording (JSC's own text escapes from the mirrored global's real descriptors).
+//
+// options.timeout: BLOCKED IN THE ENGINE, not merely unimplemented. W46 built the
+// full thing and measured it, so the next lane does not have to. JSContextRefPrivate.h
+// declares JSContextGroupSetExecutionTimeLimit/ClearExecutionTimeLimit; both are
+// defined in the shipped libJavaScriptCore.a and link; the per-GROUP limit is
+// handled by a deadline STACK (push an absolute deadline, re-arm the group at the
+// smallest remaining slice, pop and restore on the way out), so nesting is not the
+// obstacle it was assumed to be. The obstacle is that the watchdog NEVER FIRES:
+// with the limit armed at 50ms, `vm.runInNewContext('while(1){}', {}, {timeout:50})`
+// runs until the harness kills it and the JSShouldTerminateCallback is not entered
+// once. ENABLE(SIGNAL_BASED_VM_TRAPS) is on for this build (PlatformEnable.h:983,
+// DFG_JIT + x86_64), JSC::Watchdog is present in the archive, and mbun installs no
+// JSC::Options and no SIGUSR handler that could be shadowing the trap -- so the
+// cause is inside the prebuilt engine's trap delivery, and reviving `timeout` means
+// diagnosing THAT, not writing more binding code. Three test-vm-timeout-escape-*
+// files ride on it.
 export module mbun.jsc.js_builtins:node_vm;
 
 import std;
