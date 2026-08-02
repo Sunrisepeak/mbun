@@ -595,6 +595,17 @@ inline constexpr std::string_view kNodeReplJS = R"JS(
   // server is the same answer for every shape the tests drive.
   const liveServers = [];
   let captureInstalled = false;
+  // Errors that escaped REPLServer.complete(). See setupExceptionCapture.
+  const completionEscapes = new WeakSet();
+  function markCompletionEscape(err) {
+    if (err !== null && (typeof err === "object" || typeof err === "function")) {
+      try { completionEscapes.add(err); } catch { /* frozen/revoked proxy */ }
+    }
+  }
+  function escapedFromCompletion(err) {
+    if (err === null || (typeof err !== "object" && typeof err !== "function")) return false;
+    try { return completionEscapes.has(err); } catch { return false; }
+  }
   // node registers the REPL's error router through
   // process.addUncaughtExceptionCaptureCallback (repl.js:195), which is NOT an
   // 'uncaughtException' listener — the corpus asserts a closed REPL leaves
@@ -622,8 +633,17 @@ inline constexpr std::string_view kNodeReplJS = R"JS(
       // before a setImmediate scheduled by the last command fires, and
       // declining there killed the process instead of reporting through the
       // REPL's output (test-repl-uncaught-exception-after-input-ended).
+      // ...but only for throws the REPL could plausibly own. Completion never
+      // runs inside replContext.run() (node calls the completer straight from
+      // readline), so in node `getStore()` is undefined for an error thrown by
+      // a completion callback and the capture callback declines it — the error
+      // has to reach the process as a genuine uncaught exception and take it
+      // down (test-repl-tab-complete-nested-repls, nodejs/node#21586). The
+      // fallback below has no async context to consult, so the error carries
+      // the answer instead: REPLServer.complete tags whatever escapes it.
       const server = currentReplServer() ||
-        liveServers[liveServers.length - 1] || lastEvaluatingServer;
+        (escapedFromCompletion(err) ? null
+                                    : liveServers[liveServers.length - 1] || lastEvaluatingServer);
       if (server === undefined || server === null) return false;
       // node's capture returns `result !== 'unhandled'`: a REPL whose
       // handleError declined the error must let it reach the process's own
@@ -2013,7 +2033,12 @@ inline constexpr std::string_view kNodeReplJS = R"JS(
     }
 
     complete() {
-      Reflect.apply(this.completer, this, arguments);
+      try {
+        Reflect.apply(this.completer, this, arguments);
+      } catch (e) {
+        markCompletionEscape(e);
+        throw e;
+      }
     }
 
     completeOnEditorMode(callback) {
