@@ -1,0 +1,12 @@
+compat/bun/test/js/bun/http/serve-listen.test.ts
+compat/bun/test/js/bun/ffi/ffi.test.js
+compat/bun/test/js/bun/spawn/spawn-stdin-readable-stream-integration.test.ts
+compat/bun/test/regression/issue/1632.test.ts
+compat/bun/test/regression/issue/18028.test.ts
+compat/bun/test/regression/issue/28914.test.ts
+compat/bun/test/js/bun/console/console-table.test.ts
+compat/bun/test/js/bun/resolve/dynamic-import-tla-cycle.test.ts
+compat/bun/test/js/bun/spawn/spawn.ipc.test.ts
+compat/bun/test/regression/issue/09555.test.ts
+compat/bun/test/regression/issue/17294.test.ts
+compat/bun/test/regression/issue/s3-header-injection.test.ts
