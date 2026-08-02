@@ -359,6 +359,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W411 | Node perf_hooks stale-owner revalidation | 5 + 5 | W330 5/5 pass and W331 5/5 pass; 0 timeout; no build | close stale ResourceTiming BigInt and nodeTiming milestone inventory rows; select the remaining W145 timer owner |
 | W412 | Node non-integer timer bucket source fix | 5 | baseline W145 4/5 pass + 1 fail; focused target 1/1 pass; W145/W327/W335 regressions each 5/5 pass; serial release build 59.88s | normalize real-time queue deadlines and interval periods to integer millisecond buckets while preserving public delay metadata; issue #69; no upstream fixture change |
 | W413 | Node internal `setUnrefTimeout` pump source fix | 5 | baseline 4/5 pass + 1 fail; focused target 1/1 pass; five independent focused repeats 5/5 pass; W413 final 5/5 pass; HTTP/2/socket regression 5/5 pass; serial release build 59.66s | bridge `internal/timers.js` private lists through `scheduleTimer()` to the existing native timer queue; issue #70; no upstream fixture change |
+| W415 | Node HTTP/2 internal request-submit seam source fix | 5 | baseline 4/5 pass + 1 fail; focused target 1/1 pass; post selector 5/5 pass, 0 fail, 0 timeout; five independent focused repeats 5/5 pass; final serial release build 60.15s | invoke the replaceable `Http2Session.prototype.request` at the connect edge, preserve stream/session errno ownership, and prevent a mocked native failure from reaching the peer; issue #72; no upstream fixture change |
 
 ## W412 Node non-integer timer bucket source fix
 
@@ -406,6 +407,32 @@ reported `CALL`/`END 1`, internal callback order `1,2`, no output for an
 unref-only timer, and `REFRESH 2`. The final serial release build took
 **59.66s**. No upstream fixture changed and no full corpus/workspace-wide test
 ran.
+
+## W415 Node HTTP/2 internal request-submit seam source fix
+
+The bounded five-job HTTP/2 selector initially measured **4/5 pass, 1 fail, 0
+timeout**. The sole failure was `test-http2-client-onconnect-errors.js`: the
+upstream test replaces
+`internalBinding('http2').Http2Session.prototype.request` and expects the
+negative native return code to be handled before any request reaches the
+server, but mbun's live `ClientHttp2Session.request()` went directly to its JS
+framing path. The first implementation called the seam synchronously and
+still observed `undefined`, because the test assigns its simulated errno only
+after `client.request()` returns.
+
+Issue [#72](https://github.com/Sunrisepeak/mbun/issues/72) records the redacted
+reproduction and source boundary. The final implementation invokes the
+replaceable session request at the connect edge, maps stream-local `-509` and
+`-501` errors to Node's stream errors, and routes other negative nghttp2
+returns through the session error plus pending-stream cancellation path. The
+normal JS framing path remains unchanged when no replacement is installed.
+
+The focused target moved from **1/1 failure** to **1/1 pass**. The original
+five-file selector then measured **5/5 pass, 0 fail, 0 timeout**, covering the
+request seam plus the existing `info`, `respond`, and session-error guards.
+Five independent focused repetitions also measured **5/5 pass**. The final
+serial release build took **60.15s**. No upstream fixture changed and no full
+corpus/workspace-wide test ran.
 
 ## W305 Bun/Deno Event/Performance/URL/crypto leaf probe
 

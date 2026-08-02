@@ -406,6 +406,7 @@ export constexpr std::string_view kHttp2JS_part1 = R"JS(
   // method on internalBinding('http2').Http2Stream.prototype. A failed submit
   // is stream-local, so it must become NghttpError on this stream (and its
   // existing destroy path sends the matching RST_STREAM to the peer).
+  let nativeHttp2SessionPrototype = null;
   let nativeHttp2StreamPrototype = null;
   const submitNativeStream = (stream, method, ...args) => {
     const submit = nativeHttp2StreamPrototype && nativeHttp2StreamPrototype[method];
@@ -416,6 +417,41 @@ export constexpr std::string_view kHttp2JS_part1 = R"JS(
     // adopt its constructor before exposing the error for identity checks.
     if (bindingRequested) adoptNodeHttp2Internals();
     stream.destroy(nghttpErr(errno));
+    return false;
+  };
+  // Keep the request-submit seam replaceable for the same reason as the stream
+  // seams above. Node's internal http2 tests replace
+  // `internalBinding('http2').Http2Session.prototype.request` and expect the
+  // live ClientHttp2Session to observe the returned nghttp2 errno before a
+  // HEADERS frame reaches the peer.
+  const submitNativeSessionRequest = (session, stream, headers, options) => {
+    const submit = nativeHttp2SessionPrototype && nativeHttp2SessionPrototype.request;
+    if (typeof submit !== "function") return null;
+    const errno = Reflect.apply(submit, session, [headers, options]);
+    if (typeof errno !== "number" || errno >= 0) return true;
+    if (bindingRequested) adoptNodeHttp2Internals();
+    let err;
+    let sessionError = false;
+    if (errno === -509) {
+      err = mkErr("No stream ID is available because maximum stream ID has been reached", "ERR_HTTP2_OUT_OF_STREAMS");
+    } else if (errno === -501) {
+      err = mkErr("A stream cannot depend on itself", "ERR_HTTP2_STREAM_SELF_DEPENDENCY");
+    } else {
+      err = nghttpErr(errno);
+      sessionError = true;
+    }
+    // requestOnConnect returns a stream even when native submission fails. It
+    // has no id in these cases, so close it without queueing an invalid RST on
+    // stream 0. Generic session failures also cancel that pending stream with
+    // the same ERR_HTTP2_STREAM_CANCEL/cause pair as Node's closeSession().
+    stream.pending = false;
+    stream._closed = true;
+    if (sessionError) {
+      session._fatal(err);
+      G.queueMicrotask(() => { if (!stream.destroyed) stream.destroy(streamCancelErr(err)); });
+    } else {
+      G.queueMicrotask(() => { if (!stream.destroyed) stream.destroy(err); });
+    }
     return false;
   };
   // internal/errors.js AbortError: what request({ signal }) destroys the stream
@@ -2028,7 +2064,13 @@ export constexpr std::string_view kHttp2JS_part1 = R"JS(
       // request wait for a free concurrency slot (below) without the caller
       // seeing anything but a normal, corked stream.
       const stream = new ClientHttp2Stream(this, 0, headers, options);
+      const hasNativeRequest = nativeHttp2SessionPrototype &&
+        typeof nativeHttp2SessionPrototype.request === "function";
       const submit = () => {
+        // node requestOnConnect calls the native submit after the caller has
+        // returned the pending stream. Keep that edge observable: internal
+        // tests install the return code immediately after request() returns.
+        if (hasNativeRequest && submitNativeSessionRequest(self, stream, headers, options) === false) return;
         const streamId = self._nextStreamId();
         if (streamId < 0) {
           // node requestOnConnect: a negative id from nghttp2 becomes
@@ -2134,6 +2176,8 @@ export constexpr std::string_view kHttp2JS_part1 = R"JS(
         // 'error' + 'close' like any other failed request.
         stream.pending = false;
         G.process.nextTick(() => { if (!stream.destroyed) stream.destroy(requestError); });
+      } else if (hasNativeRequest) {
+        this._whenConnected(submit);
       } else if (this._pendingSubmits.length > 0 || this._openRequests >= this._maxConcurrentSend()) {
         // Cork exactly the way the constructor corks a not-yet-connected
         // stream: writes and end() issued by the caller are buffered until the

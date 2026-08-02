@@ -2023,9 +2023,10 @@ export constexpr std::string_view kHttp2JS_part2 = R"JS(
   // C++ halves. mbun's http2 is implemented in JS and does not drive them, so
   // they are plain typed arrays of the right length and stay zero: that is what
   // `updateSettingsBuffer` / `updateOptionsBuffer` write into and read back,
-  // which is all the util-level tests observe. Nothing here makes mbun's own
-  // sessions route through the binding — a test that monkey-patches
-  // `Http2Stream.prototype` still does not affect them (see DEFERRED).
+  // which is all the util-level tests observe. The live JS framing path still
+  // honors the replaceable Http2Session request and Http2Stream submit seams
+  // below, so internal tests can exercise native error ownership without
+  // pretending the typed-array state is native-backed.
   const kNghttp2Strerror = {
     0: "Success",
     "-501": "Invalid argument",
@@ -2179,6 +2180,7 @@ export constexpr std::string_view kHttp2JS_part2 = R"JS(
       class Http2Stream {}
       class Http2Ping {}
       class Http2Settings {}
+      nativeHttp2SessionPrototype = Http2Session.prototype;
       nativeHttp2StreamPrototype = Http2Stream.prototype;
       return {
         constants: bindingConstants,

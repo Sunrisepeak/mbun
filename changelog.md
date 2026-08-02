@@ -5,6 +5,13 @@
 
 ## 2026-08-02
 
+- W415 Node HTTP/2 internal request-submit seam source fix：修复 live `ClientHttp2Session.request()` 绕过
+  `internalBinding('http2').Http2Session.prototype.request` replacement 的问题；native request 现在在 connect edge
+  调用，`-509`/`-501` 保持 stream error ownership，其他负 nghttp2 errno 走 session error 与 pending-stream cancel。
+  issue #72；baseline **4/5 pass、1 fail、0 timeout**，focused target **1/1 pass**，post selector **5/5 pass、0 fail、0
+  timeout**，focused 独立重复 **5/5 pass**，final serial release build **60.15s**。未修改 upstream fixture、未跑全量
+  corpus。
+
 - W413 Node internal `setUnrefTimeout` pump source fix：`internal/timers.js` 的 private timer list 现在在首次
   `scheduleTimer()` 时懒加载 `getTimerCallbacks()`，通过现有 native timer queue 调用 `processTimers(now)`，并按
   ref/unref 状态管理 wake-up。issue #70；baseline **4/5 pass、1 fail、0 timeout**，focused target **1/1 pass**，
