@@ -195,6 +195,66 @@ int main() {
         expect(r.ok && r.pass == 1 && r.fail == 0, "I: unref'd interval doesn't wedge the run");
     }
 
+    // Scenario J — a done-style body may also return a Promise. Calling done()
+    // does not hide a later rejection from that Promise (regression: one shared
+    // settlement guard made this a false pass).
+    {
+        RunResult r{run_source(
+            "import { test } from \"bun:test\";\n"
+            "test('done then reject', async (done) => {\n"
+            "  done();\n"
+            "  await Promise.resolve();\n"
+            "  throw new Error('late rejection');\n"
+            "});\n")};
+        expect(r.ok, "J: run_source completes");
+        expect_eq(r.pass, 0, "J: done does not hide returned Promise rejection");
+        expect_eq(r.fail, 1, "J: returned Promise rejection fails the test");
+        expect(r.body.find("late rejection") != std::string::npos,
+               "J: returned Promise rejection is reported");
+    }
+
+    // Scenario K — package-manager symlinks make require.resolve() return a
+    // lexical path while the native loader caches the canonical target. A late
+    // mock must still find that loaded exports object and fan the replacement
+    // out through the named-import subscription.
+    {
+        const auto nonce{std::chrono::steady_clock::now().time_since_epoch().count()};
+        const std::filesystem::path root{
+            std::filesystem::temp_directory_path() /
+            std::format("mbun-test-runner-late-mock-{}", nonce)};
+        const std::filesystem::path packageRoot{
+            root / "node_modules/.store/pkg/node_modules/pkg"};
+        std::filesystem::create_directories(packageRoot);
+        std::filesystem::create_directory_symlink(".store/pkg/node_modules/pkg",
+                                                   root / "node_modules/pkg");
+        {
+            std::ofstream out{packageRoot / "package.json"};
+            out << R"({"name":"pkg","version":"1.0.0","main":"index.js"})";
+        }
+        {
+            std::ofstream out{packageRoot / "index.js"};
+            out << "export const value = () => 'original';\n";
+        }
+        {
+            std::ofstream out{root / "subject.ts"};
+            out << "import { value } from 'pkg';\n"
+                   "export const observed = () => value();\n";
+        }
+        const std::filesystem::path testFile{root / "late-mock.test.ts"};
+        {
+            std::ofstream out{testFile};
+            out << "import { expect, mock, test } from 'bun:test';\n"
+                   "import { observed } from './subject.ts';\n"
+                   "mock.module(require.resolve('pkg'), () => ({ value: () => 'mocked' }));\n"
+                   "test('late mock', () => expect(observed()).toBe('mocked'));\n";
+        }
+        RunResult r{mbun::jsc::test_runner::run_file(testFile.string())};
+        expect(r.ok, "K: symlink-package test completes");
+        expect_eq(r.pass, 1, "K: late mock updates the loaded named import");
+        expect_eq(r.fail, 0, "K: symlinked cache identity does not strand the original");
+        std::filesystem::remove_all(root);
+    }
+
     if (gFailed > 0) {
         std::println("test_test_runner: {} failed", gFailed);
         return 1;

@@ -1082,8 +1082,25 @@ inline constexpr std::string_view HARNESS = R"JS(
       G.__mbunNativeModules["node:" + name] = native;
       // A module already in the CommonJS cache is mutated rather than replaced:
       // its identity is what every existing binding and namespace points at.
-      let live;
-      try { live = G.__mbun_module_cache_get(key); } catch (e) {}
+      let live, liveKey = key;
+      try { live = G.__mbun_module_cache_get(liveKey); } catch (e) {}
+      // Package managers commonly expose node_modules entries as symlinks.
+      // require.resolve() preserves that lexical path, while the native loader
+      // canonicalises before inserting into moduleCache_. On a lexical miss,
+      // retry the pure cache lookup with the real path; do not require() here,
+      // because registering a mock must never evaluate an unloaded module.
+      if (live === undefined && key.charCodeAt(0) === 47 /* / */) {
+        const fs = G.__mbunNativeModules && (G.__mbunNativeModules.fs || G.__mbunNativeModules["node:fs"]);
+        if (fs && typeof fs.realpathSync === "function") {
+          try {
+            const canonical = fs.realpathSync(key);
+            if (canonical !== key) {
+              liveKey = canonical;
+              live = G.__mbun_module_cache_get(liveKey);
+            }
+          } catch (e) {}
+        }
+      }
       if (live !== undefined && live !== null && (typeof live === "object" || typeof live === "function") && m !== null && typeof m === "object") {
         const subs = G.__mbun_link_subs ? G.__mbun_link_subs.get(live) : undefined;
         for (const k of Object.keys(m)) {
@@ -1093,6 +1110,7 @@ inline constexpr std::string_view HARNESS = R"JS(
           if (list) for (let i = 0; i < list.length; i++) { try { list[i](v); } catch (e) {} }
         }
         mocks.set(key, live);
+        if (liveKey !== key) mocks.set(liveKey, live);
       } else {
         mocks.set(key, m);
       }
@@ -1697,16 +1715,49 @@ inline constexpr std::string_view HARNESS = R"JS(
         // the body returned no promise, treat the body as complete — otherwise an
         // arity-1 test that never calls done would hang the whole file.
         bodyPromise = new Promise((resolve, reject) => {
-          let settled = false;
-          const done = (err) => { if (settled) return; settled = true; if (err) reject(err instanceof Error ? err : new Error(String(err))); else resolve(); };
-          let r; try { r = t.fn(done); } catch (e) { done(e); return; }
-          if (r && typeof r.then === "function") { r.then(() => done(), (e) => done(e)); return; }
+          let completed = false, doneCalled = false, bodyReturned = false;
+          let promiseSettled = true;
+          const fail = (err) => {
+            if (completed) return;
+            completed = true;
+            reject(err instanceof Error ? err : new Error(String(err)));
+          };
+          const maybeResolve = () => {
+            if (!completed && bodyReturned && doneCalled && promiseSettled) {
+              completed = true;
+              resolve();
+            }
+          };
+          const done = (err) => {
+            if (doneCalled || completed) return;
+            doneCalled = true;
+            if (err) fail(err);
+            else maybeResolve();
+          };
+          let r;
+          try { r = t.fn(done); }
+          catch (e) { fail(e); return; }
+          bodyReturned = true;
+          if (r && typeof r.then === "function") {
+            promiseSettled = false;
+            r.then(() => { promiseSettled = true; maybeResolve(); }, fail);
+            maybeResolve();
+            return;
+          }
+          maybeResolve();
+          if (completed) return;
           // Body returned synchronously without a promise. Give the pending
           // done() every queue it could be sitting in (see awaitDone); if it
           // still hasn't fired AND no timer is pending (which could call done via
           // the runner's timer pump), treat it as complete (arity-1 arg that
           // isn't a done callback). If timers ARE pending, wait for them.
-          (async () => { await awaitDone(() => settled); if (!settled && (!G.__mbunTimers || G.__mbunTimers.q.length === 0)) { settled = true; resolve(); } })();
+          (async () => {
+            await awaitDone(() => doneCalled || completed);
+            if (!doneCalled && !completed && (!G.__mbunTimers || G.__mbunTimers.q.length === 0)) {
+              doneCalled = true;
+              maybeResolve();
+            }
+          })();
         });
       } else {
         bodyPromise = Promise.resolve().then(() => { const r = t.fn(); return (r && typeof r.then === "function") ? r : undefined; });
