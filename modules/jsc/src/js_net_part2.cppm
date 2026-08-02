@@ -176,6 +176,12 @@ export constexpr std::string_view kNetJS_part2 = R"JS(
   ].join("\n");
 
   const isResponseLike = (v) => v instanceof G.Response;
+  // Bun.serve accepts a BunFile/Blob directly as a static route value. Keep the
+  // transport boundary uniform by materializing that body as a Response once
+  // during route compilation; dispatch can then use the same clone/framing
+  // path as an explicitly constructed Response.
+  const isStaticBody = (v) => isResponseLike(v) || (typeof G.Blob === "function" && v instanceof G.Blob);
+  const asStaticResponse = (v) => isResponseLike(v) ? v : new G.Response(v);
   const hexVal = (c) => (c >= 48 && c <= 57) ? c - 48 : (c >= 97 && c <= 102) ? c - 87 : (c >= 65 && c <= 70) ? c - 55 : -1;
   // Decode a raw (latin1) path segment: percent-decode, then lossy UTF-8 decode.
   const decodeParam = (seg) => {
@@ -251,12 +257,14 @@ export constexpr std::string_view kNetJS_part2 = R"JS(
       if (value === false) continue;                   // `false` skips the route (falls through to fetch)
       if (value === null || value === undefined) continue;
       let handlers;
-      if (typeof value === "function" || isResponseLike(value)) handlers = { ANY: value };
+      if (typeof value === "function") handlers = { ANY: value };
+      else if (isStaticBody(value)) handlers = { ANY: asStaticResponse(value) };
       else if (typeof value === "object") {
         handlers = {}; let any = false;
         for (const mk of Object.keys(value)) {
           const mv = value[mk];
-          if (typeof mv === "function" || isResponseLike(mv)) { handlers[String(mk).toUpperCase()] = mv; any = true; }
+          if (typeof mv === "function") { handlers[String(mk).toUpperCase()] = mv; any = true; }
+          else if (isStaticBody(mv)) { handlers[String(mk).toUpperCase()] = asStaticResponse(mv); any = true; }
           else throw new Error(ROUTES_RECORD_ERR);
         }
         if (!any) throw new Error(ROUTES_RECORD_ERR);

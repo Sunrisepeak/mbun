@@ -434,6 +434,48 @@ Five independent focused repetitions also measured **5/5 pass**. The final
 serial release build took **60.15s**. No upstream fixture changed and no full
 corpus/workspace-wide test ran.
 
+## W416 Node HTTP/2 option/session guard revalidation
+
+The fresh five-job selector measured **5/5 pass, 0 fail, 0 timeout** across
+request-option validation, stream-ID validation, push-stream errors, and
+session-error handling. This was measurement-only: no new source owner was
+found, so it is retained as green coverage and is bundled with the next
+substantive source checkpoint rather than creating a docs-only commit.
+
+## W417 Bun HTTP serve leaf probe
+
+The fresh five-job Bun selector measured **5/5 green files**, **79 passed / 0
+failed / 80 ran / 321 expects**, and **0 timeout** across serve argument,
+cookie, date, header, and invalid-fetch-argument leaves. The existing
+`compat/bun` corpus checkout was used with its own working directory; no
+source owner was found and no corpus fixture was changed.
+
+## W418 Bun static-file route source fix and bounded triage
+
+The initial five-file selector measured **2 green files** and **3 test-failure
+files**, with **90 passed / 91 failed / 186 ran / 363 expects**. The two green
+files were `bun-serve-body-json-async.test.ts` (**1/1**) and
+`bun-serve-routes.test.ts` (**52/52**). `bun-serve-file.test.ts` failed during
+`Bun.serve()` setup because its direct `Bun.file(...)` route value was rejected;
+that single validation error cascaded into 81 reported test failures.
+
+Issue [#73](https://github.com/Sunrisepeak/mbun/issues/73) records the redacted
+reproduction. `modules/jsc/src/js_net_part2.cppm` now accepts Blob/BunFile
+static route values and materializes them through the existing Response
+clone/framing path. Five independent minimal processes moved the direct route
+from **5/5 rejected** to **5/5 accepted**; a real file-response wire probe
+returned status **200**, the detected JSON content type, and **6185 body bytes**.
+
+The post-fix five-file selector measured **2 green / 2 test-failure / 1
+timeout**, **89 passed / 10 failed / 100 ran / 361 expects**. The focused
+`bun-serve-file` slices now reach runtime behavior: HEAD serving passes;
+remaining independent owners include Last-Modified metadata, missing-file
+fallback, Range handling, and response-header snapshot shape. The complete
+file is not claimed green because its bounded 90-second run timed out in later
+stress/subprocess coverage without a test summary. `bun-server.test.ts` and
+`bun-serve-propagate-errors.test.ts` remain parked as separate owners. No
+upstream fixture changed and no full corpus/workspace-wide test ran.
+
 ## W305 Bun/Deno Event/Performance/URL/crypto leaf probe
 
 The bounded five-job Bun selector covered Deno Event, Performance, URL,
