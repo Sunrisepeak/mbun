@@ -508,10 +508,10 @@ inline constexpr std::string_view kNodeModuleJS = R"JS(
 
   function enableCompileCache(options) {
     const env = G.process && G.process.env;
-    if (env && env.NODE_DISABLE_COMPILE_CACHE === "1") {
-      return { status: compileCacheStatus.DISABLED };
-    }
-
+    // NODE_DISABLE_COMPILE_CACHE is decided natively, not here. Upstream splits
+    // it the same way -- helpers.js validates and defaults, EnableCompileCache
+    // decides -- and the split matters: the disable path has to emit its
+    // NODE_DEBUG_NATIVE trace, and the trace writer lives on the native side.
     let directory;
     let portable;
     if (options === undefined || typeof options === "string") {
