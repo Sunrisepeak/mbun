@@ -23,6 +23,8 @@ int main() {
     using mbun::cli::parse;
     using mbun::cli::parse_build;
     using mbun::cli::parse_test;
+    using mbun::cli::resolve_tsconfig_override_path;
+    using mbun::cli::take_tsconfig_override;
 
     // --version / -v → 裸版本号快速路径
     expect(parse({"--version"}).action == Action::Version, "--version → Version");
@@ -84,6 +86,20 @@ int main() {
         expect(b.external.size() == 2, "-e/--external 累积成列表");
         expect(b.entryPoints.size() == 1 && b.entryPoints[0] == "a.ts", "值 flag 不吞 entrypoint");
     }
+    {
+        auto b = parse_build({"a.ts", "--tsconfig-override", "config/build.json"});
+        expect(b.parseError.empty(), "build accepts shared --tsconfig-override");
+        expect(b.tsconfigOverride == std::optional<std::string>{"config/build.json"},
+               "build preserves tsconfig override for resolver routing");
+        expect(std::ranges::none_of(b.unsupported, [](const std::string& flag) {
+                   return flag == "--tsconfig-override";
+               }),
+               "build does not misclassify tsconfig override as unsupported");
+    }
+    {
+        auto b = parse_build({"a.ts", "--tsconfig-override"});
+        expect(!b.parseError.empty(), "build rejects dangling --tsconfig-override");
+    }
 
     // `mbun test <file>` → Test（T3.4 S1 解锁：直跑 bun 原生测试文件）
     // 操作数/flag 现由 parse_test() 二次解析（parse() 只做子命令分发）。
@@ -103,6 +119,42 @@ int main() {
         auto p = parse({"test"});
         auto t = parse_test({});
         expect(p.action == Action::Test && t.filters.empty(), "test 无文件 → 空过滤器");
+    }
+    {
+        auto t = parse_test({"--tsconfig-override=custom.json", "math.test.ts"});
+        expect(t.parseError.empty(), "test accepts shared --tsconfig-override");
+        expect(t.tsconfigOverride == std::optional<std::string>{"custom.json"},
+               "test preserves tsconfig override for runtime routing");
+        expect(t.filters.size() == 1 && t.filters[0] == "math.test.ts",
+               "test override does not swallow test filter");
+    }
+    {
+        auto t = parse_test({"--tsconfig-override"});
+        expect(!t.parseError.empty(), "test rejects dangling --tsconfig-override");
+    }
+
+    // TRANSPILER_PARAMS_ is shared by run/test/build. Its required-value reader
+    // must agree for split/inline spellings and reject a dangling occurrence.
+    {
+        mbun::cli::TsconfigOverrideArg option{};
+        const std::array<std::string_view, 2> split{"--tsconfig-override", "config.json"};
+        expect(take_tsconfig_override(split, 0, option) == 2,
+               "shared tsconfig reader consumes split spelling");
+        expect(option.value == std::optional<std::string>{"config.json"},
+               "shared tsconfig reader keeps split value");
+    }
+    {
+        mbun::cli::TsconfigOverrideArg option{};
+        const std::array<std::string_view, 1> dangling{"--tsconfig-override"};
+        expect(take_tsconfig_override(dangling, 0, option) == 1,
+               "shared tsconfig reader consumes dangling flag");
+        expect(!option.parseError.empty(), "shared tsconfig reader reports missing value");
+    }
+    {
+        const std::filesystem::path cwd{"/workspace/project"};
+        expect(resolve_tsconfig_override_path("config/tsconfig.json", cwd) ==
+                   "/workspace/project/config/tsconfig.json",
+               "tsconfig override resolves against post---cwd working directory");
     }
 
     // 未知命令 → Unknown + 保留输入

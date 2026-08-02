@@ -990,12 +990,19 @@ void write_junit_report(const std::filesystem::path& outfile,
 // `mbun test [file|dir|filter]...`: discover the test files, run each through
 // mbun.jsc.test_runner, and print a bun-style per-file report + aggregate
 // summary. Returns the process exit code (0 all pass, 1 any fail / load error).
-int run_test(std::span<const std::string_view> args) {
+bool apply_tsconfig_override(std::string value);
+
+int run_test(std::span<const std::string_view> args,
+             std::optional<std::string_view> inheritedTsconfig = std::nullopt) {
     mbun::cli::TestFlags flags { mbun::cli::parse_test(args) };
     if (!flags.parseError.empty()) {
         std::println(std::cerr, "error: {}", flags.parseError);
         return 1;
     }
+    if (!flags.tsconfigOverride && inheritedTsconfig) {
+        flags.tsconfigOverride = std::string{*inheritedTsconfig};
+    }
+    if (flags.tsconfigOverride && !apply_tsconfig_override(*flags.tsconfigOverride)) return 1;
 
     // bunfig.toml's [test] block supplies defaults the command line overrides
     // (ref: bun-ref/src/bunfig/bunfig.rs — load_config runs before Arguments'
@@ -1954,7 +1961,8 @@ int emit_compiled_executable(const mbun::cli::BuildFlags& flags, const std::stri
     return 0;
 }
 
-int run_build(std::span<const std::string_view> buildArgs) {
+int run_build(std::span<const std::string_view> buildArgs,
+              std::optional<std::string_view> inheritedTsconfig = std::nullopt) {
     const auto start{std::chrono::steady_clock::now()};
     auto flags{mbun::cli::parse_build(buildArgs)};
 
@@ -1965,6 +1973,27 @@ int run_build(std::span<const std::string_view> buildArgs) {
     if (!flags.parseError.empty()) {
         std::println(std::cerr, "error: {}", flags.parseError);
         return 1;
+    }
+
+    if (!flags.tsconfigOverride && inheritedTsconfig) {
+        flags.tsconfigOverride = std::string{*inheritedTsconfig};
+    }
+    std::optional<mbun::resolver::TsconfigPaths> explicitTsconfig{};
+    if (flags.tsconfigOverride) {
+        std::error_code ec{};
+        const std::filesystem::path cwd{std::filesystem::current_path(ec)};
+        if (ec) {
+            std::println(std::cerr, "error: Could not resolve --tsconfig-override");
+            return 1;
+        }
+        const std::string path{
+            mbun::cli::resolve_tsconfig_override_path(*flags.tsconfigOverride, cwd)};
+        auto loaded{mbun::resolver::load_tsconfig_override(build_os_fs(), path)};
+        if (!loaded.config) {
+            std::println(std::cerr, "error: {}", loaded.error);
+            return 1;
+        }
+        explicitTsconfig = std::move(loaded.config);
     }
 
     // ref: bun src/cli/Arguments.rs :1472-1488 — no entrypoints prints the banner,
@@ -2094,7 +2123,11 @@ int run_build(std::span<const std::string_view> buildArgs) {
     for (const std::string& entryPoint : entryPoints) {
         auto built{mbun::bundler::build_bundle(
             {entryPoint}, mbun::bundler::Files{},
-            {.sourcemap = wantSourcemap, .fs = &fs, .jsx = jsx, .defines = defines})};
+            {.sourcemap = wantSourcemap,
+             .fs = &fs,
+             .tsconfig = explicitTsconfig ? &*explicitTsconfig : nullptr,
+             .jsx = jsx,
+             .defines = defines})};
         if (!built) {
             std::println(std::cerr, "error: {}", built.error().message);
             return 1;
@@ -2353,12 +2386,21 @@ void apply_cwd_flag(std::string_view dir) {
 // Resolve --tsconfig-override at the CLI parsing boundary. The runtime must
 // receive one stable absolute config path; resolving later from an importing
 // module would incorrectly make the option depend on that modules directory.
-void apply_tsconfig_override(std::string value) {
+bool apply_tsconfig_override(std::string value) {
     std::error_code ec{};
-    std::filesystem::path config{value};
-    if (!config.is_absolute()) config = std::filesystem::absolute(config, ec);
-    if (!ec) value = config.lexically_normal().string();
+    const std::filesystem::path cwd{std::filesystem::current_path(ec)};
+    if (ec) {
+        std::println(std::cerr, "error: Could not resolve --tsconfig-override");
+        return false;
+    }
+    value = mbun::cli::resolve_tsconfig_override_path(value, cwd);
+    const auto loaded{mbun::resolver::load_tsconfig_override(build_os_fs(), value)};
+    if (!loaded.config) {
+        std::println(std::cerr, "error: {}", loaded.error);
+        return false;
+    }
     mbun::jsc::runtime::set_tsconfig_override(std::move(value));
+    return true;
 }
 
 // `--loader .ext:name` / `-l .ext:name`: install a process-wide extension→loader
@@ -3178,25 +3220,13 @@ int exec_as_if_node(std::span<const std::string_view> args) {
     // Only the load path gains the suffix. Bun preserves the spelling supplied
     // by the user in process.argv[1], which as-node.test.ts pins explicitly.
     std::string loadTarget{target};
-    {
-        std::error_code ec{};
-        const std::filesystem::path literal{target};
-        const bool literalIsFile{std::filesystem::exists(literal, ec) &&
-                                 !std::filesystem::is_directory(literal, ec)};
-        if (!literal.has_extension() && !literalIsFile) {
-            static constexpr std::string_view NODE_ENTRY_EXTENSION_ORDER[]{
-                ".tsx", ".jsx", ".mts", ".ts", ".mjs", ".js", ".cts", ".cjs", ".json"};
-            for (const std::string_view extension : NODE_ENTRY_EXTENSION_ORDER) {
-                std::filesystem::path candidate{target + std::string{extension}};
-                ec.clear();
-                if (std::filesystem::exists(candidate, ec) &&
-                    !std::filesystem::is_directory(candidate, ec)) {
-                    loadTarget = candidate.string();
-                    break;
-                }
-            }
-        }
-    }
+    mbun::resolver::Options entryOptions{};
+    entryOptions.kind = mbun::resolver::ResolveKind::Import;
+    entryOptions.extension_order = {
+        ".tsx", ".jsx", ".mts", ".ts", ".mjs", ".js", ".cts", ".cjs", ".json"};
+    mbun::resolver::Resolver entryResolver{build_os_fs(), std::move(entryOptions)};
+    const auto resolved{entryResolver.resolve(target, std::filesystem::current_path().string())};
+    if (resolved.status == mbun::resolver::ResolveStatus::Success) loadTarget = resolved.path;
     return run_script(loadTarget, args.subspan(i + 1), target);
 }
 

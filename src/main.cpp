@@ -255,6 +255,7 @@ int main(int argc, char* argv[]) {
     // Strip leading global run flags so `mbun [flags] <script>` runs the script,
     // but never past -e/-p/--eval/--print (those consume the next token as code).
     RunFlags globalFlags{};
+    mbun::cli::TsconfigOverrideArg globalTsconfig{};
     while (!args.empty() && !is_eval_flag(args[0])) {
         if (const std::size_t n{take_max_http_header_size_flag(args, 0)}; n > 0) {
             args.erase(args.begin(), args.begin() + static_cast<std::ptrdiff_t>(n));
@@ -312,9 +313,13 @@ int main(int argc, char* argv[]) {
             args.erase(args.begin(), args.begin() + static_cast<std::ptrdiff_t>(n));
             continue;
         }
-        if (const std::size_t n{take_valued_flag(args, 0, "--tsconfig-override",
-                                                 apply_tsconfig_override)};
+        if (const std::size_t n{
+                mbun::cli::take_tsconfig_override(args, 0, globalTsconfig)};
             n > 0) {
+            if (!globalTsconfig.parseError.empty()) {
+                std::println(std::cerr, "error: {}", globalTsconfig.parseError);
+                return 1;
+            }
             args.erase(args.begin(), args.begin() + static_cast<std::ptrdiff_t>(n));
             continue;
         }
@@ -361,6 +366,13 @@ int main(int argc, char* argv[]) {
         args.erase(args.begin());
     }
 
+    // Bun applies --cwd before joining the raw tsconfig value, regardless of
+    // their command-line order. Keep the option deferred until a runtime/build
+    // path is selected; --help/--version do not load resolver configuration.
+    const auto applyGlobalTsconfig{[&] {
+        return !globalTsconfig.value || apply_tsconfig_override(*globalTsconfig.value);
+    }};
+
     // Node-style re-exec: a leading `--flag` that is neither a bun run-flag nor
     // an eval flag, followed later by a positional entry point, is how the Node
     // corpus re-spawns `process.execPath` (`mbun --expose-gc file.js`,
@@ -384,7 +396,10 @@ int main(int argc, char* argv[]) {
                 break;
             }
         }
-        if (hasPositional) return exec_as_if_node(args);
+        if (hasPositional) {
+            if (!applyGlobalTsconfig()) return 1;
+            return exec_as_if_node(args);
+        }
     }
 
     // `mbun run <script> [args...]` and bare `mbun <script.(m)js> [args...]`
@@ -393,9 +408,13 @@ int main(int argc, char* argv[]) {
         // `bun repl` is a command, not a package.json script named "repl".
         // Keep it before auto-command resolution so both piped REPL input and
         // the command's own -e/-p forms reach the dedicated entry point.
-        if (args[0] == "repl") return exec_bun_repl(std::span{args}.subspan(1));
+        if (args[0] == "repl") {
+            if (!applyGlobalTsconfig()) return 1;
+            return exec_bun_repl(std::span{args}.subspan(1));
+        }
         // `mbun -e <code>` / `mbun --eval <code>`: evaluate a JS/TS string.
         if (is_eval_flag(args[0])) {
+            if (!applyGlobalTsconfig()) return 1;
             if (args.size() < 2) {
                 std::println(std::cerr, "{}: {} requires an argument",
                              argc > 0 ? argv[0] : "mbun", args[0]);
@@ -439,6 +458,7 @@ int main(int argc, char* argv[]) {
             // Skip run-flags placed after `run` (e.g. `mbun run --bun file.js`);
             // they are stripped before the command but not after the subcommand.
             RunFlags flags{globalFlags};
+            mbun::cli::TsconfigOverrideArg runTsconfig{globalTsconfig};
             std::size_t i = 1;
             while (i < args.size()) {
                 if (const std::size_t n{take_max_http_header_size_flag(args, i)}; n > 0) {
@@ -467,9 +487,13 @@ int main(int argc, char* argv[]) {
                                args.begin() + static_cast<std::ptrdiff_t>(i + n));
                     continue;
                 }
-                if (const std::size_t n{take_valued_flag(args, i, "--tsconfig-override",
-                                                         apply_tsconfig_override)};
+                if (const std::size_t n{
+                        mbun::cli::take_tsconfig_override(args, i, runTsconfig)};
                     n > 0) {
+                    if (!runTsconfig.parseError.empty()) {
+                        std::println(std::cerr, "error: {}", runTsconfig.parseError);
+                        return 1;
+                    }
                     args.erase(args.begin() + static_cast<std::ptrdiff_t>(i),
                                args.begin() + static_cast<std::ptrdiff_t>(i + n));
                     continue;
@@ -532,6 +556,7 @@ int main(int argc, char* argv[]) {
                 if (!is_skippable_run_flag(args[i])) break;
                 ++i;
             }
+            if (runTsconfig.value && !apply_tsconfig_override(*runTsconfig.value)) return 1;
             // `bun run` with no target prints run's help + the script list
             // (run_command.rs:2456-2466), it is NOT an error.
             if (i >= args.size()) {
@@ -557,6 +582,7 @@ int main(int argc, char* argv[]) {
         // bin_dirs_only=true and allow_fast_run_for_extensions=true here, so an
         // existing file wins outright (no script lookup).
         if (looks_like_script(args[0]) || is_markdown(args[0])) {
+            if (!applyGlobalTsconfig()) return 1;
             return exec_run_target(args[0], std::span{args}.subspan(1), globalFlags,
                                    /*allowFastRunForExtensions=*/true, /*binDirsOnly=*/true);
         }
@@ -578,13 +604,19 @@ int main(int argc, char* argv[]) {
         std::print("{}", USAGE);
         return 0;
     case Action::Test:
-        return run_test(std::span{args}.subspan(1));
+        return run_test(std::span{args}.subspan(1),
+                        globalTsconfig.value
+                            ? std::optional<std::string_view>{*globalTsconfig.value}
+                            : std::nullopt);
     case Action::Install:
         return run_install(std::span{args}.subspan(1));
     case Action::Add:
         return run_add(std::span{args}.subspan(1));
     case Action::Build:
-        return run_build(std::span{args}.subspan(1));
+        return run_build(std::span{args}.subspan(1),
+                         globalTsconfig.value
+                             ? std::optional<std::string_view>{*globalTsconfig.value}
+                             : std::nullopt);
     case Action::Exec:
         return run_exec(parsed.argument);
     case Action::Publish:
@@ -598,6 +630,7 @@ int main(int argc, char* argv[]) {
         // runs node_modules/.bin/eslint, and only when nothing matches does it
         // report `Script not found` + exit 1 (cli/mod.rs:1469-1481 → exec_with_cfg,
         // run_command.rs:2726-2790). --if-present makes the miss silent/0.
+        if (!applyGlobalTsconfig()) return 1;
         return exec_run_target(args[0], std::span{args}.subspan(1), globalFlags,
                                /*allowFastRunForExtensions=*/true, /*binDirsOnly=*/true);
     }

@@ -433,6 +433,22 @@ void test_disk_entrypoint_and_imports() {
     if (shadowed) {
         check_contains(shadowed->code, "shadowed", "in-memory file shadows the on-disk file");
     }
+
+    // `--tsconfig-override` is a shared transpiler option in Bun's run/test/build
+    // tables. The build pipeline receives the same parsed alias map instead of
+    // accepting and then discarding the option at its CLI boundary.
+    {
+        mbun::bundler::Files aliasFiles{
+            {"/alias/entry.ts", "import { answer } from '#/answer'; console.log(answer);"},
+            {"/alias/src/answer.ts", "export const answer = 42;"},
+        };
+        mbun::resolver::TsconfigPaths tsconfig{
+            .baseDir = "/alias", .entries = {{"#/*", {"./src/*"}}}};
+        auto aliased{mbun::bundler::build_bundle(
+            {"/alias/entry.ts"}, aliasFiles, {.tsconfig = &tsconfig})};
+        check(aliased.has_value(), "build routes explicit tsconfig aliases into resolver");
+        if (aliased) check(aliased->moduleCount == 2, "tsconfig alias adds target module to graph");
+    }
     fs::remove_all(dir, ec);
 }
 

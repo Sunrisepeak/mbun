@@ -1135,30 +1135,10 @@ public:
             return it->second ? &*it->second : nullptr;
         }
 
-        std::optional<mbun::resolver::TsconfigPaths> parsed;
-        std::error_code ec{};
-        if (std::filesystem::is_regular_file(config, ec)) {
-            if (auto content{read_file(cfg)}) {
-                const std::filesystem::path configDir{config.parent_path()};
-                parsed = mbun::resolver::parse_tsconfig(*content, configDir.string());
-                // Follow `extends`: when this config declares no paths of its own
-                // but extends another, inherit the parent's baseDir + entries
-                // (a nested config that only `extends` a parent otherwise loses
-                // the parent's path aliases like "harness"). Bounded chain walk.
-                std::filesystem::path base{configDir};
-                for (int hop{0}; parsed && parsed->entries.empty() &&
-                                    !parsed->extends_from.empty() && hop < 16; ++hop) {
-                    std::string ext{parsed->extends_from};
-                    if (!ext.ends_with(".json")) ext += "/tsconfig.json";
-                    std::filesystem::path parentCfg{(base / ext).lexically_normal()};
-                    std::error_code parentEc{};
-                    if (!std::filesystem::is_regular_file(parentCfg, parentEc)) break;
-                    auto parentContent{read_file(parentCfg.string())};
-                    if (!parentContent) break;
-                    base = parentCfg.parent_path();
-                    parsed = mbun::resolver::parse_tsconfig(*parentContent, base.string());
-                }
-            }
+        auto loaded{mbun::resolver::load_tsconfig_override(os_fs(), cfg)};
+        std::optional<mbun::resolver::TsconfigPaths> parsed{std::move(loaded.config)};
+        if (!parsed && cfg == gTsconfigOverride && !loaded.error.empty()) {
+            std::println(std::cerr, "error: {}", loaded.error);
         }
         auto& slot{tsconfigCache_[cfg]};
         slot = std::move(parsed);

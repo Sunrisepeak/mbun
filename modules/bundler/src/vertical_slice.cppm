@@ -98,6 +98,9 @@ struct BuildOptions {
     // runtime bridge passes an OS-backed filesystem so real entrypoints resolve.
     // Borrowed: must outlive the build_bundle() call.
     const mbun::resolver::FileSystem* fs{nullptr};
+    // Explicit tsconfig alias map, parsed and owned by the caller for the
+    // duration of build_bundle(). Null keeps ordinary resolver behavior.
+    const mbun::resolver::TsconfigPaths* tsconfig{nullptr};
     // Empty hooks = no plugins registered (the default), which keeps the pipeline
     // byte-identical to the pre-plugin path.
     OnResolveHook on_resolve{};
@@ -670,6 +673,7 @@ public:
             return std::unexpected(BuildError{"", "at least one entry point is required", 0});
         }
         diskFs_ = options.fs;
+        tsconfig_ = options.tsconfig;
         onResolve_ = options.on_resolve ? &options.on_resolve : nullptr;
         onLoad_ = options.on_load ? &options.on_load : nullptr;
         jsxOptions_ = options.jsx;
@@ -800,6 +804,7 @@ private:
     std::optional<BuildError> inputError_;
     // Borrowed disk fallback (BuildOptions::fs); null keeps the build memory-only.
     const mbun::resolver::FileSystem* diskFs_{nullptr};
+    const mbun::resolver::TsconfigPaths* tsconfig_{nullptr};
     // Borrowed plugin hooks (BuildOptions::on_resolve / on_load); null = no plugins.
     const OnResolveHook* onResolve_{nullptr};
     const OnLoadHook* onLoad_{nullptr};
@@ -945,7 +950,9 @@ private:
                 std::string{importer},
                 std::format("could not resolve {:?} from namespace {:?}", specifier, importerNs), 0});
         }
-        mbun::resolver::Resolver resolver{overlay_fs_(), mbun::resolver::Options{}};
+        mbun::resolver::Options resolverOptions{};
+        resolverOptions.tsconfig = tsconfig_;
+        mbun::resolver::Resolver resolver{overlay_fs_(), std::move(resolverOptions)};
         const mbun::resolver::ResolveResult resolved{resolver.resolve(specifier, dirname(importer))};
         if (resolved.status == mbun::resolver::ResolveStatus::Success) {
             return Resolved{resolved.path, "file"};

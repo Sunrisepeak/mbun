@@ -72,6 +72,10 @@ export struct Options {
     // parents. Default false (node's default, and what the isolated-linker
     // layouts below need).
     bool preserve_symlinks{false};
+    // Optional caller-pinned LOAD_AS_FILE order. Empty retains the resolver's
+    // project/node_modules defaults; RunAsNodeCommand supplies Bun's main-entry
+    // order without changing ordinary import resolution.
+    std::vector<std::string_view> extension_order;
 };
 
 // ReResolve: `path` is a bare specifier (e.g. a package.json "imports" target
@@ -425,6 +429,46 @@ export std::optional<TsconfigPaths> parse_tsconfig(std::string_view json,
     return ts;
 }
 
+export struct TsconfigLoadResult {
+    std::optional<TsconfigPaths> config;
+    std::string error;
+};
+
+// Load an explicitly requested config. Unlike the nearest-tsconfig probe, an
+// explicit path is a user assertion: missing/unreadable/malformed input must be
+// reported rather than cached as an indistinguishable null result.
+export TsconfigLoadResult load_tsconfig_override(const FileSystem& fs,
+                                                  std::string_view configPath) {
+    const std::string path{paths::normalize(configPath)};
+    if (!fs.file_exists || !fs.file_exists(path)) {
+        return {.error = std::format("Cannot find tsconfig file \"{}\"", path)};
+    }
+    if (!fs.read_file) {
+        return {.error = std::format("Cannot read file \"{}\"", path)};
+    }
+    auto content{fs.read_file(path)};
+    if (!content) return {.error = std::format("Cannot read file \"{}\"", path)};
+
+    auto parsed{parse_tsconfig(*content, paths::dirname(path))};
+    if (!parsed) return {.error = std::format("Cannot parse tsconfig file \"{}\"", path)};
+
+    // Preserve the runtime's existing bounded extends behavior. A leaf with its
+    // own paths wins; otherwise inherit the first parent that supplies them.
+    std::string current{path};
+    for (int hop{0}; parsed->entries.empty() && !parsed->extends_from.empty() && hop < 16; ++hop) {
+        std::string parentSpec{parsed->extends_from};
+        if (!parentSpec.ends_with(".json")) parentSpec += "/tsconfig.json";
+        current = paths::join({paths::dirname(current), parentSpec});
+        if (!fs.file_exists(current)) break;
+        auto parentContent{fs.read_file(current)};
+        if (!parentContent) break;
+        auto parent{parse_tsconfig(*parentContent, paths::dirname(current))};
+        if (!parent) break;
+        parsed = std::move(parent);
+    }
+    return {.config = std::move(parsed)};
+}
+
 // ---------------------------------------------------------------------------
 // Resolver
 // ---------------------------------------------------------------------------
@@ -538,7 +582,8 @@ private:
     // Bun selects the node_modules order when the path being searched passes
     // through a node_modules directory. The resolver works in normalized
     // forward-slash paths, so the needle is "/node_modules/".
-    static std::span<const std::string_view> extensions_for(std::string_view path) {
+    std::span<const std::string_view> extensions_for(std::string_view path) const {
+        if (!opts_.extension_order.empty()) return opts_.extension_order;
         if (path.find("/node_modules/") != std::string_view::npos) {
             return kExtensionsNodeModules;
         }
