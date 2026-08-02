@@ -7033,6 +7033,19 @@ surface on Linux:
   混修；下一轮必须从 fresh bounded measurement 选单一 owner。W55 无构建、无全量
   corpus，资源策略继续保持 3–5 jobs，并在 swap/disk 低水位时只做小型 probe。
 
+### W424 GCC workspace gate timer-order test correction
+
+- The first W423 Linux gate reached a real GCC-only failure in
+  `modules/jsc`'s `test_runtime_dns`: `setTimeout(..., 0)` was normalized to the
+  correct integer timer bucket minimum of 1ms, but the test drained timers once
+  immediately after scheduling and expected it to have fired. LLVM passed the
+  same workspace gate; a second GCC run reproduced the same timing assumption.
+- The test now pumps until that timer is actually due while the delayed DNS
+  backend remains held, then verifies DNS callbacks are still blocked until the
+  backend is released. This removes the test's wall-clock race without changing
+  runtime timer semantics or weakening the DNS assertion. The fix is source-test
+  code, not a CI skip or result rewrite; Linux CI must be rerun before merge.
+
 ### W423 Bun.file conditional-request response source fix
 
 - W423 fresh five-lane measurement isolated one shared conditional-response

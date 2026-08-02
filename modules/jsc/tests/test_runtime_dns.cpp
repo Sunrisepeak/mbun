@@ -212,8 +212,10 @@ void test_delayed_backend_keeps_lookup_reverse_and_service_off_js_thread() {
     JSGarbageCollect(static_cast<JSContextRef>(context));
     expect_num("globalThis.__dnsDelayedDone", 0.0,
                "held lookup/reverse/lookupService do not complete on the JS thread");
-    static_cast<void>(mbun::jsc::runtime::eval_number(
-        "globalThis.__mbun_drain_timers ? __mbun_drain_timers(1) : 0"));
+    if (!pump_until("globalThis.__dnsDelayedTimer===1?1:0")) {
+        ++gFailed;
+        std::println("  FAIL: JS timer did not fire while resolver backend was held");
+    }
     expect_num("globalThis.__dnsDelayedTimer", 1.0,
                "JS timers remain responsive while resolver backend is held");
     expect_num("globalThis.__dnsDelayedDone", 0.0,
