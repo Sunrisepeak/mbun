@@ -31,17 +31,87 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
 (function () {
   const G = globalThis;
 
-  // `internal/event_target` and the engine's native Web Event can be separate
-  // realms during builtin initialization. NodeEventTarget's dispatch path is
-  // strict about its own Event brand, so install a post-loader bridge that
-  // converts a native Web Event into the matching internal event only at that
-  // boundary. The hook is invoked after the top-level require is installed.
+  // `internal/bootstrap/realm` — mbun's implementation of the id.
+  //
+  // node's file of that name is its per-realm BOOTSTRAP: on load it reassigns
+  // `process.binding` and `Error.prepareStackTrace` over whatever the host
+  // already installed. Nothing asks for it on purpose — `internal/util/inspect`
+  // needs one symbol from it (`BuiltinModule`) and inspect sits on the
+  // transitive path of most of `lib/internal/**` — so simply making the
+  // vendored tree reachable was enough to take mbun's `process.binding` away
+  // (measured: process-binding.test.ts, "The value of \"err\" is out of range").
+  //
+  // So mbun owns the id: the resolver never offers node's copy for it (see
+  // internal_module_is_mbun_owned_ in runtime/engine.inc) and this table entry
+  // is the single answer, on every path and from every directory. It exports
+  // the same `BuiltinModule` surface node's consumers use, computed from mbun's
+  // OWN builtin table, and mutates nothing.
   try {
-    Object.defineProperty(G, "__mbunPatchNodeEventTarget", {
-      value: function patchNodeEventTarget(req) {
-        if (typeof req !== "function" || G.__mbunNodeEventTargetPatched) return;
-        let internal;
-        try { internal = req("internal/event_target"); } catch (e) { return; }
+    const M = G.__mbunNativeModules;
+    if (M && !M["internal/bootstrap/realm"]) {
+      // node keeps four ids requirable only WITH the `node:` scheme
+      // (lib/internal/bootstrap/realm.js schemelessBlockList).
+      const schemeOnly = ["test", "test/reporters", "sqlite", "quic"];
+      const exists = (id) => typeof id === "string" &&
+        (Object.prototype.hasOwnProperty.call(M, id) ||
+         Object.prototype.hasOwnProperty.call(M, "node:" + id));
+      const BuiltinModule = {
+        // `map` is read as a Map (has/get) by node's loader and by inspect.
+        map: { has: (id) => exists(id), get: (id) => M[id] || M["node:" + id] },
+        exists,
+        canBeRequiredByUsers: (id) => exists(id) && !id.startsWith("internal/"),
+        canBeRequiredWithoutScheme: (id) =>
+          exists(id) && !id.startsWith("internal/") && schemeOnly.indexOf(id) === -1,
+        normalizeRequirableId(id) {
+          if (typeof id === "string" && id.startsWith("node:")) {
+            const n = id.slice(5);
+            return BuiltinModule.canBeRequiredByUsers(n) ? n : "";
+          }
+          return BuiltinModule.canBeRequiredWithoutScheme(id) ? id : "";
+        },
+        isBuiltin: (id) => BuiltinModule.normalizeRequirableId(id) !== "",
+        getSchemeOnlyModuleNames: () => schemeOnly.filter(exists),
+        getCanBeRequiredByUsersWithoutSchemeList: () =>
+          Object.keys(M).filter((id) => BuiltinModule.canBeRequiredWithoutScheme(id)),
+        getAllBuiltinModuleIds: () =>
+          Object.keys(M).filter((id) => !id.startsWith("node:")),
+        // mbun's table has no "internal ids are hidden until a flag exposes
+        // them" phase, so the two mutators node's pre_execution calls are
+        // already satisfied.
+        allowRequireByUsers() {},
+        setRealmAllowRequireByUsers() {},
+        exposeInternals() {},
+      };
+      M["internal/bootstrap/realm"] = { BuiltinModule };
+    }
+  } catch (e) {}
+
+  // `internal/event_target` and the engine's native Web Event can be separate
+  // realms: NodeEventTarget's dispatch path is strict about its own Event
+  // brand, so a native Web Event handed to it is rejected. Convert at exactly
+  // that boundary.
+  //
+  // This used to be a startup bridge that require()d `internal/event_target`
+  // (and `internal/abort_controller`, whose AbortController/AbortSignal it then
+  // republished as the globals). That was the identity hazard in person: it
+  // brought node's copies up in EVERY process where the vendored tree happened
+  // to be reachable, and made node's AbortSignal the process-wide one — so a
+  // platform AbortSignal then failed its own EventTarget brand check
+  // ('The "emitter" argument must be of type EventEmitter or EventTarget.
+  // Received [object AbortSignal]'), which is how widening the resolver's reach
+  // in W44 broke four corpus files.
+  //
+  // So the patch is now a REACTION, not a load: the loader calls it from the
+  // `internal/event_target` identity suffix (runtime/module_loading.inc) with
+  // that module's own exports, and only if something actually required it.
+  // A process that never touches node's event_target pays nothing and keeps
+  // exactly one EventTarget — its own. AbortController/AbortSignal are handled
+  // the same way, in the `internal/abort_controller` suffix, which republishes
+  // the platform pair as node's exports rather than the other way round.
+  try {
+    Object.defineProperty(G, "__mbunAdoptNodeEventTarget", {
+      value: function adoptNodeEventTarget(internal) {
+        if (G.__mbunNodeEventTargetPatched) return;
         const NativeEvent = G.Event;
         const InternalEvent = internal && internal.Event;
         const NodeEventTarget = internal && internal.NodeEventTarget;
@@ -65,20 +135,48 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
         Object.defineProperty(G, "__mbunNodeEventTargetPatched", {
           value: true, writable: false, configurable: true, enumerable: false,
         });
-        let abortController;
-        try { abortController = req("internal/abort_controller"); } catch (e) { return; }
-        if (abortController && typeof abortController.AbortController === "function" &&
-            typeof abortController.AbortSignal === "function") {
-          Object.defineProperty(G, "AbortController", {
-            value: abortController.AbortController, writable: true, configurable: true, enumerable: false,
-          });
-          Object.defineProperty(G, "AbortSignal", {
-            value: abortController.AbortSignal, writable: true, configurable: true, enumerable: false,
-          });
-        }
       },
       writable: false, configurable: true, enumerable: false,
     });
+  } catch (e) {}
+
+  // `AbortSignal.any` argument validation, node-exact.
+  //
+  // node's own AbortSignal.any() runs its arguments through the WebIDL
+  // `sequence<AbortSignal>` converter, so a bad argument is an
+  // ERR_INVALID_ARG_TYPE reading "signals[1] is not of type AbortSignal."
+  // (lib/internal/abort_controller.js). The platform AbortSignal throws a plain
+  // TypeError with no `code`. That gap used to be invisible inside the node
+  // corpus for one bad reason: the startup event-target bridge republished
+  // node's AbortSignal as the global there, so node's validation came along
+  // with node's second implementation. With one AbortSignal in the process the
+  // validation has to live on it — same shape as the RegExp diagnostic below:
+  // keep the platform behaviour, normalize only the node-visible diagnostic.
+  try {
+    const AS = G.AbortSignal;
+    if (typeof AS === "function" && typeof AS.any === "function" && !AS.any.__mbunNodeValidated) {
+      const nativeAny = AS.any;
+      const argType = (msg) => { const e = new TypeError(msg); e.code = "ERR_INVALID_ARG_TYPE"; return e; };
+      const anyCompat = function any(signals) {
+        if (signals === null || signals === undefined ||
+            typeof signals[Symbol.iterator] !== "function") {
+          throw argType("signals is not iterable.");
+        }
+        const arr = Array.from(signals);
+        for (let i = 0; i < arr.length; i++) {
+          if (!(arr[i] instanceof AS)) {
+            throw argType("signals[" + i + "] is not of type AbortSignal.");
+          }
+        }
+        return Reflect.apply(nativeAny, this, [arr]);
+      };
+      Object.defineProperty(anyCompat, "name", { value: "any", configurable: true });
+      Object.defineProperty(anyCompat, "length", { value: 1, configurable: true });
+      Object.defineProperty(anyCompat, "__mbunNodeValidated", { value: true });
+      Object.defineProperty(AS, "any", {
+        value: anyCompat, writable: true, configurable: true, enumerable: false,
+      });
+    }
   } catch (e) {}
 
   // JSC's RegExp constructor omits the offending flags from its SyntaxError,

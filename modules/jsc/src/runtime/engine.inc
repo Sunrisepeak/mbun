@@ -263,14 +263,12 @@ public:
         if (auto r{eval_void(js)}; !r) {
             return r;
         }
-        // Node's internal/event_target module loads only after the builtin image
-        // is assembled. Let the node-process partition repair its
-        // NodeEventTarget/Event realm boundary once top-level require exists.
-        if (auto r{eval_void(
-                "if (typeof globalThis.__mbunPatchNodeEventTarget === 'function') "
-                "globalThis.__mbunPatchNodeEventTarget(globalThis.require);")}; !r) {
-            return r;
-        }
+        // (The NodeEventTarget/Event realm repair used to be forced here, by
+        // require()ing node's internal/event_target as soon as top-level
+        // require existed. It is now driven from the module's own identity
+        // suffix in module_loading.inc, so it happens if and only if something
+        // actually loads that module -- see __mbunAdoptNodeEventTarget in
+        // js_builtins:node_process_extra for why the difference matters.)
         // Finish the entry Module from C++: `paths` reuses the loader's own
         // transliteration of Module._nodeModulePaths, and the entry becomes the
         // root of the parent chain so top-level require()s land in
@@ -1131,32 +1129,119 @@ public:
         return out;
     }
 
+    // ── who owns `internal/<x>` ──────────────────────────────────────────────
+    //
+    // `internal/<x>` must name exactly ONE implementation, whoever asks and from
+    // wherever. There are two producers for that name — mbun's builtin table
+    // (`globalThis.__mbunNativeModules`, consulted first by require_impl) and
+    // node's vendored `compat/node/lib` — and the whole class of bug this
+    // registry exists to prevent is the two of them BOTH answering, in different
+    // parts of one process. module_loading.inc documents the symptom side (fresh
+    // `Symbol`s, second module-level caches); this is the resolution side.
+    //
+    // `kMbunOwnedInternalPrefixes` names the ids whose single implementation is
+    // mbun's. For those the vendored `lib` root is never offered — not by the
+    // walk from the requesting file either, so an id on this list resolves the
+    // same way from inside `compat/node` as from anywhere else. That is the
+    // property the previous attempt (b31c36a, reverted in 6ba7466) lacked: it
+    // widened reach without a per-id owner, so widening the reach also widened
+    // the set of ids node answered for, and node's copies started shadowing
+    // mbun's implementations in worker and bun-test processes.
+    //
+    // The one entry, and why it is the whole list:
+    //
+    //   internal/bootstrap/**  — node's per-realm BOOTSTRAP, not a library.
+    //     `internal/bootstrap/realm.js` REASSIGNS `process.binding` and
+    //     `Error.prepareStackTrace` at top level, on load. It is not requested
+    //     directly by anything mbun runs: `internal/util/inspect` pulls it in
+    //     for one symbol (`BuiltinModule`), and inspect is on the transitive
+    //     path of most of `lib/internal/**`. So merely making the vendored tree
+    //     reachable from a bun test was enough to replace mbun's
+    //     `process.binding` — measured: process-binding.test.ts fails with
+    //     "The value of \"err\" is out of range. Received 5". mbun answers this
+    //     id from its builtin table instead (see the `internal/bootstrap/realm`
+    //     shim in js_builtins:node_process_extra), which exports the same
+    //     `BuiltinModule` surface over mbun's own builtin list and mutates
+    //     nothing.
+    //
+    // A new entry belongs here when node's file, merely by being evaluated,
+    // takes over something mbun already owns. A module that only DEFINES a
+    // parallel class does not: that is fixed at the export boundary, next to the
+    // other identity suffixes in module_loading.inc, so node's implementation
+    // still runs and only the identity is unified.
+    static bool internal_module_is_mbun_owned_(std::string_view spec) {
+        return spec.starts_with("internal/bootstrap/");
+    }
+
+    // Append the vendored `lib` root found by walking up from `start`. A
+    // checkout of node itself has `lib/` at its root; mbun vendors the same tree
+    // at `compat/node/lib`, so both spellings are probed at every level.
+    // Returns true once a root was found (or was already present).
+    static bool append_node_lib_root_(std::vector<std::string>& out,
+                                      const std::filesystem::path& start) {
+        std::error_code ec;
+        std::filesystem::path dir{start};
+        if (dir.empty()) return false;
+        if (!dir.is_absolute()) dir = std::filesystem::absolute(dir, ec);
+        if (ec) return false;
+        dir = dir.lexically_normal();
+        for (int depth{0}; depth < 64; ++depth) {
+            for (const std::filesystem::path lib :
+                 {dir / "lib", dir / "compat" / "node" / "lib"}) {
+                ec.clear();
+                if (std::filesystem::is_directory(lib / "internal", ec)) {
+                    const std::string root{lib.lexically_normal().string()};
+                    if (std::ranges::find(out, root) == out.end()) out.emplace_back(root);
+                    return true;
+                }
+            }
+            const std::filesystem::path parent{dir.parent_path()};
+            if (parent == dir || parent.empty()) break;
+            dir = parent;
+        }
+        return false;
+    }
+
     // Node's own `internal/*` modules live under the vendored node source's
     // `lib/` tree, not in a user `node_modules/` directory. The test runner can
     // be launched from a temporary cwd, so the normal cwd-based package walk
     // cannot find them. When an internal request originates from a file in the
     // vendored tree, add that tree's `lib` directory as a resolver root.
+    //
+    // The walk starts at the REQUESTING file, so on its own it only ever
+    // succeeds for code that already lives inside the vendored tree. Everything
+    // else — an mbun builtin bridging to node's lib, a user script, a worker
+    // (a separate process whose entry is elsewhere), a fixture in a temp dir —
+    // got "cannot find package 'internal'" for a module mbun ships, which is why
+    // lanes keep hand-writing stubs beside a complete vendored implementation.
+    // So when the walk from the requesting file finds nothing, retry it from the
+    // entry script, the cwd and the executable.
+    //
+    // Reach is widened for exactly the ids mbun does NOT own; see
+    // internal_module_is_mbun_owned_ above for the gate and why it has to apply
+    // to the requesting-file walk too rather than only to the fallbacks.
     static std::vector<std::string> node_paths_for_(std::string_view spec,
                                                     const std::string& fromDir) {
         std::vector<std::string> out{node_paths_from_env()};
         if (!spec.starts_with("internal/")) return out;
+        if (internal_module_is_mbun_owned_(spec)) return out;
 
+        if (append_node_lib_root_(out, std::filesystem::path{fromDir})) return out;
+
+        // Fallbacks, in the order that keeps the vendored tree of the program
+        // being run ahead of the one next to the binary.
         std::error_code ec;
-        std::filesystem::path dir{fromDir};
-        if (dir.empty()) return out;
-        if (!dir.is_absolute()) dir = std::filesystem::absolute(dir, ec);
-        if (ec) return out;
-        dir = dir.lexically_normal();
-        for (int depth{0}; depth < 64; ++depth) {
-            const std::filesystem::path lib{dir / "lib"};
-            if (std::filesystem::is_directory(lib / "internal", ec)) {
-                const std::string root{lib.lexically_normal().string()};
-                if (std::ranges::find(out, root) == out.end()) out.emplace_back(root);
+        if (gArgv.size() > 1 && !gArgv[1].empty()) {
+            if (append_node_lib_root_(out, std::filesystem::path{gArgv[1]}.parent_path())) {
                 return out;
             }
-            const std::filesystem::path parent{dir.parent_path()};
-            if (parent == dir || parent.empty()) break;
-            dir = parent;
+        }
+        if (const std::filesystem::path cwd{std::filesystem::current_path(ec)};
+            !ec && append_node_lib_root_(out, cwd)) {
+            return out;
+        }
+        if (const std::string exe{exe_path()}; !exe.empty()) {
+            (void)append_node_lib_root_(out, std::filesystem::path{exe}.parent_path());
         }
         return out;
     }

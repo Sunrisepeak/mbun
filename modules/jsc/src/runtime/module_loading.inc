@@ -985,9 +985,50 @@
                               "module.exports.SubtleCrypto = globalThis.SubtleCrypto; "
                               "module.exports.crypto = globalThis.crypto; }\n"}
                 : std::string{}};
+        // AbortController/AbortSignal are runtime-owned (the platform installs
+        // them as globals before any node-internal module loads), and node's
+        // vendored internal/abort_controller declares a SECOND pair on top of
+        // node's own internal/event_target. Whoever holds the second pair loses
+        // every brand check against the first: measured, a bun test asking
+        // util.aborted(signal) for a platform AbortSignal reported
+        // 'The "emitter" argument must be of type EventEmitter or EventTarget.
+        // Received [object AbortSignal]' the moment node's copies became
+        // reachable, because mbun's own event-target bridge had by then
+        // republished node's classes as the globals.
+        //
+        // Every consumer of this module in node's lib (util.js, _http_incoming,
+        // internal/streams/*, internal/webstreams/writablestream,
+        // internal/test_runner/*) destructures nothing but the two public
+        // constructors, so publishing the runtime's pair keeps node's helpers
+        // (aborted, transferableAbortSignal, ClonedAbortSignal) intact while
+        // leaving exactly one AbortSignal in the process. Same shape as the
+        // fs/util/webcrypto suffixes above.
+        // node's NodeEventTarget rejects an Event that is not its OWN Event.
+        // mbun's platform Event is a different class, so hand this module's own
+        // pair to the adopter, which patches NodeEventTarget.prototype
+        // .dispatchEvent to convert at that one boundary. Driven from here, so
+        // it costs nothing in a process that never loads node's event_target --
+        // it used to be a startup require(), which is what put node's second
+        // EventTarget (and, through it, node's AbortSignal) into every process
+        // that could see the vendored tree.
+        const std::string eventTargetIdentitySuffix{
+            spec == "internal/event_target"
+                ? std::string{"\nif (typeof module === \"object\" && module.exports && "
+                              "typeof globalThis.__mbunAdoptNodeEventTarget === \"function\") { "
+                              "globalThis.__mbunAdoptNodeEventTarget(module.exports); }\n"}
+                : std::string{}};
+        const std::string abortIdentitySuffix{
+            spec == "internal/abort_controller"
+                ? std::string{"\nif (typeof module === \"object\" && module.exports && "
+                              "typeof globalThis.AbortController === \"function\" && "
+                              "typeof globalThis.AbortSignal === \"function\") { "
+                              "module.exports.AbortController = globalThis.AbortController; "
+                              "module.exports.AbortSignal = globalThis.AbortSignal; }\n"}
+                : std::string{}};
         std::string wrapper{std::string{tla ? "(async function (" : "(function ("} + params +
                             ") {\n" + strictPrefix + metaPrefix + source + debugEnvSuffix +
-                            fsIdentitySuffix + internalUtilSuffix + webcryptoIdentitySuffix + "\n})"};
+                            fsIdentitySuffix + internalUtilSuffix + webcryptoIdentitySuffix +
+                            eventTargetIdentitySuffix + abortIdentitySuffix + "\n})"};
         // User CommonJS modules run through the mutable Module.wrapper hook.
         // Keep the extended native wrapper for Node internals (which receive
         // primordials/internalBinding parameters), but honour changed user
