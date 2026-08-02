@@ -932,7 +932,25 @@ export constexpr std::string_view kNetJS_part2 = R"JS(
         },
         publish(topic, data, compress) { const WS = G.__mbunWS; return WS ? WS.publish(serverObj, topic, data) : 0; },
         subscriberCount(topic) { const WS = G.__mbunWS; return WS ? WS.subscriberCount(serverObj, topic) : 0; },
-        requestIP() { return { address: "127.0.0.1", family: "IPv4", port: 0 }; },
+        // ref: bun src/runtime/server/mod.rs requestIP → getRemoteSocketInfo.
+        // This is the JS serve path (the one a `tls:` server takes), and it
+        // used to answer with a fixed 127.0.0.1:0 — which made every peer look
+        // like the same connection to anything counting client ports
+        // (regression/issue/27358). The accepted socket is already parked on
+        // the Request, so report its real peer and keep the old placeholder
+        // only when the transport has none.
+        requestIP(req) {
+          const sock = req && req.__mbunSock;
+          const addr = sock && sock.remoteAddress;
+          if (typeof addr !== "string" || addr === "") {
+            return { address: "127.0.0.1", family: "IPv4", port: 0 };
+          }
+          return {
+            address: addr,
+            family: sock.remoteFamily || (addr.indexOf(":") >= 0 ? "IPv6" : "IPv4"),
+            port: sock.remotePort | 0,
+          };
+        },
         timeout() { return serverObj; },
         ref() { return serverObj; },
         unref() { return serverObj; },
@@ -2335,9 +2353,14 @@ export constexpr std::string_view kNetJS_part2 = R"JS(
   // JSStringCreateWithUTF8CString, which stops at the first NUL and would
   // silently truncate this whole JS layer -- leaving the load-only fetch stub
   // ("network requests are not implemented yet") installed instead.
-  const poolKey = (host, port, secure, tlsVerify, tlsCa) =>
+  // `serverName` belongs in the key for the same reason verify+ca do: it is
+  // part of the SSLConfig the socket was handshaked under, so a request that
+  // overrides SNI must not be answered over a connection established without
+  // it (regression/issue/27358, "different custom TLS configs do NOT share
+  // keepalive connections").
+  const poolKey = (host, port, secure, tlsVerify, tlsCa, tlsSni) =>
     host.toLowerCase() + "\u0000" + port + "\u0000" + (secure ? 1 : 0) + "\u0000" +
-    (tlsVerify ? 1 : 0) + "\u0000" + tlsCa;
+    (tlsVerify ? 1 : 0) + "\u0000" + tlsCa + "\u0000" + (tlsSni || "");
 
   const poolClose = (e) => {
     if (e.tls) { try { NN.tlsClose(e.fd); } catch (x) {} }
@@ -2690,6 +2713,7 @@ export constexpr std::string_view kNetJS_part2 = R"JS(
     const tlsVerify = secure && tlsOpt.rejectUnauthorized !== false &&
       !(G.process && G.process.env && G.process.env.NODE_TLS_REJECT_UNAUTHORIZED === "0");
     const tlsCa = secure && tlsOpt.ca ? (Array.isArray(tlsOpt.ca) ? tlsOpt.ca.map((c) => typeof c === "string" ? c : td.decode(u8(c))).join("\n") : (typeof tlsOpt.ca === "string" ? tlsOpt.ca : td.decode(u8(tlsOpt.ca)))) : "";
+    const tlsSni = secure && typeof tlsOpt.serverName === "string" ? tlsOpt.serverName : "";
     let pathq = m[4] || "/";
     if (pathq === "" || pathq[0] !== "/") pathq = "/" + pathq;
     // Collapse a leading run of slashes in the request target to one: a URL
@@ -2754,7 +2778,7 @@ export constexpr std::string_view kNetJS_part2 = R"JS(
       : new G.DOMException("The operation was aborted.", "AbortError");
     if (signal && signal.aborted) return Promise.reject(abortReason());
 
-    const pkey = poolKey(host, port, secure, tlsVerify, tlsCa);
+    const pkey = poolKey(host, port, secure, tlsVerify, tlsCa, tlsSni);
 
     return new Promise((resolve, reject) => {
       let fd;
