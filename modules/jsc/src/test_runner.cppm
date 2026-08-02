@@ -211,6 +211,28 @@ inline constexpr std::string_view HARNESS = R"JS(
     return String(v);
   }
 
+  // Names already recorded in `__snapshots__/<file>.snap`, parsed once per file.
+  // Only the KEYS matter here (the CI guard asks "would this create a new
+  // snapshot?"); value comparison against an existing .snap is still DEFERRED.
+  function existingSnapKeys() {
+    if (S.snapKeys) return S.snapKeys;
+    const keys = new Set();
+    try {
+      if (typeof G.require === "function" && G.__filename) {
+        const fs = G.require("fs"), path = G.require("path");
+        const f = path.join(path.dirname(G.__filename), "__snapshots__", path.basename(G.__filename) + ".snap");
+        if (fs.existsSync(f)) {
+          const src = String(fs.readFileSync(f, "utf8"));
+          const re = /exports\[`((?:[^`\\]|\\.)*)`\]/g;
+          let mm;
+          while ((mm = re.exec(src)) !== null) keys.add(mm[1].replace(/\\([`\\$])/g, "$1"));
+        }
+      }
+    } catch (e) {}
+    S.snapKeys = keys;
+    return keys;
+  }
+
   // Cycle-safe: matcher messages are built eagerly (even on pass), so fmt must
   // never recurse forever on circular structures.
   function fmt(v, seen) {
@@ -550,17 +572,36 @@ inline constexpr std::string_view HARNESS = R"JS(
       // existing .snap is DEFERRED — record-and-pass keeps current semantics for
       // files that already ship a snapshot. (issue: snapshot-tests/new-snapshot)
       toMatchSnapshot() {
+        let snapName = null;
         try {
           const key = S.curLabel || "";
           S.snapCounters = S.snapCounters || {};
           const n = (S.snapCounters[key] = (S.snapCounters[key] || 0) + 1);
-          (S.snapshots || (S.snapshots = [])).push({ key: key + " " + n, value: snapSerialize(received, "") });
+          snapName = key + " " + n;
+          (S.snapshots || (S.snapshots = [])).push({ key: snapName, value: snapSerialize(received, "") });
           S.snapTotal = (S.snapTotal || 0) + 1;   // bun's summary snapshot tally
         } catch (e) {}
+        // CI may not CREATE snapshots — only compare against ones already on
+        // disk (Snapshots.rs `update_snapshots`/is_ci guard). A name absent from
+        // `__snapshots__/<file>.snap` in CI is a hard failure, not a silent
+        // record. ref test/js/bun/test/ci-restrictions.test.ts.
+        if (snapName !== null && __mbunIsCI() && !G.__mbunUpdateSnapshots && !existingSnapKeys().has(snapName)) {
+          check(false, () => "Snapshot creation is disabled in CI environments\n\n" +
+                             "Snapshot name: " + JSON.stringify(snapName) + "\n\n" +
+                             "Received: " + snapSerialize(received, ""));
+        }
         return m;
       },
       toMatchInlineSnapshot(snap) {
-        if (snap === undefined) return m;  // no inline arg → record mode
+        if (snap === undefined) {  // no inline arg → record mode
+          // …which is likewise refused in CI: bun cannot rewrite the source file
+          // there, so an un-filled inline snapshot fails the test.
+          if (__mbunIsCI() && !G.__mbunUpdateSnapshots) {
+            check(false, () => "Inline snapshot creation is disabled in CI environments\n\n" +
+                               "Received: " + snapSerialize(received, ""));
+          }
+          return m;
+        }
         const ser = snapSerialize(received);
         const norm = (s) => String(s).replace(/\r/g, "").trim().split("\n").map((l) => l.trim()).join("\n");
         check(norm(ser) === norm(snap), () => "toMatchInlineSnapshot\n\nExpected: " + fmt(snap) + "\nReceived: " + fmt(ser)); return m;
@@ -874,7 +915,14 @@ inline constexpr std::string_view HARNESS = R"JS(
         else if (typeof x === "number") opts = { timeout: x };
       }
       // bun throws at REGISTRATION when a runnable test has no body (todo/skip may omit it).
-      if (fn === undefined && mode !== "todo" && mode !== "skip") throw new TypeError("test() expects a function");
+      // `.failing` carries its own message — unlike `.todo`, a body is mandatory
+      // there and bun says so explicitly (ScopeFunctions.rs: "test.failing expects
+      // a function as the second argument").
+      if (fn === undefined && mode !== "todo" && mode !== "skip") {
+        throw new TypeError(mode === "failing"
+          ? "test.failing expects a function as the second argument"
+          : "test() expects a function");
+      }
       // `retry` re-runs a FAILING test until it passes; `repeats` re-runs a
       // PASSING one a fixed number of extra times. They are mutually exclusive
       // (bun_test.rs validates the option bag at registration, before the test
@@ -1417,7 +1465,7 @@ inline constexpr std::string_view HARNESS = R"JS(
   function ftClearAll() { ftRequireActive(); FT.queue = []; }
   function ftCount() { ftRequireActive(); return FT.queue.length; }
 
-  const jest = { fn: mock, spyOn: spyOn, mock: (m, f) => { if (typeof m !== "string") throw new TypeError("jest.mock() 1st argument must be a string"); if (typeof f !== "function") throw new TypeError("jest.mock() 2nd argument must be a function"); }, unmock: () => {}, useFakeTimers: (o) => { ftInstall(o); return jest; }, useRealTimers: () => { ftUninstall(); setSystemTime(); return jest; }, setSystemTime: (v) => { setSystemTime(v); return jest; }, restoreAllMocks: () => mock.restoreAllMocks(), clearAllMocks: () => mock.clearAllMocks(), resetAllMocks: () => mock.resetAllMocks(), advanceTimersByTime: (ms) => { ftAdvanceBy(ms); return jest; }, advanceTimersToNextTimer: () => { ftAdvanceToNext(); return jest; }, runAllTimers: () => { ftRunAll(); return jest; }, runOnlyPendingTimers: () => { ftRunPending(); return jest; }, clearAllTimers: () => { ftClearAll(); return jest; }, getTimerCount: () => ftCount(), isFakeTimers: () => FT.on };
+  const jest = { fn: mock, spyOn: spyOn, mock: (m, f) => { if (typeof m !== "string") throw new TypeError("jest.mock() 1st argument must be a string"); if (typeof f !== "function") throw new TypeError("jest.mock() 2nd argument must be a function"); }, unmock: () => {}, setTimeout: (ms) => { const n = Number(ms); S.defaultTimeout = Number.isFinite(n) && n >= 0 ? n : 5000; return jest; }, useFakeTimers: (o) => { ftInstall(o); return jest; }, useRealTimers: () => { ftUninstall(); setSystemTime(); return jest; }, setSystemTime: (v) => { setSystemTime(v); return jest; }, restoreAllMocks: () => mock.restoreAllMocks(), clearAllMocks: () => mock.clearAllMocks(), resetAllMocks: () => mock.resetAllMocks(), advanceTimersByTime: (ms) => { ftAdvanceBy(ms); return jest; }, advanceTimersToNextTimer: () => { ftAdvanceToNext(); return jest; }, runAllTimers: () => { ftRunAll(); return jest; }, runOnlyPendingTimers: () => { ftRunPending(); return jest; }, clearAllTimers: () => { ftClearAll(); return jest; }, getTimerCount: () => ftCount(), isFakeTimers: () => FT.on };
 
   // `vi` is bun:test's vitest-compat surface. It is NOT the same object as `jest`
   // (verified against bun 1.3.14: `vi === jest` is false) and carries its own key
@@ -1460,7 +1508,7 @@ inline constexpr std::string_view HARNESS = R"JS(
   // block, so an `xdescribe` guarding a throwing test failed the file (issue 5228).
   G.__mbunBT = { test, it, describe, xdescribe: describe.skip, xit: test.skip, xtest: test.skip, expect,
                  beforeEach, afterEach, beforeAll, afterAll, onTestFinished, mock, spyOn, jest, vi, expectTypeOf,
-                 setDefaultTimeout: function () {}, setSystemTime: setSystemTime,
+                 setDefaultTimeout: function (ms) { const n = Number(ms); S.defaultTimeout = Number.isFinite(n) && n >= 0 ? n : 5000; }, setSystemTime: setSystemTime,
                  spyOn: spyOn };
   // bun exposes the test globals without an explicit import; mirror onto globalThis.
   // `vi` is deliberately excluded: bun 1.3.14 exports it from bun:test but leaves
@@ -1695,6 +1743,10 @@ inline constexpr std::string_view HARNESS = R"JS(
     // how many the body makes (verified after it settles, below).
     S.assertExpected = null; S.assertHas = false;
     S.curLabel = t.name;  // toMatchSnapshot keys off the test's own name (not the full path)
+    // …and the per-name counter restarts on EVERY attempt: a { retry } / { repeats }
+    // re-run must resolve to the same `<name> 1`, `<name> 2`, … keys as the first
+    // one, not keep counting into snapshots that were never recorded (issue 23705).
+    if (S.snapCounters) delete S.snapCounters[t.name];
     const expectBaseline = S.expectCalls;
     // bun prints thrown (non-assertion) errors as "error: <message>"; assertion
     // failures print the expect() message directly.
@@ -1772,7 +1824,9 @@ inline constexpr std::string_view HARNESS = R"JS(
       // so it rejects unconditionally (bun kills a test at its timeout no
       // matter what it awaits). Default 5000ms = bun's per-test default; the
       // stall detector stays as the fallback for the timer-less window.
-      let tmo = 5000;
+      // jest.setTimeout(ms) moves the per-file default; an explicit per-test
+      // timeout still wins over it (jest/bun both scope setTimeout to the file).
+      let tmo = (typeof S.defaultTimeout === "number") ? S.defaultTimeout : 5000;
       if (t.opts && typeof t.opts.timeout === "number") tmo = t.opts.timeout;
       let timeoutTimer = null;
       const timeoutPromise = new Promise((_, reject) => {
@@ -1854,8 +1908,21 @@ inline constexpr std::string_view HARNESS = R"JS(
       return;
     }
     if (t.mode === "failing") {  // expected-failure test: invert
-      if (failed) { S.pass++; S.out.push("(pass) " + label + " (failing)"); }
-      else { S.fail++; S.out.push("(fail) " + label + " — expected to fail but passed"); }
+      // …except a TIMEOUT, which is not an "expected" failure: bun reports a
+      // timed-out `.failing` test as a plain failure (test-failing.test.ts
+      // "timeouts still count as failures"), with the same caret annotation a
+      // timed-out ordinary test gets.
+      const toF = failed ? /^error: timed out after (\d+)ms$/.exec(msg) : null;
+      if (toF) {
+        S.fail++; S.out.push("(fail) " + label);
+        S.out.push("  ^ this test timed out after " + toF[1] + "ms.");
+      } else if (failed) { S.pass++; S.out.push("(pass) " + label + " (failing)"); }
+      else {
+        // ref bun test_command.rs: a `.failing` test that passed prints the
+        // status line first, then a caret annotation naming the fix.
+        S.fail++; S.out.push("(fail) " + label);
+        S.out.push("  ^ this test is marked as failing but it passed. Remove `.failing` if tested behavior now works");
+      }
       return;
     }
     if (failed) {
@@ -1891,7 +1958,9 @@ inline constexpr std::string_view HARNESS = R"JS(
     S.onFinished = []; S.innerAfterAll = []; S.inTest = false; S.inConcurrent = false;
     S.todoDepth = 0;   // a describe.todo left open by a throwing body
     S.sysTime = null;  // a file's fake system time must not leak into the next
+    S.defaultTimeout = 5000;  // …nor a jest.setTimeout() the previous file set
     S.snapshots = []; S.snapCounters = {}; S.curLabel = "";  // snapshot state is per-file
+    S.snapKeys = null;                                       // …including the parsed .snap keys
     S.snapTotal = 0; S.snapAdded = 0;                        // …including its tallies
     G.__mbun_describe_pending = 0;  // async describe bodies of the previous file
     ftUninstall();     // a file's fake timers must not leak into the next either
@@ -1905,6 +1974,7 @@ inline constexpr std::string_view HARNESS = R"JS(
   function flushSnapshots() {
     try {
       if (!S.snapshots || !S.snapshots.length) return;
+      if (__mbunIsCI() && !G.__mbunUpdateSnapshots) return;   // CI never creates a .snap without -u (see toMatchSnapshot)
       if (typeof G.require !== "function" || !G.__filename) return;
       const fs = G.require("fs"), path = G.require("path");
       const snapDir = path.join(path.dirname(G.__filename), "__snapshots__");
@@ -2195,6 +2265,11 @@ RunResult run_source(std::string_view js_source, std::string_view dir = ".", boo
     // 1b. runner flags: --todo makes todo tests run (pass → fail, fail → todo).
     rt::eval(detail::has_cli_flag("--todo") ? "globalThis.__mbunRunTodo=true;"
                                             : "globalThis.__mbunRunTodo=false;");
+    // 1b2. -u/--update-snapshots: the explicit opt-in that lifts the CI ban on
+    //      creating/rewriting snapshots (Snapshots.rs `update_snapshots`).
+    rt::eval((detail::has_cli_flag("--update-snapshots") || detail::has_cli_flag("-u"))
+                 ? "globalThis.__mbunUpdateSnapshots=true;"
+                 : "globalThis.__mbunUpdateSnapshots=false;");
     // 1c. --randomize/--seed: hand the harness this file's shuffle seed as a
     //     decimal string (u64 exceeds JS number precision; the harness BigInt's it).
     rt::eval(test_seed ? std::format("globalThis.__mbunTestSeed=\"{}\";", *test_seed)

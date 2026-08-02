@@ -1191,6 +1191,11 @@ int run_test(std::span<const std::string_view> args,
         // all — not even its path header (test_command.rs:1340 gates the header
         // on the reporter, and only-failures suppresses it).
         if (!flags.onlyFailures || !body.empty()) {
+            // bun separates each file block with a blank line — including the
+            // first one, so stderr opens with "\n" right under the stdout banner
+            // (test_command.rs printFileHeader). Snapshot suites that diff raw
+            // stderr (test-failing.test.ts) depend on that leading newline.
+            std::println(std::cerr, "");
             std::println(std::cerr, "{}:", title);
             if (!body.empty()) std::println(std::cerr, "{}", body);
         }
