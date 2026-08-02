@@ -419,14 +419,19 @@ int main() {
     {
         MemoryFs configFs;
         configFs.add_file("/config/invalid.json", "{ invalid");
+        configFs.add_file("/config/trailing.json", "{\"compilerOptions\":{}} invalid");
         auto missing{load_tsconfig_override(configFs.make(), "/config/missing.json")};
         check(!missing.config.has_value(), "missing explicit tsconfig does not parse as null success");
         check(missing.error == "Cannot find tsconfig file \"/config/missing.json\"",
               "missing explicit tsconfig diagnostic");
         auto invalid{load_tsconfig_override(configFs.make(), "/config/invalid.json")};
         check(!invalid.config.has_value(), "invalid explicit tsconfig does not parse as null success");
-        check(invalid.error == "Cannot parse tsconfig file \"/config/invalid.json\"",
+        check(invalid.error == "Expected string but found \"invalid\"\n    at /config/invalid.json:1:3",
               "invalid explicit tsconfig diagnostic");
+        auto trailing{load_tsconfig_override(configFs.make(), "/config/trailing.json")};
+        check(!trailing.config.has_value(), "trailing token does not parse as explicit tsconfig success");
+        check(trailing.error == "Expected end of file but found \"invalid\"\n    at /config/trailing.json:1:24",
+              "trailing token explicit tsconfig diagnostic");
     }
 
     // ============ "browser" main-field override ============

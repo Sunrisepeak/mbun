@@ -1649,7 +1649,8 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
       // after process.chdir() would resolve against the wrong cwd. Pass the
       // normalized parse-time value out of band only when execArgv is inherited;
       // child startup consumes and erases this key before process.env exists.
-      if (options.execArgv === undefined && typeof proc.__mbunTsconfigOverride === "string" &&
+      const inheritsExecArgv = options.execArgv == null;
+      if (inheritsExecArgv && typeof proc.__mbunTsconfigOverride === "string" &&
           proc.__mbunTsconfigOverride !== "") {
         env.MBUN_INTERNAL_TSCONFIG_OVERRIDE = proc.__mbunTsconfigOverride;
       }
@@ -1673,8 +1674,8 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
         }
         return out;
       };
-      const execArgv = stripEval(Array.isArray(options.execArgv) ? options.execArgv.map(String)
-                                                                 : ((proc.execArgv || []).map(String)));
+      const execArgv = stripEval(inheritsExecArgv ? ((proc.execArgv || []).map(String))
+                                                  : options.execArgv.map(String));
       const argv = Array.isArray(options.argv) ? options.argv.map(String) : [];
       const child = CPM.spawn(String(proc.execPath || "mbun"),
                               execArgv.concat([entry], argv),
