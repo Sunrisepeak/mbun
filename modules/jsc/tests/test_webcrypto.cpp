@@ -51,6 +51,21 @@ int main() {
     expect_number("__webcryptoHmacResult", 1, "HMAC known answer and verification");
 
     expect_number(
+        "globalThis.__webcryptoNodeBridge=0;"
+        "(async()=>{try{"
+        "const {createHmac,KeyObject}=require('node:crypto');"
+        "const key=await crypto.subtle.generateKey({name:'HMAC',hash:'SHA-256'},true,['sign']);"
+        "const object=KeyObject.from(key);"
+        "const data=new TextEncoder().encode('payload');"
+        "const direct=createHmac('sha256',key).update(data).digest('hex');"
+        "const bridged=createHmac('sha256',object).update(data).digest('hex');"
+        "__webcryptoNodeBridge=direct===bridged?1:-1;"
+        "}catch(e){__webcryptoNodeBridge=-2;}})();0",
+        0, "schedule node:crypto CryptoKey bridge");
+    expect_number("__webcryptoNodeBridge", 1,
+                  "node:crypto accepts a branded WebCrypto CryptoKey");
+
+    expect_number(
         "globalThis.__webcryptoRawAttack=0;"
         "(async()=>{try{"
         "const key=await crypto.subtle.importKey('raw',new Uint8Array([1,2,3]),"

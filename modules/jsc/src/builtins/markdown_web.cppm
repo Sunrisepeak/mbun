@@ -765,6 +765,16 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
       if (ArrayBuffer.isView(data)) return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
       if (data instanceof ArrayBuffer) return new Uint8Array(data);
       if (typeof SharedArrayBuffer !== "undefined" && data instanceof SharedArrayBuffer) return new Uint8Array(data);
+      // Legacy node:crypto accepts a branded WebCrypto CryptoKey. Its bytes
+      // live in webcrypto's hidden metadata, not in public getters or own
+      // properties; reading `type`/`export` here would either be forgeable or
+      // miss the key entirely after the CryptoKey prototype is patched.
+      if (data && typeof data === "object" &&
+          typeof G.__mbunIsCryptoKey === "function" && G.__mbunIsCryptoKey(data) &&
+          typeof G.__mbunCryptoKeyToKeyObject === "function") {
+        const transfer = G.__mbunCryptoKeyToKeyObject(data);
+        if (transfer && transfer.kind === "secret") return toBytes(transfer.material);
+      }
       if (data && data.type === "secret" && typeof data.export === "function") return toBytes(data.export());
       return te.encode(String(data));
     };
