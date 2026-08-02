@@ -536,23 +536,72 @@ private:
     HandleScopeRec* m_rec{nullptr};
 };
 
-// Drain the deferred (GC-time) finalizer queue. Only called from event-loop
-// pump points / env cleanup — never from inside GC.
+// A finalizer is a new callback boundary. A VM exception that JS already
+// caught can still be visible through the top exception scope when the native
+// pump starts; letting NAPI_PREAMBLE observe it makes the finalizer's first API
+// call fail with napi_pending_exception. Start clean, like bun's Finalizer::run
+// entering from an event-loop task rather than from the previous addon call.
+inline void prepareFinalizerCallback(napi_env env) {
+    if (env == nullptr) return;
+    auto catcher = DECLARE_TOP_EXCEPTION_SCOPE(env->vm());
+    catcher.clearException();
+    env->clearPendingException();
+}
+
+// Hand an error raised by a finalizer to the same process-level uncaught path
+// used by timer/I/O callbacks. That path offers process capture/listeners first
+// and arms Runtime's fatal channel only when nobody claims the error.
+inline void dispatchFinalizerException(napi_env env, JSC::JSValue error) {
+    if (env == nullptr || error.isEmpty()) return;
+    JSC::JSGlobalObject* globalObject{env->globalObject()};
+    JSContextRef ctx{toRef(globalObject)};
+    JSObjectRef global{JSContextGetGlobalObject(ctx)};
+    JSStringRef name{JSStringCreateWithUTF8CString("__mbun_uncaught")};
+    JSValueRef lookupException{nullptr};
+    JSValueRef candidate{JSObjectGetProperty(ctx, global, name, &lookupException)};
+    JSStringRelease(name);
+    if (lookupException != nullptr || candidate == nullptr ||
+        !JSValueIsObject(ctx, candidate)) {
+        return;
+    }
+    JSObjectRef handler{JSValueToObject(ctx, candidate, nullptr)};
+    if (handler == nullptr || !JSObjectIsFunction(ctx, handler)) return;
+    JSValueRef argument{toRef(globalObject, error)};
+    JSValueRef dispatchException{nullptr};
+    JSObjectCallAsFunction(ctx, handler, nullptr, 1, &argument, &dispatchException);
+}
+
+inline void dispatchFinalizerExceptions(napi_env env) {
+    if (env == nullptr) return;
+    JSC::VM& vm{env->vm()};
+    auto catcher = DECLARE_TOP_EXCEPTION_SCOPE(vm);
+    JSC::Strong<JSC::Unknown> vmException;
+    if (JSC::Exception* exception{catcher.exception()}) {
+        vmException.set(vm, exception->value());
+        catcher.clearException();
+    }
+    JSC::Strong<JSC::Unknown> napiException;
+    if (env->hasPendingException()) {
+        napiException.set(vm, env->pendingException());
+        env->clearPendingException();
+    }
+    if (vmException) dispatchFinalizerException(env, vmException.get());
+    if (napiException) dispatchFinalizerException(env, napiException.get());
+}
+
+// Drain the deferred (GC-time) finalizer task queue. Only called from
+// event-loop pump points / env cleanup — never from inside GC.
 inline void drainPendingFinalizers() {
     auto& state = NapiState::singleton();
     while (!state.pendingFinalizers.empty()) {
         std::vector<PendingFinalizer> batch = std::move(state.pendingFinalizers);
         state.pendingFinalizers.clear();
         for (const PendingFinalizer& fin : batch) {
+            JSC::JSLockHolder locker{fin.env->vm()};
             ScopedHandleScope scope;
+            prepareFinalizerCallback(fin.env);
             fin.cb(fin.env, fin.data, fin.hint);
-            // each finalizer starts from a clean exception state (napi.h
-            // clearExceptionsBetweenFinalizers; Node never chains them)
-            if (fin.env) {
-                auto catcher = DECLARE_TOP_EXCEPTION_SCOPE(fin.env->vm());
-                catcher.clearException();
-                fin.env->clearPendingException();
-            }
+            dispatchFinalizerExceptions(fin.env);
         }
     }
 }
