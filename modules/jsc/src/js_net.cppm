@@ -893,22 +893,33 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
         host !== "localhost" && host !== "" && host !== "*";
       if (!unixPath && ((_blockList && _famOf(host)) || _lookup || _needsDns)) {
         const failWith = (err) => { self.connecting = false; G.queueMicrotask(() => { self.emit("error", err); self.destroy(); }); return self; };
+        // node's autoSelectFamilyAttemptTimeout, forwarded to the native connect
+        // so a global v6 literal that black-holes fails the ATTEMPT rather than
+        // the whole test.
+        const _attemptTimeout = (optArg && optArg.autoSelectFamilyAttemptTimeout > 0)
+          ? (optArg.autoSelectFamilyAttemptTimeout | 0) : autoSelectFamilyAttemptTimeoutDefault;
         const dialResolved = (addr, fam) => {
           if (fam !== 4 && fam !== 6) { const e = mkErr("Invalid address family: " + fam + " " + host + ":" + port, "ERR_INVALID_ADDRESS_FAMILY"); e.host = host; e.port = port; return failWith(e); }
           if (_blockList && _blockList.check(addr, fam === 6 ? "ipv6" : "ipv4")) return failWith(mkErr("IP is blocked by net.BlockList", "ERR_IP_BLOCKED"));
-          // The reactor's IPv4 fallback is only for an explicitly enabled
-          // Happy-Eyeballs attempt. A disabled family selector must surface the
-          // IPv6 connection failure rather than reaching an IPv4-only server.
-          // The reactor's loopback transport is IPv4-backed. An explicitly
-          // requested IPv6 family still needs the same local-loopback bridge
-          // as the happy-eyeballs path; this does not enable fallback for an
-          // otherwise disabled family selector.
-          const dh = (_autoSelectFamily || (optArg && optArg.family === 6))
-              && (addr === "::1" || addr === "::" || addr === "::0")
+          // A RESOLVED address is dialled exactly as resolved — no v4 loopback
+          // bridge. node does not have one here, and the corpus depends on not
+          // having one: with autoSelectFamily disabled and a lookup that answers
+          // "::1" first, `connect ECONNREFUSED ::1:<port>` IS the expected
+          // outcome even though a v4 server is listening on that port
+          // (test-net-autoselectfamily, "the option can be disabled"). The
+          // bridge belongs only on the legacy fast path below, where the address
+          // came from a v4-backed server.address() rather than from a resolver.
+          const dh = (optArg && optArg.family === 6) && (addr === "::" || addr === "::0")
             ? "127.0.0.1" : addr;
           let fd2;
           try { fd2 = NN.connect(dh, port, _localAddr, _localPort); }
           catch (e) { self.connecting = false; const err = connectError(e, addr, port); G.queueMicrotask(() => { if (self.destroyed) return; self.emit("error", err); self.destroy(); }); return self; }
+          return _adoptDialed(fd2, addr, fam, dh !== addr);
+        };
+        // Everything after a successful connect(2), shared by the single-address
+        // path above and the Happy Eyeballs loop below (which has already spent
+        // its descriptor and must not dial a second time to reuse this).
+        const _adoptDialed = (fd2, addr, fam, remapped) => {
           self._adopt(fd2); _adoptLocal(self, fd2);
           // _adopt owns the descriptor immediately, but public Socket#pending
           // remains true until the connect event is published.
@@ -923,7 +934,7 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
             }
             if (self.destroyed) { self.connecting = false; return; }
             self.pending = false; self.connecting = false;
-            adoptClientPeer(self, fd2, addr, fam === 6 ? "IPv6" : "IPv4", port, null, dh !== addr);
+            adoptClientPeer(self, fd2, addr, fam === 6 ? "IPv6" : "IPv4", port, null, remapped);
             self._flushPreConnect(null); self._applyDeferredSockOpts();
             // Bytes held back by the `connecting` guard in _flush go out now.
             self._flush();
@@ -932,6 +943,53 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
           };
           G.queueMicrotask(finishConnect);
           return self;
+        };
+        // node net.js lookupAndConnectMultiple (Happy Eyeballs, RFC 8305).
+        // Dedupe within each family preserving answer order, put the family of
+        // the FIRST answer in front, interleave the two buckets, then attempt
+        // them in that order. Every attempt is recorded on
+        // socket.autoSelectFamilyAttemptedAddresses whether it succeeded or not,
+        // and exhausting the list is an AggregateError carrying one error per
+        // attempt — not the last failure.
+        const dialMultiple = (list) => {
+          const bucket = { 4: [], 6: [] };
+          let firstFam = 0;
+          for (let i = 0; i < list.length; i++) {
+            const a = list[i];
+            const ip = a && a.address;
+            if (typeof ip !== "string") continue;
+            const f = (a.family === 4 || a.family === 6) ? a.family : _famOf(ip);
+            if (f !== 4 && f !== 6) continue;
+            if (!firstFam) firstFam = f;
+            if (bucket[f].indexOf(ip) !== -1) continue;
+            bucket[f].push(ip);
+          }
+          const primary = firstFam === 4 ? bucket[4] : bucket[6];
+          const secondary = firstFam === 4 ? bucket[6] : bucket[4];
+          const order = [];
+          for (let i = 0; i < Math.max(primary.length, secondary.length); i++) {
+            if (i < primary.length) order.push(primary[i]);
+            if (i < secondary.length) order.push(secondary[i]);
+          }
+          if (!order.length) { const e = mkErr("getaddrinfo ENOTFOUND " + host, "ENOTFOUND"); e.host = host; e.port = port; return failWith(e); }
+          const attempted = [];
+          const errors = [];
+          self.autoSelectFamilyAttemptedAddresses = attempted;
+          for (let i = 0; i < order.length; i++) {
+            const ip = order[i];
+            const f = _famOf(ip);
+            attempted.push(ip + ":" + port);
+            if (_blockList && _blockList.check(ip, f === 6 ? "ipv6" : "ipv4")) {
+              errors.push(mkErr("IP is blocked by net.BlockList", "ERR_IP_BLOCKED"));
+              continue;
+            }
+            let fdA;
+            try { fdA = NN.connect(ip, port, _localAddr, _localPort, _attemptTimeout); }
+            catch (e) { errors.push(connectError(e, ip, port)); continue; }
+            return _adoptDialed(fdA, ip, f, false);
+          }
+          const AggErr = G.AggregateError;
+          return failWith(AggErr ? new AggErr(errors, "") : (errors[errors.length - 1] || mkErr("connect failed", "ECONNREFUSED")));
         };
         const hf = _famOf(host);
         if (hf) return dialResolved(host, hf);
@@ -956,6 +1014,7 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
             // ERR_INVALID_IP_ADDRESS.
             if (lopts.all && Array.isArray(address)) {
               if (!address.length) { const e = mkErr("getaddrinfo ENOTFOUND " + host, "ENOTFOUND"); e.host = host; e.port = port; return failWith(e); }
+              if (_autoSelectFamily) return dialMultiple(address);
               return dialResolved(address[0].address, address[0].family);
             }
             if (typeof address !== "string" || !_famOf(address)) {
@@ -970,7 +1029,14 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
       // The reactor's native connect is IPv4 (net.inc net_parse_addr); an IPv6
       // loopback/wildcard (as reported by an IPv6-defaulted server.address())
       // dials the v4 loopback, which the v4-mapped INADDR_ANY listener accepts.
-      const dialHost = (host === "::1" || host === "::" || host === "::0") ? "127.0.0.1" : host;
+      // "::1" is now dialled for real (netn_connect_cb grew an AF_INET6 branch),
+      // with the v4 loopback kept as a FALLBACK rather than a rewrite: a server
+      // that took the default `listen(0)` path is still an AF_INET INADDR_ANY
+      // socket, which no AF_INET6 peer can reach, so the old mapping has to stay
+      // reachable — it just must not pre-empt a listener that really is on ::1.
+      // "::"/"::0" keep going straight to the v4 wildcard (net_parse_addr6
+      // declines them) because as a destination that is all they ever meant.
+      let dialHost = (host === "::" || host === "::0") ? "127.0.0.1" : host;
       // The transport remains IPv4-backed for this legacy fast path, but an
       // explicit IPv6 family still has a logical peer address that callers must
       // observe. Keep the wire path stable while preserving Node's address
@@ -1017,7 +1083,16 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
       // Same as the listen path: the native connect re-addresses an over-long
       // path through a directory fd, so no JS-side length gate here either.
       try { fd = unixPath ? NN.connectUnix(unixPath) : NN.connect(dialHost, port, _localAddr, _localPort); }
-      catch (e) { this.connecting = false; const err = connectError(e, unixPath || host, unixPath ? undefined : port); G.queueMicrotask(() => { if (this.destroyed) return; this.emit("error", err); this.destroy(); }); return this; }
+      catch (e) {
+        let recovered = false;
+        if (dialHost === "::1") {
+          // Nothing on the v6 loopback: the listener is one of the v4-backed
+          // ones described above. Retry there before reporting a failure.
+          try { fd = NN.connect("127.0.0.1", port, _localAddr, _localPort); dialHost = "127.0.0.1"; recovered = true; }
+          catch (e2) {}
+        }
+        if (!recovered) { this.connecting = false; const err = connectError(e, unixPath || host, unixPath ? undefined : port); G.queueMicrotask(() => { if (this.destroyed) return; this.emit("error", err); this.destroy(); }); return this; }
+      }
       this._adopt(fd);
       if (!unixPath) _adoptLocal(this, fd);
       // node reports `connecting === true` from the moment connect() returns
@@ -2475,7 +2550,17 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
       // the Bun.serve ":: default" convention already used above.
       if (host == null) host = "::";
       const isV6 = host.indexOf(":") !== -1;
-      const bindHost = host === "::1" && !this._ipv6Only ? "127.0.0.1" : host;  // v6 loopback → v4 bind
+      // `listen(port, "::1")` binds the v6 loopback for real. It used to be
+      // rewritten to a 127.0.0.1 bind because the reactor's connect(2) was
+      // AF_INET-only and nothing could have dialled an AF_INET6 listener; now
+      // that netn_connect_cb has a v6 branch the rewrite is not only
+      // unnecessary, it is wrong. node's dual-stack idiom — bind 127.0.0.1:0,
+      // then bind [::1] on the SAME port — is two distinct addresses, but the
+      // rewrite turned the second bind into a second 127.0.0.1:p and it failed
+      // EADDRINUSE. That is what killed the whole autoselectfamily family
+      // (test-{net,http,https}-autoselectfamily*) before either of them reached
+      // the algorithm they were written to test.
+      const bindHost = host;
       if (cb) this.once("listening", cb);
       let lh;
       try { lh = NN.listen(bindHost, port, !!this._reusePort, !!this._ipv6Only); }
