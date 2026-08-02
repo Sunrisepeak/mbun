@@ -14,13 +14,40 @@ void expect(bool condition, std::string_view message) {
     }
 }
 
+// The pinned Bun harness is located from THIS file, not from the working
+// directory. `mcpp test` runs a member's tests with the cwd set to the member
+// directory, so the previous `process.cwd() + "/compat/..."` only resolved when
+// the suite happened to be launched from the repo root -- everywhere else
+// realpathSync raised ENOENT on `<member>/compat` and killed the whole eval
+// before any HTTP/2 assertion ran. test_runtime_structure.cpp already locates
+// its inputs this way.
+std::string harness_source_path() {
+    const auto testFile { std::filesystem::path { __FILE__ } };
+    const auto repoRoot { testFile.parent_path()   // tests
+                              .parent_path()       // jsc
+                              .parent_path()       // modules
+                              .parent_path() };    // repo root
+    return (repoRoot / "compat" / "bun" / "test" / "harness.ts").string();
+}
+
+// The path as a JS string literal, prepended to the eval so the script can use
+// it without depending on the process working directory.
+std::string harness_path_decl() {
+    std::string quoted;
+    for (const char c : harness_source_path()) {
+        if (c == '\\' || c == '"') quoted.push_back('\\');
+        quoted.push_back(c);
+    }
+    return "globalThis.__h2HarnessPath = \"" + quoted + "\";\n";
+}
+
 }  // namespace
 
 int main() {
 #if !defined(_WIN32)
     using namespace mbun::jsc::runtime;
 
-    auto setup { eval(R"MJS(
+    auto setup { eval(harness_path_decl() + R"MJS(
       globalThis.__h2SecurityDone = 0;
       globalThis.__h2SecurityResult = "";
       globalThis.__h2SecurityError = "";
@@ -28,7 +55,7 @@ int main() {
         try {
           const http2 = require("node:http2");
           const fs = require("node:fs");
-          const harnessPath = fs.realpathSync(process.cwd() + "/compat/bun/test/harness.ts");
+          const harnessPath = fs.realpathSync(globalThis.__h2HarnessPath);
           const harness = fs.readFileSync(harnessPath, "utf8");
           const tlsBlock = harness.slice(harness.indexOf("export const tls"), harness.indexOf("export const invalidTls"));
           const tls = {
@@ -143,7 +170,7 @@ int main() {
                "HTTP2 redirect and TLS policies are enforced (got '" + result.value_or("<eval failed>") + "')");
     }
 
-    auto streamingSetup { eval(R"MJS(
+    auto streamingSetup { eval(harness_path_decl() + R"MJS(
       globalThis.__h2StreamingDone = 0;
       globalThis.__h2StreamingResult = "";
       globalThis.__h2StreamingError = "";
@@ -152,7 +179,7 @@ int main() {
           const http2 = require("node:http2");
           const fs = require("node:fs");
           const zlib = require("node:zlib");
-          const harnessPath = fs.realpathSync(process.cwd() + "/compat/bun/test/harness.ts");
+          const harnessPath = fs.realpathSync(globalThis.__h2HarnessPath);
           const harness = fs.readFileSync(harnessPath, "utf8");
           const tlsBlock = harness.slice(harness.indexOf("export const tls"), harness.indexOf("export const invalidTls"));
           const tls = {
