@@ -1382,3 +1382,13 @@ JSValueRef http_get_user_agent_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, st
     if (gUserAgent.empty()) return JSValueMakeUndefined(ctx);
     return make_string(ctx, gUserAgent);
 }
+
+// `--fetch-preconnect <URL>` list, in argv order (empty array when absent).
+// The JS side (kNetJS fetch.preconnect installer) dials each one at startup.
+JSValueRef http_get_preconnect_urls_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_t,
+                                       const JSValueRef[], JSValueRef*) {
+    std::vector<JSValueRef> elems{};
+    elems.reserve(gFetchPreconnect.size());
+    for (const std::string& u : gFetchPreconnect) elems.push_back(make_string(ctx, u));
+    return JSObjectMakeArray(ctx, elems.size(), elems.empty() ? nullptr : elems.data(), nullptr);
+}

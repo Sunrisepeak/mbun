@@ -322,6 +322,12 @@ int main(int argc, char* argv[]) {
             args.erase(args.begin(), args.begin() + static_cast<std::ptrdiff_t>(n));
             continue;
         }
+        if (const std::size_t n{take_valued_flag(args, 0, "--fetch-preconnect",
+                                                 mbun::jsc::runtime::add_fetch_preconnect)};
+            n > 0) {
+            args.erase(args.begin(), args.begin() + static_cast<std::ptrdiff_t>(n));
+            continue;
+        }
         if (const std::size_t n{
                 mbun::cli::take_tsconfig_override(args, 0, globalTsconfig)};
             n > 0) {
@@ -504,6 +510,13 @@ int main(int argc, char* argv[]) {
                 }
                 if (const std::size_t n{take_valued_flag(args, i, "--user-agent",
                                                          mbun::jsc::runtime::set_user_agent)};
+                    n > 0) {
+                    args.erase(args.begin() + static_cast<std::ptrdiff_t>(i),
+                               args.begin() + static_cast<std::ptrdiff_t>(i + n));
+                    continue;
+                }
+                if (const std::size_t n{take_valued_flag(args, i, "--fetch-preconnect",
+                                                         mbun::jsc::runtime::add_fetch_preconnect)};
                     n > 0) {
                     args.erase(args.begin() + static_cast<std::ptrdiff_t>(i),
                                args.begin() + static_cast<std::ptrdiff_t>(i + n));

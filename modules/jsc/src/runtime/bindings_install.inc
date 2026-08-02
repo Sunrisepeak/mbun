@@ -994,6 +994,7 @@
         set_fn(ctx_, htn, "getMaxHeaderSize", http_get_max_header_size_cb);
         set_fn(ctx_, htn, "setMaxHeaderSize", http_set_max_header_size_cb);
         set_fn(ctx_, htn, "userAgent", http_get_user_agent_cb);
+        set_fn(ctx_, htn, "preconnectUrls", http_get_preconnect_urls_cb);
         set_prop(ctx_, global, "__mbunHttpNative", htn);
         // CAP-S3: AWS SigV4 signing for Bun.S3Client (builtins/s3.cppm calls
         // __mbunS3Native.sign; algorithm is mbun.s3_signing, crypto is mbun.crypto).
