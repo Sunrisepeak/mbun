@@ -175,6 +175,12 @@ inline constexpr std::string_view kNodeProcessLifecycleJS = R"JS(
       if (!p._exiting) {
         const capture = p._mbunUncaughtCaptureCallback;
         if (typeof capture === "function") { capture(err); return true; }
+        // node:repl's router (see node_repl setupExceptionCapture). It is a
+        // capture callback, not a listener, so a closed REPL leaves no
+        // listener behind; returning false means the REPL declined the error
+        // and the user's own listeners still get it.
+        const replCapture = G.__mbunReplUncaughtCapture;
+        if (typeof replCapture === "function" && replCapture(err) === true) return true;
         if (listeners("uncaughtException") > 0) {
           p.emit("uncaughtException", err, "uncaughtException");
           return true;

@@ -1948,6 +1948,9 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
         try {
           const cap = p && p._mbunUncaughtCaptureCallback;
           if (typeof cap === "function") { cap(err); return true; }
+          // node:repl's capture callback — not an 'uncaughtException' listener.
+          const replCapture = G.__mbunReplUncaughtCapture;
+          if (typeof replCapture === "function" && replCapture(err) === true) return true;
           if (p && typeof p.listenerCount === "function" && p.listenerCount("uncaughtException") > 0) {
             p.emit("uncaughtException", err, origin || "uncaughtException");
             return true;
