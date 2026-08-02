@@ -1697,16 +1697,49 @@ inline constexpr std::string_view HARNESS = R"JS(
         // the body returned no promise, treat the body as complete — otherwise an
         // arity-1 test that never calls done would hang the whole file.
         bodyPromise = new Promise((resolve, reject) => {
-          let settled = false;
-          const done = (err) => { if (settled) return; settled = true; if (err) reject(err instanceof Error ? err : new Error(String(err))); else resolve(); };
-          let r; try { r = t.fn(done); } catch (e) { done(e); return; }
-          if (r && typeof r.then === "function") { r.then(() => done(), (e) => done(e)); return; }
+          let completed = false, doneCalled = false, bodyReturned = false;
+          let promiseSettled = true;
+          const fail = (err) => {
+            if (completed) return;
+            completed = true;
+            reject(err instanceof Error ? err : new Error(String(err)));
+          };
+          const maybeResolve = () => {
+            if (!completed && bodyReturned && doneCalled && promiseSettled) {
+              completed = true;
+              resolve();
+            }
+          };
+          const done = (err) => {
+            if (doneCalled || completed) return;
+            doneCalled = true;
+            if (err) fail(err);
+            else maybeResolve();
+          };
+          let r;
+          try { r = t.fn(done); }
+          catch (e) { fail(e); return; }
+          bodyReturned = true;
+          if (r && typeof r.then === "function") {
+            promiseSettled = false;
+            r.then(() => { promiseSettled = true; maybeResolve(); }, fail);
+            maybeResolve();
+            return;
+          }
+          maybeResolve();
+          if (completed) return;
           // Body returned synchronously without a promise. Give the pending
           // done() every queue it could be sitting in (see awaitDone); if it
           // still hasn't fired AND no timer is pending (which could call done via
           // the runner's timer pump), treat it as complete (arity-1 arg that
           // isn't a done callback). If timers ARE pending, wait for them.
-          (async () => { await awaitDone(() => settled); if (!settled && (!G.__mbunTimers || G.__mbunTimers.q.length === 0)) { settled = true; resolve(); } })();
+          (async () => {
+            await awaitDone(() => doneCalled || completed);
+            if (!doneCalled && !completed && (!G.__mbunTimers || G.__mbunTimers.q.length === 0)) {
+              doneCalled = true;
+              maybeResolve();
+            }
+          })();
         });
       } else {
         bodyPromise = Promise.resolve().then(() => { const r = t.fn(); return (r && typeof r.then === "function") ? r : undefined; });

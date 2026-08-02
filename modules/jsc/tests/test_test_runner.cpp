@@ -195,6 +195,24 @@ int main() {
         expect(r.ok && r.pass == 1 && r.fail == 0, "I: unref'd interval doesn't wedge the run");
     }
 
+    // Scenario J — a done-style body may also return a Promise. Calling done()
+    // does not hide a later rejection from that Promise (regression: one shared
+    // settlement guard made this a false pass).
+    {
+        RunResult r{run_source(
+            "import { test } from \"bun:test\";\n"
+            "test('done then reject', async (done) => {\n"
+            "  done();\n"
+            "  await Promise.resolve();\n"
+            "  throw new Error('late rejection');\n"
+            "});\n")};
+        expect(r.ok, "J: run_source completes");
+        expect_eq(r.pass, 0, "J: done does not hide returned Promise rejection");
+        expect_eq(r.fail, 1, "J: returned Promise rejection fails the test");
+        expect(r.body.find("late rejection") != std::string::npos,
+               "J: returned Promise rejection is reported");
+    }
+
     if (gFailed > 0) {
         std::println("test_test_runner: {} failed", gFailed);
         return 1;
