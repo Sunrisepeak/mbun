@@ -390,7 +390,17 @@ inline constexpr std::string_view kMarkdownWebJS = R"JS(  // ---------------- Em
         const stdout = meth === "log" || meth === "info" || meth === "debug";
         const target = stdout ? con._stdout : con._stderr;
         const standard = G.process && (stdout ? G.process.stdout : G.process.stderr);
-        if (target && target !== standard && typeof target.write === "function") {
+        // ...and skip it when the standard stream's own write has been
+        // REPLACED, even though the target still IS that stream. A worker's
+        // process.stdout.write does not reach fd 1 at all: it sends the write to
+        // the parent as one IPC frame, because that is the only way the chunk
+        // boundary node's worker stdio guarantees can survive a pipe. The native
+        // path writes the fd directly and would slip past the replacement, so a
+        // worker's console.log arrived in the parent coalesced with whatever
+        // followed it (test-worker-message-port-drain).
+        const framedStd = standard != null && typeof standard.write === "function" &&
+                          standard.write.__mbunFramed === true;
+        if (target && typeof target.write === "function" && (target !== standard || framedStd)) {
           target.write(text + "\n");
           return;
         }

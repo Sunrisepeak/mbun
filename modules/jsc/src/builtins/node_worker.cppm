@@ -1230,6 +1230,7 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
   const pathM = M["path"] || M["node:path"];
   const fsM = M["fs"] || M["node:fs"];
   const osM = M["os"] || M["node:os"];
+  const streamM = M["stream"] || M["node:stream"];
   const workerRegistry = new Map();  // threadId -> Worker (parent side)
   let nextThreadId = 1;
 
@@ -1272,6 +1273,96 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
     const meta = p.slice(5, comma);
     const semi = meta.indexOf(";");
     return (semi === -1 ? meta : meta.slice(0, semi)).trim();
+  };
+
+  // ---- which options a worker thread may carry ----------------------------
+  // node's per-isolate + per-environment option table (src/node_options.cc), i.e.
+  // exactly the options whose effect is scoped to one thread. PROCESS-wide
+  // options (--title, --v8-options, --perf-*) and V8 flags (--expose-gc,
+  // --stack-size, --max-old-space-size, --jitless) are deliberately absent:
+  // node refuses them in a worker's execArgv, and "absent from the list" is how
+  // that refusal is spelled here. Underscores are normalised to dashes first,
+  // so `--pending_deprecation` and `--pending-deprecation` are one entry.
+  const WORKER_EXEC_OPTIONS = new Set((
+      "abort-on-uncaught-exception allow-addons allow-child-process allow-fs-read " +
+      "allow-fs-write allow-net allow-wasi allow-worker conditions cpu-prof " +
+      "cpu-prof-dir cpu-prof-interval cpu-prof-name disable-proto disable-sigusr1 " +
+      "disable-warning dns-result-order enable-network-family-autoselection " +
+      "enable-source-maps entry-url env-file env-file-if-exists experimental-abortcontroller " +
+      "experimental-addon-modules experimental-config-file experimental-default-config-file " +
+      "experimental-detect-module experimental-eventsource experimental-import-meta-resolve " +
+      "experimental-json-modules experimental-loader experimental-modules " +
+      "experimental-network-imports experimental-permission experimental-print-required-tla " +
+      "experimental-quic experimental-repl-await experimental-require-module " +
+      "experimental-shadow-realm experimental-specifier-resolution experimental-sqlite " +
+      "experimental-strip-types experimental-test-coverage experimental-test-isolation " +
+      "experimental-test-module-mocks experimental-test-snapshots experimental-transform-types " +
+      "experimental-vm-modules experimental-wasi-unstable-preview1 experimental-wasm-modules " +
+      "experimental-webstorage expose-internals force-context-aware " +
+      "force-node-api-uncaught-exceptions-policy frozen-intrinsics " +
+      "heap-prof heap-prof-dir heap-prof-interval heap-prof-name " +
+      "heapsnapshot-near-heap-limit heapsnapshot-signal http-parser " +
+      "icu-data-dir import input-type insecure-http-parser inspect inspect-brk " +
+      "inspect-brk-node inspect-port inspect-publish-uid inspect-wait " +
+      "localstorage-file max-http-header-size napi-modules network-family-autoselection-attempt-timeout " +
+      "no-addons no-async-context-frame no-deprecation no-experimental-detect-module " +
+      "no-experimental-fetch no-experimental-global-customevent " +
+      "no-experimental-global-navigator no-experimental-global-webcrypto " +
+      "no-experimental-repl-await no-experimental-require-module no-experimental-websocket " +
+      "no-experimental-print-required-tla no-extra-info-on-fatal-exception " +
+      "no-force-async-hooks-checks no-global-search-paths no-network-family-autoselection " +
+      "no-use-system-ca no-warnings openssl-config openssl-legacy-provider " +
+      "openssl-shared-config pending-deprecation policy-integrity preserve-symlinks " +
+      "preserve-symlinks-main prof-process redirect-warnings report-compact report-dir " +
+      "report-directory report-exclude-env report-exclude-network report-filename " +
+      "report-on-fatalerror report-on-signal report-signal report-uncaught-exception " +
+      "require secure-heap secure-heap-min snapshot-blob test test-concurrency " +
+      "test-coverage-branches test-coverage-exclude test-coverage-functions " +
+      "test-coverage-include test-coverage-lines test-force-exit test-name-pattern " +
+      "test-only test-reporter test-reporter-destination test-shard test-skip-pattern " +
+      "test-timeout test-udp-no-try-send throw-deprecation tls-cipher-list tls-keylog " +
+      "tls-max-v1.2 tls-max-v1.3 tls-min-v1.0 tls-min-v1.1 tls-min-v1.2 tls-min-v1.3 " +
+      "trace-atomics-wait trace-deprecation trace-env trace-env-js-stack " +
+      "trace-env-native-stack trace-event-categories trace-event-file-pattern " +
+      "trace-events-enabled trace-exit trace-promises trace-require-module trace-sigint " +
+      "trace-sync-io trace-tls trace-uncaught trace-warnings track-heap-objects " +
+      "unhandled-rejections use-bundled-ca use-largepages use-openssl-ca use-system-ca " +
+      "watch watch-path watch-preserve-output zero-fill-buffers " +
+      // Short spellings node's parser accepts, plus the bun-side per-thread
+      // flags mbun answers to (worker_threads is a surface bun implements too).
+      "r C smol user-agent").split(" "));
+  // Options that are meaningless without an argument; node's parser reports
+  // `<option> requires an argument` and the Worker constructor turns that into
+  // ERR_WORKER_INVALID_EXEC_ARGV (test-worker-execargv-invalid's
+  // `--redirect-warnings`).
+  const WORKER_EXEC_OPTIONS_WITH_VALUE = new Set((
+      "conditions cpu-prof-dir cpu-prof-interval cpu-prof-name disable-warning " +
+      "dns-result-order entry-url env-file env-file-if-exists experimental-loader " +
+      "experimental-specifier-resolution heap-prof-dir heap-prof-interval heap-prof-name " +
+      "heapsnapshot-near-heap-limit heapsnapshot-signal icu-data-dir import input-type " +
+      "localstorage-file max-http-header-size network-family-autoselection-attempt-timeout " +
+      "openssl-config policy-integrity redirect-warnings report-dir report-directory " +
+      "report-filename report-signal require secure-heap secure-heap-min snapshot-blob " +
+      "test-concurrency test-coverage-exclude test-coverage-include test-name-pattern " +
+      "test-reporter test-reporter-destination test-shard test-skip-pattern test-timeout " +
+      "tls-cipher-list tls-keylog trace-event-categories trace-event-file-pattern " +
+      "unhandled-rejections watch-path").split(" "));
+  // NODE_OPTIONS is parsed against a DIFFERENT and larger table than a worker's
+  // execArgv: node's kAllowedInEnvvar, which admits options that are
+  // process-wide precisely because the environment applies to the process.
+  // `--title` is the case the corpus pins from both sides — refused in execArgv
+  // (test-worker-execargv-invalid) and accepted in NODE_OPTIONS
+  // (test-worker-node-options, whose fixture copies the parent's env wholesale).
+  // Only a genuinely UNKNOWN option is refused here.
+  const NODE_OPTIONS_EXTRA = new Set((
+      "diagnostic-dir interpreted-frames-native-stack max-old-space-size " +
+      "max-semi-space-size perf-basic-prof perf-basic-prof-only-functions perf-prof " +
+      "perf-prof-unwinding-info stack-trace-limit title tls-keylog " +
+      "max-http-header-size v8-pool-size").split(" "));
+  const invalidExecArgv = (what, tok) => {
+    const e = new Error("Initiated Worker with invalid " + what + ": " + tok);
+    e.code = "ERR_WORKER_INVALID_EXEC_ARGV";
+    return e;
   };
 
   // node ERR_WORKER_PATH: a bare specifier is not a worker entry point.
@@ -1535,6 +1626,55 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
         const e = new TypeError('The "options.execArgv" property must be an instance of Array. Received ' + recvType(options.execArgv));
         e.code = "ERR_INVALID_ARG_TYPE"; throw e;
       }
+      // node runs the execArgv array through its OWN option parser before the
+      // thread exists (src/node_worker.cc Worker::New -> ParsePerIsolateOptions),
+      // and rejects the whole construction with ERR_WORKER_INVALID_EXEC_ARGV if
+      // any token is not an option a thread may carry. Three distinct things are
+      // refused and the corpus asserts all three: an option node does not know
+      // at all (`--foo`), an option that is PROCESS-wide rather than per-thread
+      // (`--title=blah` renames the whole process), and a V8 option (`--expose-gc`
+      // — V8 flags are set on the isolate at creation and a worker inherits the
+      // parent's, so passing one per-worker is meaningless). A fourth case is an
+      // option that is legal but was given without its required value
+      // (`--redirect-warnings` needs a file). mbun spawns the worker as a CHILD
+      // PROCESS, so it used to hand the array straight to spawn() and the bad
+      // flag surfaced — if at all — as a dead child much later, never as the
+      // synchronous throw the constructor's contract promises.
+      // Allow-list rather than deny-list, because that is the shape of the
+      // question: "is this one of the options a thread may carry", not "is this
+      // one of the bad ones". Anything not listed is refused.
+      const validateExecArgvList = (list, what, extra) => {
+        for (let i = 0; i < list.length; i++) {
+          const tok = String(list[i]);
+          // A bare token is the VALUE of the option before it (`--require foo`),
+          // never an option itself.
+          if (tok.charCodeAt(0) !== 45 /* - */) continue;
+          const eq = tok.indexOf("=");
+          let name = (eq === -1 ? tok : tok.slice(0, eq));
+          while (name.charCodeAt(0) === 45) name = name.slice(1);
+          name = name.replace(/_/g, "-");
+          if (!WORKER_EXEC_OPTIONS.has(name) && !(extra && extra.has(name))) throw invalidExecArgv(what, tok);
+          // Needs a value and got none, and there is no following token to take
+          // it from.
+          if (eq === -1 && WORKER_EXEC_OPTIONS_WITH_VALUE.has(name) &&
+              (i + 1 >= list.length || String(list[i + 1]).charCodeAt(0) === 45)) {
+            throw invalidExecArgv(what, tok);
+          }
+        }
+      };
+      if (Array.isArray(options.execArgv)) validateExecArgvList(options.execArgv.map(String), "execArgv flags");
+      // NODE_OPTIONS travels in the worker's env, and node parses it with the
+      // same table before the thread starts — an unparseable NODE_OPTIONS is the
+      // same ERR_WORKER_INVALID_EXEC_ARGV. Only an EXPLICIT env is checked: an
+      // inherited one already survived this process's own startup.
+      // …and never re-checked when it is the value THIS process already started
+      // with: a copied env carries the parent's NODE_OPTIONS unchanged, and the
+      // parent accepting it at startup is the whole proof it is valid.
+      if (options.env && options.env !== SHARE_ENV && typeof options.env.NODE_OPTIONS === "string" &&
+          options.env.NODE_OPTIONS !== (proc.env && proc.env.NODE_OPTIONS)) {
+        validateExecArgvList(options.env.NODE_OPTIONS.split(/\s+/).filter((s) => s !== ""),
+                             "NODE_OPTIONS env variable", NODE_OPTIONS_EXTRA);
+      }
       // Serialise BEFORE the structuredClone check: the encoder is what knows
       // about the transfer list, and it owns the "needs transfer but was not
       // listed" DataCloneError whose exact wording the corpus asserts. A plain
@@ -1708,10 +1848,56 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
       // asked for the streams (options.stdout / options.stderr / options.stdin).
       this.stdin = options.stdin ? child.stdin : null;
       if (!options.stdin && child.stdin) { try { child.stdin.end(); } catch (e) {} }
-      this.stdout = child.stdout;
-      this.stderr = child.stderr;
-      if (!options.stdout && child.stdout) child.stdout.on("data", (d) => { try { proc.stdout.write(d); } catch (e) {} });
-      if (!options.stderr && child.stderr) child.stderr.on("data", (d) => { try { proc.stderr.write(d); } catch (e) {} });
+      // node's worker stdout/stderr are MESSAGE PORTS, not pipes: the worker's
+      // process.stdout is a Writable whose every write becomes one message, and
+      // the parent turns each message back into exactly one 'data' chunk. Chunk
+      // BOUNDARIES are therefore part of the contract, and the corpus asserts
+      // them directly — test-worker-no-stdin-stdout-interaction wants ten writes
+      // to arrive as ten 'data' events, and test-worker-message-port-drain
+      // matches each worker line against a whole chunk.
+      //
+      // An mbun worker is a child PROCESS whose fd 1 is an OS pipe, and a pipe
+      // has no message boundaries at all: ten quick writes coalesce in the
+      // kernel buffer and the parent reads one chunk (measured: 1 event, not 10;
+      // and "1 threadId: 1\n2 threadId: 1" as a single chunk). So the worker's
+      // writes ride the IPC channel as 'so'/'se' frames — the same channel the
+      // messages use, which is also what makes the drain test's ORDERING hold —
+      // and this stream is where they are re-emitted, one chunk per frame.
+      //
+      // child.stdout is still merged in rather than dropped: anything that
+      // reaches the child's real fd 1 without passing through its
+      // process.stdout (the runtime's own fatal-error printer, a grandchild
+      // process, a native write) has no frame and would otherwise vanish.
+      // A plain Readable that is PUSHED into, not a PassThrough that is written
+      // to: a Transform queues its writes and hands them on together, and a
+      // byte-mode Readable's read() CONCATENATES whatever is sitting in its
+      // buffer — so two frames that arrive in one IPC batch came back out as one
+      // 'data' event and the boundary this whole change exists to keep was lost
+      // again (measured: "1 threadId: 1\n2 threadId: 1\n" as a single chunk).
+      // push() on a flowing Readable emits each chunk as it lands, which is what
+      // node's ReadableWorkerStdio does.
+      const mkStdioStream = () => {
+        if (!streamM || typeof streamM.Readable !== "function") return null;
+        try { return new streamM.Readable({ read() {} }); } catch (e) { return null; }
+      };
+      const outStream = mkStdioStream();
+      const errStream = mkStdioStream();
+      this._outStream = outStream;
+      this._errStream = errStream;
+      this.stdout = outStream || child.stdout;
+      this.stderr = errStream || child.stderr;
+      if (child.stdout) child.stdout.on("data", (d) => {
+        if (outStream) { try { outStream.push(d); return; } catch (e) {} }
+        if (!options.stdout) { try { proc.stdout.write(d); } catch (e) {} }
+      });
+      if (child.stderr) child.stderr.on("data", (d) => {
+        if (errStream) { try { errStream.push(d); return; } catch (e) {} }
+        if (!options.stderr) { try { proc.stderr.write(d); } catch (e) {} }
+      });
+      // node pipes the worker's stdio into the parent's unless the caller asked
+      // to own the stream (options.stdout / options.stderr).
+      if (!options.stdout && outStream) outStream.on("data", (d) => { try { proc.stdout.write(d); } catch (e) {} });
+      if (!options.stderr && errStream) errStream.on("data", (d) => { try { proc.stderr.write(d); } catch (e) {} });
       workerRegistry.set(tid, this);
 
       const self = this;
@@ -1757,6 +1943,16 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
           if (m.d && m.d.code) err.code = m.d.code;
           if (typeof self.onerror === "function") self.onerror(err);
           self.emit("error", err);
+        } else if (m.t === "so" || m.t === "se") {
+          // One stdio write in the worker, re-emitted here as exactly one chunk.
+          // base64 because the IPC channel carries JSON and a worker's stdout is
+          // a byte stream, not text.
+          const s = m.t === "so" ? self._outStream : self._errStream;
+          let buf = null;
+          try { buf = G.Buffer.from(String(m.d), "base64"); } catch (e) { buf = null; }
+          if (buf === null) return;
+          if (s) { try { s.push(buf); } catch (e) {} }
+          else { try { (m.t === "so" ? proc.stdout : proc.stderr).write(buf); } catch (e) {} }
         } else if (m.t === "me") {
           self.emit("messageerror", new Error(String(m.d)));
         } else if (m.t === "wm" && typeof m.id === "number") {
@@ -1793,6 +1989,10 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
         self.threadName = null;
         workerRegistry.delete(tid);
         if (self._tempFile) { try { fsM.unlinkSync(self._tempFile); } catch (e) {} self._tempFile = null; }
+        // The synthetic stdio streams have no fd to close themselves on: end
+        // them with the thread, so a reader waiting on 'end' is not left open.
+        if (self._outStream) { try { self._outStream.push(null); } catch (e) {} }
+        if (self._errStream) { try { self._errStream.push(null); } catch (e) {} }
         self.emit("exit", self._exitCode);
         const rs = self._exitResolvers.splice(0);
         for (const r of rs) r(self._exitCode);
@@ -2049,6 +2249,13 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
       // asserts the propagated error arrives with stack === undefined).
       const d = {};
       try { d.message = e && e.message; } catch (_) {}
+      // JSC spells the stack-exhaustion RangeError with a trailing full stop;
+      // V8 — and therefore node's public contract, which the corpus asserts
+      // verbatim — does not. This is the one message the engines disagree about
+      // that crosses the worker boundary as DATA rather than as console output,
+      // so the serializer that rebuilds the error in the parent is where the
+      // engine's wording is translated into node's.
+      if (d.message === "Maximum call stack size exceeded.") d.message = "Maximum call stack size exceeded";
       try { d.name = e && e.name; } catch (_) {}
       try { d.stack = e && e.stack; } catch (_) { d.noStack = true; }
       try { d.code = e && e.code; } catch (_) {}
@@ -2192,6 +2399,52 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
         const realChdir = proc.chdir;
         rawChdirW = realChdir.bind(proc);
       }
+      // ---- stdio as messages, not as a pipe ---------------------------------
+      // node's worker stdout/stderr ARE message ports (internal/worker/io.js
+      // WritableWorkerStdio): one write is one message, and the parent turns it
+      // back into one 'data' chunk. mbun's worker is a child process whose fd 1
+      // is an OS pipe, which has no boundaries — ten writes coalesce into one
+      // read and the corpus notices (see the parent-side note above). Sending
+      // each write as its own IPC frame restores the boundary AND the ordering
+      // against postMessage, since both now ride the same channel.
+      //
+      // Installed from HERE rather than at partition-assembly time because
+      // process.stdout does not exist yet when the worker_threads partition is
+      // evaluated; node_process_extra calls this after the process object is
+      // complete. The real stream stays underneath as the fallback for a frame
+      // that cannot be built or sent.
+      const frameStdio = (stream, tag) => {
+        if (!stream || typeof stream.write !== "function" || stream.write.__mbunFramed) return;
+        const realWrite = stream.write;
+        const framed = function write(chunk, enc, cb) {
+          if (typeof enc === "function") { cb = enc; enc = undefined; }
+          let buf = null;
+          try {
+            buf = (G.Buffer && G.Buffer.isBuffer(chunk))
+                ? chunk
+                : (chunk instanceof Uint8Array ? G.Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength)
+                                               : G.Buffer.from(String(chunk), enc || "utf8"));
+          } catch (e) { buf = null; }
+          if (buf === null || !wsendable()) return realWrite.call(this, chunk, enc, cb);
+          let sent = false;
+          try { sent = wsend({ t: tag, d: buf.toString("base64") }); } catch (e) { sent = false; }
+          if (!sent) return realWrite.call(this, chunk, enc, cb);
+          // node's WritableWorkerStdio calls the write callback once the message
+          // is handed off, i.e. asynchronously but unconditionally
+          // (test-worker-no-stdin-stdout-interaction passes common.mustSucceed()
+          // as that callback).
+          if (typeof cb === "function") {
+            try { proc.nextTick(() => cb(null)); } catch (e) { try { cb(null); } catch (_) {} }
+          }
+          return true;
+        };
+        try {
+          framed.__mbunFramed = true;
+          stream.write = framed;
+        } catch (e) {}
+      };
+      frameStdio(proc.stdout, "so");
+      frameStdio(proc.stderr, "se");
       const unsupported = (name) => {
         const f = function () {
           const e = new TypeError("process." + name + "() is not supported in workers");
