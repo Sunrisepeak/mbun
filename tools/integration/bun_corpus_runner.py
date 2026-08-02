@@ -31,7 +31,11 @@ SKIP_RE = re.compile(r"(?m)^\s*(\d+) skip\s*$")
 # bun's bugs on purpose because the corpus scored them as required behaviour.
 #
 # Being ahead of the reference implementation is its own outcome, not a failure.
-AHEAD_RE = re.compile(r"expected to fail but passed")
+# A stale `test.failing` marker. mbun used to print its own wording ("— expected
+# to fail but passed"); it now prints bun's ("this test is marked as failing but
+# it passed…"), so both spellings have to be recognised or the ahead-of-reference
+# bucket silently empties out.
+AHEAD_RE = re.compile(r"expected to fail but passed|marked as failing but it passed")
 EXPECT_RE = re.compile(r"(?m)^\s*(\d+) expect\(\) calls\s*$")
 RAN_RE = re.compile(r"Ran (\d+) tests?")
 TEST_FILE_RE = re.compile(r"\.test\.(?:[cm]?[jt]sx?)$")
