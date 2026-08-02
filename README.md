@@ -1,4 +1,4 @@
-# mbun | [Rewrite Bun in MC++](https://github.com/Sunrisepeak/mbun/pull/1) - Just for Fun
+# mbun | [Rewrite Bun in MC++](https://github.com/Sunrisepeak/mbun/pull/1) - Linux W42: 2/3 focused files green; frozen Node 70.7% / Bun 53.4%
 
 [中文文档](README.zh-CN.md)
 
@@ -126,17 +126,21 @@ Source-snapshot measurements against the upstream corpora pinned as submodules u
 | Both corpora combined | 4,149 / 6,335 files | 65.5% |
 | Elysia test suite | 1,522 pass / 3 fail | 99.8% |
 
-### Latest PR #36 Linux checkpoint
+### Latest PR #79 Linux checkpoint
 
 The full-corpus rows above remain the last frozen whole-corpus measurement. The
-latest incremental checkpoint is deliberately reported separately: W423 ran
-five independent Linux processes against `bun-serve-file.test.ts` and passed
-**9 active conditional-request checks, 0 failed, 0 timed out**. It covers
-`If-None-Match`, custom `ETag`, `If-Modified-Since` precedence over `Range`,
-and the non-GET/HEAD guard. W422 immediately before it passed **13 active
-range checks, 0 failed, 0 timed out**. The two checkpoints changed source and
-were verified against a serial release build; they are not a new full-corpus
-percentage.
+latest incremental checkpoint is deliberately reported separately. W42 used
+four bounded Linux screen lanes (one worker per process): test-runner **40
+dispatched: 18 pass / 15 fail / 3 skipped / 4 timeout**, util **30: 18 / 9 / 2
+/ 1**, webcrypto **50: 31 / 19**, and process **96: 85 / 6 / 4 / 1**. The
+candidate then ran a serial three-file gate: **2/3 files green, 0 timeout**.
+`test-util-promisify-custom-names.mjs` and
+`test-process-binding-internalbinding-allowlist.js` pass. The WebCrypto
+hidden-slots file reaches the new branded CryptoKey-to-HMAC bridge assertion,
+then reaches the existing unsupported EC `node:crypto` signing backend; it is
+not counted as green. Focused JSC tests `test_webcrypto` and
+`test_node_compat_bridges` both pass. These are incremental source/test
+checkpoints, not a new full-corpus percentage.
 
 File-level "green" means every executed test in the file passed and the file reported no error outside a test; it is stricter than an API checklist and lower than test-level pass rates. Files that declare no runnable test, files whose every test is skipped, and files needing a service this environment lacks (MySQL, Redis, the npm registry) are separate buckets and never count as passes. Node.js files run directly through mbun (exit 0 = pass) without Node's own harness services, so that figure is honest file-level coverage, not API completion.
 
