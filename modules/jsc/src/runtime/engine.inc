@@ -158,8 +158,55 @@ public:
         JSStringRelease(url);
         JSStringRelease(script);
         if (ok) return 0;
-        std::println(std::cerr, "{}: {}", srcUrl, describe_exception_(exc));
+        // node reports a failed --check through its ordinary uncaught-exception
+        // printer (lib/internal/main/check_syntax.js re-throws the parse error),
+        // which is a FIVE-part frame: `<file>:<line>`, the offending source
+        // line, a caret, a blank line, then the error on a line of its own.
+        // test-cli-syntax-piped-bad matches /^SyntaxError:/m, so the error text
+        // cannot share a line with the filename.
+        const double line{number_property_(exc, "line", 1)};
+        const double column{number_property_(exc, "column", 0)};
+        std::println(std::cerr, "{}:{}", srcUrl, static_cast<long long>(line));
+        if (const auto text{source_line_(source, static_cast<long long>(line))}; text) {
+            std::println(std::cerr, "{}", *text);
+            const long long caret{static_cast<long long>(column)};
+            std::println(std::cerr, "{}^",
+                         std::string(caret > 1 ? static_cast<std::size_t>(caret - 1) : 0, ' '));
+        }
+        std::println(std::cerr, "");
+        std::println(std::cerr, "{}", describe_exception_(exc));
         return 1;
+    }
+
+    // The 1-based `line`th line of `source`, or nothing when it is out of range.
+    static std::optional<std::string_view> source_line_(std::string_view source, long long line) {
+        if (line < 1) return std::nullopt;
+        std::size_t start{0};
+        for (long long n{1}; n < line; ++n) {
+            const std::size_t nl{source.find('\n', start)};
+            if (nl == std::string_view::npos) return std::nullopt;
+            start = nl + 1;
+        }
+        if (start > source.size()) return std::nullopt;
+        std::size_t end{source.find('\n', start)};
+        if (end == std::string_view::npos) end = source.size();
+        if (end > start && source[end - 1] == '\r') --end;
+        return source.substr(start, end - start);
+    }
+
+    // A numeric own property of an exception object (JSC puts `line`/`column`
+    // on its SyntaxError instances), or `fallback` when it is absent.
+    double number_property_(JSValueRef value, const char* name, double fallback) {
+        if (value == nullptr || !JSValueIsObject(ctx_, value)) return fallback;
+        JSValueRef ignored{nullptr};
+        JSObjectRef object{JSValueToObject(ctx_, value, &ignored)};
+        if (object == nullptr) return fallback;
+        JSStringRef key{JSStringCreateWithUTF8CString(name)};
+        JSValueRef prop{JSObjectGetProperty(ctx_, object, key, &ignored)};
+        JSStringRelease(key);
+        if (prop == nullptr || !JSValueIsNumber(ctx_, prop)) return fallback;
+        const double n{JSValueToNumber(ctx_, prop, &ignored)};
+        return std::isfinite(n) ? n : fallback;
     }
 
     // Evaluate source and return the string coercion of its result (for reading
