@@ -1019,7 +1019,7 @@
         // so a changed file invalidates its record; maybe_save then decides
         // between keeping what was read back and refreshing it, and the
         // accumulated entries are written out by flushCompileCache()/exit.
-        CompileCacheEntry* ccEntry{nullptr};
+        std::optional<std::uint32_t> ccEntry;
         if (!nodeInternal && CompileCacheHandler::get().enabled()) {
             ccEntry = CompileCacheHandler::get().get_or_insert(source, path,
                                                               CachedCodeType::kCommonJS);
@@ -1052,8 +1052,8 @@
         // usable as-is; a miss initializes the entry instead. A module that
         // failed to compile above returned already and is never cached, which
         // is what keeps a syntax error out of the cache directory.
-        if (ccEntry != nullptr) {
-            CompileCacheHandler::get().maybe_save(ccEntry, source, /*rejected=*/false);
+        if (ccEntry) {
+            CompileCacheHandler::get().maybe_save(*ccEntry, source, /*rejected=*/false);
         }
 
         JSObjectRef moduleObj{JSObjectMake(ctx, nullptr, nullptr)};

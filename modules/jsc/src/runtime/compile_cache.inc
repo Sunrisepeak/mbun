@@ -199,10 +199,15 @@ class CompileCacheHandler {
         return result;
     }
 
-    // Upstream CompileCacheHandler::GetOrInsert.
-    CompileCacheEntry* get_or_insert(std::string_view code, const std::string& filename,
-                                     CachedCodeType type) {
-        if (dir_with_tag_.empty()) return nullptr;
+    // Upstream CompileCacheHandler::GetOrInsert, but handing back the cache KEY
+    // rather than a pointer into the store. Upstream can pass the entry pointer
+    // straight to MaybeSave because compilation and saving are adjacent; mbun's
+    // entry point compiles and RUNS in one step, so user code -- including a
+    // module.flushCompileCache(), which empties the store -- gets to run between
+    // the two. A key survives that; a pointer does not.
+    std::optional<std::uint32_t> get_or_insert(std::string_view code, const std::string& filename,
+                                               CachedCodeType type) {
+        if (dir_with_tag_.empty()) return std::nullopt;
 
         std::string file_path{filename};
         // Portable mode keys on the module's position RELATIVE to the cache
@@ -225,7 +230,7 @@ class CompileCacheHandler {
         const std::uint32_t code_hash{cc_hash(code)};
 
         if (auto it{store_.find(key)}; it != store_.end() && it->second.code_hash == code_hash) {
-            return &it->second;
+            return key;
         }
 
         // A code-hash mismatch means the source changed: discard the stale
@@ -240,7 +245,16 @@ class CompileCacheHandler {
         entry.source_filename = filename;
         entry.type = type;
         read_cache_file_(&entry);
-        return &entry;
+        return key;
+    }
+
+    // Save against a key looked up fresh. An entry that a flush removed while
+    // the module was running is simply gone: the next compilation of that file
+    // re-inserts it, which is exactly what upstream's cleared store does.
+    void maybe_save(std::uint32_t key, std::string_view code, bool rejected) {
+        if (auto it{store_.find(key)}; it != store_.end()) {
+            maybe_save(&it->second, code, rejected);
+        }
     }
 
     // Upstream CompileCacheHandler::MaybeSaveImpl. `rejected` is the engine's

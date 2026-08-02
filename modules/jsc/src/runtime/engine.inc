@@ -695,7 +695,7 @@ public:
         // loader uses is applied around this evaluation. Keyed on the file's own
         // source, exactly as in module_loading.inc, so entry and require() agree
         // on the record for a given file.
-        CompileCacheEntry* entryCacheRecord{nullptr};
+        std::optional<std::uint32_t> entryCacheRecord;
         if (CompileCacheHandler::get().enabled()) {
             entryCacheRecord = CompileCacheHandler::get().get_or_insert(
                 source, absPath, CachedCodeType::kCommonJS);
@@ -747,8 +747,8 @@ public:
             }
             // Same point as the synchronous branch below: the entry compiled
             // (as an async wrapper), so its record can be kept or initialized.
-            if (entryCacheRecord != nullptr) {
-                CompileCacheHandler::get().maybe_save(entryCacheRecord, source,
+            if (entryCacheRecord) {
+                CompileCacheHandler::get().maybe_save(*entryCacheRecord, source,
                                                       /*rejected=*/false);
             }
             const bool settled{pump_event_loop("globalThis.__mbun_run_done")};
@@ -793,8 +793,8 @@ public:
             // initialized). An entry that failed to parse returned above and is
             // never recorded, which is what keeps a broken file out of the cache
             // directory.
-            if (entryCacheRecord != nullptr) {
-                CompileCacheHandler::get().maybe_save(entryCacheRecord, source,
+            if (entryCacheRecord) {
+                CompileCacheHandler::get().maybe_save(*entryCacheRecord, source,
                                                       /*rejected=*/false);
             }
             // Top level ran synchronously to completion. Node/bun keep the process
