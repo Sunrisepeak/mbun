@@ -5,6 +5,31 @@ session that is interrupted (usage limit, crash, restart) can pick up from the
 file rather than from memory. **If you are a fresh session reading this, start
 here.**
 
+## 2026-08-03 — CHECKPOINT FORMAT: every wave comment carries the running total and an ETA
+
+User directive: **"每次 comment 记录真实的推进数量 以及 总进度也一起在表格里 方便观察 以及 后面
+备注 预估多长时间后能 100% 兼容 bun 和 node"**. So every wave's PR comment must contain, as
+tables rather than prose:
+
+1. **Per-lane: goal, delivered, lane-hours, files/hour.** Delivered is the integrator's own
+   verified number, never the lane's self-report.
+2. **The running total against both corpora** — baseline, now, Δ, the audited runnable
+   denominator, % of runnable, and files remaining. Label it as **accounting, not a fresh full
+   run**: full-corpus runs are suspended, so the carried total is the last full measurement plus
+   every per-file gain and loss verified since on a frozen binary. Denominators never shrink.
+3. **The wave-by-wave trend** (files and files/lane-hour), so a falling rate is visible instead
+   of asserted.
+4. **An ETA to 100%**, with the arithmetic shown and the two honest caveats: the rate declines
+   as dense clusters are consumed, and part of the remainder is **architecture-gated rather than
+   effort-gated**. Keep the blocker table current — as of W46: worker threads/SAB (~10 files),
+   JSC's readonly-assign message dropping the property name (4), the prebuilt's execution-time-
+   limit callback never firing (4), `ContextifyScript`/`ModuleWrap` being V8-shaped (ESM + live
+   test runner), nghttp2 (≥2), and unvendored acorn (6 internals).
+
+W46's numbers, as the template: Node 3,239/3,898 runnable (83.1%), Bun 1,063/1,804 (58.9%),
+combined 4,302/5,702 (75.4%), 1,400 remaining, ~165 coordinated wall-hours to exhaust what is
+reachable on today's architecture.
+
 ## 2026-08-03 — W45: the module-identity block is GONE. Next bottleneck: `internalBinding('modules')`
 
 The W44 entry below says porting node's `lib/internal/**` is blocked. **That is now out of
