@@ -595,6 +595,17 @@ inline constexpr std::string_view kNodeReplJS = R"JS(
   // server is the same answer for every shape the tests drive.
   const liveServers = [];
   let captureInstalled = false;
+  // Errors that escaped REPLServer.complete(). See setupExceptionCapture.
+  const completionEscapes = new WeakSet();
+  function markCompletionEscape(err) {
+    if (err !== null && (typeof err === "object" || typeof err === "function")) {
+      try { completionEscapes.add(err); } catch { /* frozen/revoked proxy */ }
+    }
+  }
+  function escapedFromCompletion(err) {
+    if (err === null || (typeof err !== "object" && typeof err !== "function")) return false;
+    try { return completionEscapes.has(err); } catch { return false; }
+  }
   // node registers the REPL's error router through
   // process.addUncaughtExceptionCaptureCallback (repl.js:195), which is NOT an
   // 'uncaughtException' listener — the corpus asserts a closed REPL leaves
@@ -622,8 +633,17 @@ inline constexpr std::string_view kNodeReplJS = R"JS(
       // before a setImmediate scheduled by the last command fires, and
       // declining there killed the process instead of reporting through the
       // REPL's output (test-repl-uncaught-exception-after-input-ended).
+      // ...but only for throws the REPL could plausibly own. Completion never
+      // runs inside replContext.run() (node calls the completer straight from
+      // readline), so in node `getStore()` is undefined for an error thrown by
+      // a completion callback and the capture callback declines it — the error
+      // has to reach the process as a genuine uncaught exception and take it
+      // down (test-repl-tab-complete-nested-repls, nodejs/node#21586). The
+      // fallback below has no async context to consult, so the error carries
+      // the answer instead: REPLServer.complete tags whatever escapes it.
       const server = currentReplServer() ||
-        liveServers[liveServers.length - 1] || lastEvaluatingServer;
+        (escapedFromCompletion(err) ? null
+                                    : liveServers[liveServers.length - 1] || lastEvaluatingServer);
       if (server === undefined || server === null) return false;
       // node's capture returns `result !== 'unhandled'`: a REPL whose
       // handleError declined the error must let it reach the process's own
@@ -660,7 +680,49 @@ inline constexpr std::string_view kNodeReplJS = R"JS(
     /(?:[\w$]+|[\w$]+\.(?:[\w$]+\.)*[\w$]*|\[[^\]]*\](?:\.[\w$]*)*)$/;
   const requireRE = /\brequire\s*\(\s*['"`](([\w@./:-]+\/)?(?:[\w@./:-]*))(?![^'"`])$/;
   const fsAutoCompleteRE = /fs(?:\.promises)?\.\s*[a-z][a-zA-Z]+\(\s*["'](.*)/;
+  // Exclude the versioned names that 'npm' installs.
+  const versionedFileNamesRe = /-\d+\.\d+/;
   const importRE = /\bimport\s*\(\s*['"`](([\w@./:-]+\/)?(?:[\w@./:-]*))(?![^'"`])$/;
+
+  // node's internal/repl/completion.js builds `nodeSchemeBuiltinLibs` ONCE, at
+  // module scope, while `getReplBuiltinLibs()` stays live. That asymmetry is
+  // load-bearing and asserted: pushing a name onto the deprecated mutable
+  // `repl.builtinModules` must grow the completion list by exactly one — the
+  // bare name — and must NOT also produce `node:<name>`
+  // (test-repl-tab-complete-require, test-repl-tab-complete-import). Mapping
+  // the live list twice added both. Built lazily rather than at builtins-image
+  // evaluation time, when the module table is not yet populated.
+  let nodeSchemeBuiltinLibsCache = null;
+  const nodeSchemeBuiltinLibs = () => {
+    if (nodeSchemeBuiltinLibsCache === null) {
+      nodeSchemeBuiltinLibsCache = getReplBuiltinLibs().map((lib) => `node:${lib}`);
+    }
+    return nodeSchemeBuiltinLibsCache.slice();
+  };
+
+  function gracefulReaddir(...args) {
+    try { return fs.readdirSync(...args); } catch { /* Continue regardless of error. */ }
+  }
+
+  // node internal/repl/completion.js completeFSFunctions: inside an fs call's
+  // string literal, complete on directory entries rather than on JS.
+  function completeFSFunctions(match) {
+    let baseName = "";
+    let filePath = match[1];
+    let fileList = gracefulReaddir(filePath, { withFileTypes: true });
+
+    if (!fileList) {
+      baseName = path.basename(filePath);
+      filePath = path.dirname(filePath);
+      fileList = gracefulReaddir(filePath, { withFileTypes: true }) || [];
+    }
+
+    const completions = fileList
+      .filter((dirent) => dirent.name.startsWith(baseName))
+      .map((d) => d.name);
+
+    return [[completions], baseName];
+  }
 
   function isIdentifier(str) {
     if (str === "") return false;
@@ -977,22 +1039,39 @@ inline constexpr std::string_view kNodeReplJS = R"JS(
       completeOn = match[1];
       filter = completeOn;
       const subdir = match[2] || "";
-      completionGroups.push(getReplBuiltinLibs());
-      completionGroups.push(getReplBuiltinLibs().map((lib) => `node:${lib}`));
       if (subdir === "") completionGroups.push([]);
       if (this.allowBlockingCompletions) {
         const extensions = Object.keys(CJSModule._extensions || { ".js": 1 });
         const indexes = extensions.map((extension) => `index${extension}`);
         indexes.push("package.json", "index");
         const replModule = this.context && this.context.module;
-        const paths = ((replModule && replModule.paths) || []).concat(CJSModule.globalPaths || []);
-        const group2 = [];
+        // node picks the search roots from what has been typed so far: a bare
+        // "." or ".." answers with the directory prefixes themselves and reads
+        // nothing, an explicit "./" or "../" reads the cwd, and only a bare
+        // specifier walks module.paths + globalPaths
+        // (test-repl-tab-complete-require's `require('.` case wants exactly
+        // ['./', '../'], not the whole node_modules sweep).
+        let group2 = [];
+        let paths = [];
+        if (completeOn === ".") {
+          group2 = ["./", "../"];
+        } else if (completeOn === "..") {
+          group2 = ["../"];
+        } else if (/^\.\.?\//.test(completeOn)) {
+          paths = [process.cwd()];
+        } else {
+          paths = ((replModule && replModule.paths) || []).concat(CJSModule.globalPaths || []);
+        }
         for (let dir of paths) {
           dir = path.resolve(dir, subdir);
           let dirents;
           try { dirents = fs.readdirSync(dir, { withFileTypes: true }); } catch { continue; }
           for (const dirent of dirents) {
-            if (extensions.includes(path.extname(dirent.name)) || indexes.includes(dirent.name)) {
+            // node's guard here excludes the versioned names 'npm' installs.
+            // mbun's skipped every entry with a requirable extension instead,
+            // which made the `group2.push` below unreachable for files: a
+            // relative `require('./` completed to nothing at all.
+            if (versionedFileNamesRe.test(dirent.name) || dirent.name === ".npm") {
               continue;
             }
             const extension = path.extname(dirent.name);
@@ -1016,11 +1095,70 @@ inline constexpr std::string_view kNodeReplJS = R"JS(
         }
         if (group2.length) completionGroups.push(group2);
       }
+      // Last, and in this order: completionGroupsLoaded unshifts, so the group
+      // pushed last comes out nearest the cursor. node pushes the on-disk group
+      // first and then `getReplBuiltinLibs(), nodeSchemeBuiltinLibs`, which
+      // renders as `node:`-prefixed builtins, separator, bare builtins,
+      // separator, files — the exact sequence
+      // test-repl-tab-complete-require indexes off `node:<last builtin>`.
+      completionGroups.push(getReplBuiltinLibs());
+      completionGroups.push(nodeSchemeBuiltinLibs());
     } else if ((match = importRE.exec(line)) !== null) {
       completeOn = match[1];
       filter = completeOn;
-      completionGroups.push(getReplBuiltinLibs().map((lib) => `node:${lib}`));
+      if (this.allowBlockingCompletions) {
+        const subdir = match[2] || "";
+        // node's extensionFormatMap keys — what import() can name directly.
+        const extensions = [".cjs", ".js", ".json", ".mjs", ".wasm"];
+        // Only consulted for bare specifiers loaded out of node_modules.
+        const indexes = extensions.map((ext) => `index${ext}`);
+        indexes.push("package.json");
+
+        let group3 = [];
+        let paths = [];
+        if (completeOn === ".") {
+          group3 = ["./", "../"];
+        } else if (completeOn === "..") {
+          group3 = ["../"];
+        } else if (/^\.\.?\//.test(completeOn)) {
+          paths = [process.cwd()];
+        } else {
+          const replModule = this.context && this.context.module;
+          paths = ((replModule && replModule.paths) || []).slice();
+        }
+
+        for (let dir of paths) {
+          dir = path.resolve(dir, subdir);
+          const isInNodeModules = path.basename(dir) === "node_modules";
+          const dirents = gracefulReaddir(dir, { withFileTypes: true }) || [];
+          for (const dirent of dirents) {
+            const name = dirent.name;
+            // Exclude versioned names that 'npm' installs.
+            if (versionedFileNamesRe.test(name) || name === ".npm") continue;
+            if (!dirent.isDirectory()) {
+              if (extensions.includes(path.extname(name))) group3.push(`${subdir}${name}`);
+              continue;
+            }
+            group3.push(`${subdir}${name}/`);
+            if (!subdir && isInNodeModules) {
+              const absolute = path.resolve(dir, name);
+              const subfiles = gracefulReaddir(absolute) || [];
+              if (subfiles.some((subfile) => indexes.includes(subfile))) {
+                group3.push(`${subdir}${name}`);
+              }
+            }
+          }
+        }
+        if (group3.length) completionGroups.push(group3);
+      }
       completionGroups.push(getReplBuiltinLibs());
+      completionGroups.push(nodeSchemeBuiltinLibs());
+    } else if ((match = fsAutoCompleteRE.exec(line)) !== null &&
+               this.allowBlockingCompletions) {
+      // Completing inside an fs call's path literal: the whole completion is
+      // the directory listing, so it REPLACES completionGroups and leaves
+      // `filter` empty (test-repl-tab-complete-files).
+      ({ 0: completionGroups, 1: completeOn } = completeFSFunctions(match));
     } else if (line.length === 0 || /\w|\.|\$/.test(line[line.length - 1])) {
       const completeTarget =
         line.length === 0 ? line : findExpressionCompleteTarget(line);
@@ -1899,7 +2037,12 @@ inline constexpr std::string_view kNodeReplJS = R"JS(
     }
 
     complete() {
-      Reflect.apply(this.completer, this, arguments);
+      try {
+        Reflect.apply(this.completer, this, arguments);
+      } catch (e) {
+        markCompletionEscape(e);
+        throw e;
+      }
     }
 
     completeOnEditorMode(callback) {
