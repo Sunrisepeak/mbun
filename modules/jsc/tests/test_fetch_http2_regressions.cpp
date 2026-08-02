@@ -188,6 +188,34 @@ int main() {
           out.push(headWinner, delayedText);
           await close(delayed);
 
+          const nullBody = http2.createSecureServer({ key: tls.key, cert: tls.cert });
+          const nullBodyClosed = Promise.withResolvers();
+          let nullBodyCloseCount = 0;
+          nullBody.on("stream", (stream, headers) => {
+            stream.on("error", () => {});
+            stream.on("close", () => {
+              if (++nullBodyCloseCount === 2) nullBodyClosed.resolve("closed");
+            });
+            stream.respond({ ":status": headers[":path"] === "/no-content" ? 204 : 200 });
+          });
+          await listen(nullBody);
+          const noContentResponse = await fetchH2(origin(nullBody) + "/no-content");
+          const noContentBodyIsNull = noContentResponse.body === null;
+          const noContentText = noContentBodyIsNull ? await noContentResponse.text() : "non-null";
+          if (!noContentBodyIsNull) await noContentResponse.body.cancel();
+          const headResponse = await fetchH2(origin(nullBody) + "/head", { method: "HEAD" });
+          const headBodyIsNull = headResponse.body === null;
+          const headText = headBodyIsNull ? await headResponse.text() : "non-null";
+          if (!headBodyIsNull) await headResponse.body.cancel();
+          const nullBodyTransport = await Promise.race([
+            nullBodyClosed.promise,
+            delay(250, "close-timeout"),
+          ]);
+          out.push(noContentBodyIsNull && noContentText === "" &&
+            headBodyIsNull && headText === "" && nullBodyTransport === "closed"
+            ? "null-bodies" : "non-null-bodies");
+          await close(nullBody);
+
           const redirectDestination = http2.createSecureServer({ key: tls.key, cert: tls.cert });
           redirectDestination.on("stream", (stream) => {
             stream.respond({ ":status": 200 });
@@ -282,7 +310,7 @@ int main() {
         expect(error.has_value() && error->empty(),
                "HTTP2 streaming regression ran without harness errors: " + error.value_or("<eval failed>"));
         const auto result { eval_to_string("globalThis.__h2StreamingResult") };
-        expect(result.has_value() && *result == "head|ab|redirect-ok|gzip|cancel|body-error",
+        expect(result.has_value() && *result == "head|ab|null-bodies|redirect-ok|gzip|cancel|body-error",
                "HTTP2 fetch resolves on headers and streams decoded bodies (got '" + result.value_or("<eval failed>") + "')");
     }
 

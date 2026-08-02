@@ -2560,6 +2560,23 @@ export constexpr std::string_view kNetJS_part2 = R"JS(
             }
           }
 
+          // Fetch responses to HEAD and null-body statuses never expose a body,
+          // even if a peer sends payload bytes. This H2 fetch owns its session,
+          // so cancel the stream after resolving the metadata instead of leaving
+          // an unobservable payload buffered behind a synthetic ReadableStream.
+          if (method === "HEAD" || status === 204 || status === 205 || status === 304) {
+            let response;
+            try { response = new G.Response(null, { status, statusText: "", headers }); }
+            catch (error) { fail(error); return; }
+            response.url = parsed.href;
+            response.redirected = depth > 0;
+            headResolved = true;
+            bodyDone = true;
+            cancelTransport();
+            resolve(response);
+            return;
+          }
+
           const rawBody = new G.ReadableStream({
             start(controller) {
               bodyController = controller;
