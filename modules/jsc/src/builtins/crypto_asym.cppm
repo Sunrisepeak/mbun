@@ -512,14 +512,26 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
   // ref: node src/crypto/crypto_keys.cc ExportJWKInner (default arm).
   // The PQC families serialize as RFC 9794 "AKP" documents (one opaque `pub`,
   // one opaque `priv`, parameter set in `alg`), so they ARE JWK-exportable.
-  const PQC_TYPES = {
+  // Split by whether the family HAS a seed, because that decides which raw
+  // private form exists — and the two are mutually exclusive, not merely
+  // preferred: ML-DSA/ML-KEM expose `raw-seed` and reject `raw-private`, while
+  // SLH-DSA (no seed form at all) is the exact mirror. Asking for the wrong one
+  // is ERR_CRYPTO_INCOMPATIBLE_KEY_OPTIONS, not a silent substitution — which
+  // matters, because substituting would hand back private bytes of a different
+  // length and meaning than the caller asked for.
+  const PQC_SEED_TYPES = {
     "ml-dsa-44": 1, "ml-dsa-65": 1, "ml-dsa-87": 1,
     "ml-kem-512": 1, "ml-kem-768": 1, "ml-kem-1024": 1,
+  };
+  const PQC_TYPES = {
+    ...PQC_SEED_TYPES,
     "slh-dsa-sha2-128s": 1, "slh-dsa-sha2-128f": 1, "slh-dsa-sha2-192s": 1,
     "slh-dsa-sha2-192f": 1, "slh-dsa-sha2-256s": 1, "slh-dsa-sha2-256f": 1,
     "slh-dsa-shake-128s": 1, "slh-dsa-shake-128f": 1, "slh-dsa-shake-192s": 1,
     "slh-dsa-shake-192f": 1, "slh-dsa-shake-256s": 1, "slh-dsa-shake-256f": 1,
   };
+  // The one private raw format a PQC type admits.
+  const pqcPrivRawFormat = (type) => (PQC_SEED_TYPES[type] ? "raw-seed" : "raw-private");
   const JWK_EXPORTABLE = { rsa: 1, ec: 1, ed25519: 1, ed448: 1, x25519: 1, x448: 1,
     ...PQC_TYPES };
   const jwkUnsupportedType = () => {
@@ -541,6 +553,14 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
   };
   const jwkToDer = (jwk, isPrivate) => {
     if (jwk == null || typeof jwk !== "object") throw new TypeError("Invalid JWK");
+    // An AKP *document* must carry `pub` whichever key it describes. The native
+    // importer deliberately does not enforce this — it is also the transport for
+    // the raw-seed/raw-private encodings, which have no public half — so the
+    // document rule belongs here, where an actual JWK is being parsed.
+    if (jwk.kty === "AKP" && typeof jwk.pub !== "string") {
+      const e = new Error("Invalid JWK AKP key");
+      e.code = "ERR_CRYPTO_INVALID_JWK"; throw e;
+    }
     const parts = { kty: jwk.kty };
     if (jwk.crv != null) parts.crv = jwk.crv;
     // AKP carries its parameter set in `alg`; without it the importer has no way
@@ -601,9 +621,10 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
     // are the AKP JWK's `pub`/`priv` rather than an EC point or an OKP x/d.
     if (PQC_TYPES[keyType]) {
       if (fmt === "raw-public") return Buffer.from(b64uDecode(jwk.pub));
-      // raw-private and raw-seed both name the private member. A public key has
-      // no `priv` in its JWK at all — that omission, not a length check, is what
-      // stops a public handle from yielding private bytes here.
+      // Only the family's own private form; the other one does not exist for it.
+      if (fmt !== pqcPrivRawFormat(keyType)) throw rawIncompat(fmt);
+      // A public key has no `priv` in its JWK at all — that omission, not a
+      // length check, is what stops a public handle from yielding private bytes.
       if (kind !== "private" || jwk.priv == null) throw rawIncompat(fmt);
       return Buffer.from(b64uDecode(jwk.priv));
     }
@@ -646,6 +667,11 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
       throw rawInvalidValue("The property 'options.format' is invalid. Received 'raw-public'");
     }
     if (!RAW_KEY_TYPES[type]) throw rawIncompat(fmt);
+    // Same split as the export side: raw-seed exists only for the seed families,
+    // raw-private only for everything else (EC/OKP and SLH-DSA).
+    if (fmt !== "raw-public" && PQC_TYPES[type] && fmt !== pqcPrivRawFormat(type)) {
+      throw rawIncompat(fmt);
+    }
     if (fmt === "raw-seed" && !PQC_TYPES[type]) throw rawIncompat(fmt);
     // Raw input is bytes: node does not decode a string here even when an
     // `encoding` is supplied, because the raw forms are not textual.
@@ -1381,6 +1407,11 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
         e.code = "ERR_CRYPTO_INCOMPATIBLE_KEY_OPTIONS"; throw e;
       }
       if (!RAW_KEY_TYPES[type]) throw rawIncompat(pubRawEnc ? pubRawEnc.format : privRawEnc.format);
+      // raw-seed is a PQC-only form, and within the PQC families each admits
+      // exactly one private raw form — see PQC_SEED_TYPES.
+      if (privRawEnc && PQC_TYPES[type] && privRawEnc.format !== pqcPrivRawFormat(type)) {
+        throw rawIncompat(privRawEnc.format);
+      }
       if (privRawEnc && privRawEnc.format === "raw-seed" && !PQC_TYPES[type]) throw rawIncompat("raw-seed");
       const pair = genKeyPair(type, Object.assign({}, options, {
         publicKeyEncoding: pubRawEnc ? undefined : options.publicKeyEncoding,

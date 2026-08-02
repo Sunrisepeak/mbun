@@ -383,22 +383,36 @@ JSC_DEFINE_HOST_FUNCTION(node_asym_jwk_import_host,
         // The parameter set lives in `alg`, so it is load-bearing here in a way
         // `alg` normally is not: without it there is no way to know which
         // provider to hand the opaque bytes to.
+        // Matched CASE-SENSITIVELY against the canonical spelling. OpenSSL would
+        // happily resolve "slh-dsa-sha2-128f" through its case-insensitive
+        // namemap, but a JWK `alg` is a registered identifier, not a lookup key:
+        // node rejects the lowercase form, and accepting it would mean two
+        // different documents describing the same key — one of which no other
+        // implementation would read back.
         const std::string alg{asym_str(global, toJS(global, get_prop(ctx, jwk, "alg")))};
-        if (alg.empty() || !asym_is_pqc_name(asym_lower(alg))) {
+        if (alg.empty() || !asym_is_pqc_name(asym_lower(alg)) ||
+            alg != asym_pqc_jwk_alg(asym_lower(alg))) {
             return throw_coded_error(global, kErrInvalidJwk, "Invalid JWK \"alg\" Parameter");
         }
         std::vector<std::uint8_t> pub;
         std::vector<std::uint8_t> priv;
         const bool havePub{asym_jwk_part(global, ctx, jwk, "pub", pub)};
         const bool havePriv{isPrivate && asym_jwk_part(global, ctx, jwk, "priv", priv)};
+        // NOT required for a private import at this layer, deliberately: this
+        // entry point is also the transport for the raw-seed / raw-private
+        // encodings, which carry no public half at all and are reconstructed by
+        // the provider. "A JWK *document* must carry pub" is a rule about the
+        // document, and it lives with the document parser (jwkToDer in
+        // builtins/crypto_asym.cppm), not here.
+        if (!isPrivate && !havePub) {
+            return throw_coded_error(global, kErrInvalidJwk, "Invalid JWK AKP key");
+        }
         // A private import REQUIRES `priv`: a JWK carrying only `pub` describes a
         // public key, and quietly returning one from createPrivateKey would hand
         // back a key whose `type` lies about what it holds.
         if (isPrivate && !havePriv) {
-            return throw_coded_error(global, kErrInvalidJwk, "Invalid JWK AKP key");
-        }
-        if (!isPrivate && !havePub) {
-            return throw_coded_error(global, kErrInvalidJwk, "Invalid JWK AKP key");
+            return throw_coded_error(global, kErrInvalidJwk,
+                                     "JWK does not contain private key material");
         }
         // One fromdata attempt with a caller-chosen parameter set.
         const auto attempt{[&](bool asSeed) -> EVP_PKEY* {

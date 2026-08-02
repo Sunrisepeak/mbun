@@ -364,6 +364,19 @@ inline std::string asym_lower(std::string_view s) {
     return out;
 }
 
+// The canonical spelling of a PQC name, derived rather than tabulated: uppercase
+// throughout, except that SLH-DSA keeps its trailing f/s lowercase. `lower` must
+// already have passed asym_is_pqc_name.
+inline std::string asym_pqc_jwk_alg(std::string_view lower) {
+    std::string out;
+    out.reserve(lower.size());
+    for (char c : lower) { out.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(c)))); }
+    if (lower.starts_with("slh-dsa-") && !out.empty()) {
+        out.back() = static_cast<char>(std::tolower(static_cast<unsigned char>(out.back())));
+    }
+    return out;
+}
+
 // The key's canonical OpenSSL name when it is one of the PQC families, else "".
 // Used both to gate the PQC arms and to fill the JWK "alg" with the exact casing
 // node reports.
