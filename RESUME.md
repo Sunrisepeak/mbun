@@ -5,6 +5,54 @@ session that is interrupted (usage limit, crash, restart) can pick up from the
 file rather than from memory. **If you are a fresh session reading this, start
 here.**
 
+## 2026-08-03 — W44: porting node's `lib/internal/**` is blocked by MODULE IDENTITY
+
+The single most important thing this wave learned, because it caps the campaign's
+highest-yield lane shape.
+
+The ledger says port-shaped lanes outyield fix-shaped ones roughly 2:1, and W44
+confirmed it again: the compile-cache lane **ported** `compat/node/src/compile_cache.cc`
+and delivered **15 files in 49 minutes**, the best rate in the ledger. So lanes keep
+reaching for node's vendored `lib/internal/**` — and keep finding it unreachable from
+outside `compat/node`, because the internal-module walk starts at the *requesting* file.
+Lane after lane then hand-writes a stub beside a real implementation (W44's `t.mock.timers`
+was a literal no-op next to node's complete `mock_timers.js`).
+
+W44's test-runner lane widened the walk to retry from the entry script, cwd and executable.
+It worked for the tests it targeted and **broke worker startup**, because an mbun worker is
+a separate process: its `fromDir` is outside the vendored tree, so `internal/errors`,
+`internal/util`, `internal/validators`, `internal/event_target`, `internal/abort_controller`,
+`internal/worker/js_transferable` and eight more resolved to node's copies **as a second
+implementation beside mbun's builtins**. Measured by fallback count per run: 28 before,
+~500 with the change, 28 with it reverted. The visible symptoms were an `AbortSignal`
+failing an `EventTarget` brand check and two worker files going red — i.e. the failure
+surfaces nowhere near the resolver.
+
+The narrowed version (gate the fallback to `internal/test_runner/`) restores the worker
+files and **delivers nothing**: the ported module dies on its own transitive
+`require('internal/errors')`, which the prefix does not cover. It was reverted outright
+rather than kept as dead code with a comment claiming a capability it lacks.
+
+**So the real work is not a resolver tweak.** It is making `internal/<x>` name ONE
+implementation — mbun's builtin and node's vendored copy must be the same module object,
+not two — before any lane can port from `lib/internal/**` outside the corpus. Until that
+exists, treat "port it from node's lib" as available only to code that already lives under
+`compat/node`, and size lanes accordingly. This is a strong candidate for the next wave's
+lane 0, because it unblocks the shape with the best measured throughput in the campaign.
+
+Cheap check for anything touching module resolution, found the same day:
+`MBUN_DEBUG_INTERNAL_MODULES=1` prints every internal-module fallback, so a line count
+before/after localises this class of regression in two commands, with no bisect build.
+
+### The other W44 finding: infrastructure was eating the wave
+
+57% of lane wall clock was not lane work — 199 minutes queued on the build lock (cap of 1,
+on a box idling at load 2.0 with 49 GB free; raised to 2, waits fell from 245 s to ~1 min)
+and 120 minutes on a staged `libstdc++.a` from the wrong GCC (now auto-repaired in
+`build_lock.sh`, with a retry on that exact link signature). Disk was at 100% before the
+wave started, which would have failed every measurement with an error that reads like a
+runner bug. **Check disk headroom and the staged archive before dispatching a wave.**
+
 ## 2026-07-31 08:30 — CORE RULE: JS is the thinnest possible interface layer
 
 User directive: **"js 只做最薄的接口层,能用 C++ 实现的都用 C++ 实现,保证性能"**,
