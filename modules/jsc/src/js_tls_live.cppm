@@ -1216,7 +1216,47 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
       // nothing to, a bad secureProtocol, …) throws from createServer() rather
       // than at the first connection.
       let builtContext;
-      if (T && typeof T.createSecureContext === "function") builtContext = T.createSecureContext(options || {});
+      if (T && typeof T.createSecureContext === "function") {
+        try {
+          builtContext = T.createSecureContext(options || {});
+        } catch (e) {
+          // bun does NOT decode the server's key material in the constructor:
+          // compat/bun/src/js/node/tls.ts Server.setSecureContext() only
+          // shape-checks `key`/`cert`/`pfx` and stores the PEM, so an
+          // undecodable key reaches OpenSSL at listen() rather than at
+          // createServer(). http2.createSecureServer({ key, cert }) with
+          // placeholder PEM therefore constructs (regression/issue/24924).
+          // Everything ELSE stays eager: re-run the context build with the key
+          // material stripped so an unusable cipher list / secureProtocol /
+          // ecdhCurve still throws from createServer(), which node's corpus
+          // asserts (test-tls-set-ciphers-error, test-tls-basic-validations).
+          const hadMaterial =
+            options && (options.key != null || options.cert != null || options.pfx != null);
+          if (!hadMaterial) throw e;
+          // Only OpenSSL's own decode failures are deferred. An argument-type
+          // or range rejection is node's, is raised before OpenSSL sees
+          // anything, and every corpus that checks the option surface expects
+          // it out of createServer() (test-tls-options-boolean-check,
+          // test-tls-basic-validations, test-https-options-boolean-check,
+          // test-tls-reduced-SECLEVEL-in-cipher).
+          // Narrower still: only a PEM that OpenSSL cannot DECODE at all is
+          // deferred. A key that decodes and is then rejected on policy
+          // ("key too small") is still reported from createServer(), because
+          // node's corpus reads that error there
+          // (test-tls-reduced-SECLEVEL-in-cipher). The two corpora genuinely
+          // disagree about when key material is inspected; this is the
+          // narrowest deferral that satisfies both.
+          const undecodable =
+            !(e instanceof TypeError) && !(e instanceof RangeError) &&
+            typeof e?.message === "string" &&
+            /^error:[0-9a-fA-F]{8}:(DECODER|PEM) routines/.test(e.message);
+          if (!undecodable) throw e;
+          const probe = Object.assign({}, options);
+          probe.key = undefined; probe.cert = undefined;
+          probe.pfx = undefined; probe.passphrase = undefined;
+          T.createSecureContext(probe);
+        }
+      }
       // A `pfx` server option is a PKCS#12 archive holding the certificate, its
       // key and the chain. createSecureContext has just opened it (and threw if
       // it could not); read the recovered cert/key/ca back off the context, or

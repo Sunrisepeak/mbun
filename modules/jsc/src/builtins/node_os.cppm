@@ -278,10 +278,30 @@ inline constexpr std::string_view kNodeOsJS = R"JS(
   const EventEmitter = M["events"] || M["node:events"];
   const BaseProto = EventEmitter ? EventEmitter.prototype : Object.prototype;
   const initEmitter = function (self) { if (EventEmitter) EventEmitter.call(self); };
+  // node lib/tty.js: `ReadStream`/`WriteStream` ARE net.Sockets and their
+  // constructors run `net.Socket.call(this, ...)`. node:tty is built before
+  // node:net here, so js_net re-parents these prototypes after the fact (see
+  // js_net.cppm "node lib/tty.js: ReadStream extends net.Socket"). That fixes
+  // method lookup but not instance state: the inherited Duplex on()/emit()
+  // then read stream state this constructor never created, so the first
+  // `ttyStream.on("data", ...)` threw instead of registering a listener
+  // (tty-reopen-after-stdin-eof: "TTY ReadStream should not set position for
+  // character devices"). Initialise the base in place, WITHOUT `fd` — node
+  // hands net.Socket a TTY handle rather than a descriptor to adopt, and
+  // adopting it here would make `stream.destroy()` close a descriptor the
+  // caller still owns and closes itself.
+  const initSocketBase = function (self) {
+    const netMod = M["net"] || M["node:net"];
+    const S = netMod && netMod.Socket;
+    if (typeof S === "function" && self instanceof S) {
+      try { S.call(self, {}); return; } catch (e) {}
+    }
+    initEmitter(self);
+  };
 
   function ReadStream(fd) {
     if (!(this instanceof ReadStream)) return new ReadStream(fd);
-    initEmitter(this);
+    initSocketBase(this);
     this.fd = fd | 0;
     this.readable = true;
     this.isRaw = false;
@@ -305,7 +325,7 @@ inline constexpr std::string_view kNodeOsJS = R"JS(
 
   function WriteStream(fd) {
     if (!(this instanceof WriteStream)) return new WriteStream(fd);
-    initEmitter(this);
+    initSocketBase(this);
     this.fd = fd | 0;
     this.writable = true;
     this.columns = undefined;
