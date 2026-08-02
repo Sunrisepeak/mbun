@@ -1,0 +1,9 @@
+compat/node/test/parallel/test-repl-autocomplete.js
+compat/node/test/parallel/test-repl-import-referrer.js
+compat/node/test/parallel/test-repl-preprocess-top-level-await.js
+compat/node/test/parallel/test-repl-require.js
+compat/node/test/parallel/test-repl-sigint-nested-eval.js
+compat/node/test/parallel/test-repl-sigint.js
+compat/node/test/parallel/test-repl-tab-complete-nested-repls.js
+compat/node/test/parallel/test-repl-unsafe-array-iteration.js
+compat/node/test/parallel/test-repl-user-error-handler.js
