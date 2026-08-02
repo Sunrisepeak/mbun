@@ -152,6 +152,7 @@
 // solely by runtime.cppm, so these definitions exist exactly once.
 #include "napi_core.inc"
 #include "napi_objects.inc"
+#include "napi_binary.inc"
 
 // ICU per-item zstd decompression hook. Strong extern "C" definition of
 // bun_icu_maybe_decompress binds the weak-undef reference the repacked ICU's

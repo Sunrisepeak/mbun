@@ -156,11 +156,14 @@ extern "C" napi_status napi_get_value_int64(napi_env env, napi_value value, int6
     NAPI_CHECK_ARG(env, result);
     JSC::JSValue jsValue = toJSValue(value);
     NAPI_RETURN_EARLY_IF_FALSE(env, jsValue.isNumber(), napi_number_expected);
-    // port: napi.cpp:2221-2266 — clamp to int64 range, 0 for NaN/±Inf
+    // port: napi.cpp:2221-2266 — 0 for every non-finite input (node gates on
+    // isfinite, not just isnan: ±Infinity is documented to yield 0, NOT the
+    // clamped range endpoint a finite overflow gives), then clamp finite
+    // out-of-range values to the int64 endpoints.
     double d = jsValue.asNumber();
     constexpr double kMin = static_cast<double>(std::numeric_limits<int64_t>::min());
     constexpr double kMax = static_cast<double>(std::numeric_limits<int64_t>::max());
-    if (std::isnan(d)) {
+    if (!std::isfinite(d)) {
         *result = 0;
     } else if (d <= kMin) {
         *result = std::numeric_limits<int64_t>::min();
