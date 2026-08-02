@@ -447,9 +447,22 @@ int main(int argc, char* argv[]) {
             }
             mbun::jsc::runtime::set_argv(std::move(jsArgv));
             std::string code{args[1]};
-            // `-p`/`--print` prints the expression result.
+            // `-p`/`--print` prints the result.
+            //
+            // node lib/internal/process/execution.js evalScript compiles
+            // `return eval(<source>)` inside the CJS module wrapper and prints
+            // what that returns — a DIRECT eval, so the printed value is the
+            // SCRIPT COMPLETION VALUE and the source may be statements
+            // (`const`, `if`, a loop), not just an expression.
+            //
+            // Wrapping the source in an arrow-function expression body instead
+            // made every statement a syntax error: `mbun -pe "const a = 1; a"`
+            // died with "error: Unexpected const". The corpus reaches this
+            // through common.spawnPromisified(process.execPath, ['-pe', ...])
+            // and asserts the child's stderr is empty
+            // (test-timers-{timeout,immediate,interval}-promisified).
             if (eval_flag_prints(args[0])) {
-                code = "console.log((() => (" + code + "))())";
+                code = "console.log(eval(" + js_quote(args[1]) + "))";
             }
             // node/bun expose the ORIGINAL eval source as process._eval
             // (run-eval.test.ts). Set it on the same first line so source-map

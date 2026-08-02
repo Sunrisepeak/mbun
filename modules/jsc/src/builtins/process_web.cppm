@@ -1539,18 +1539,34 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     const getIndexArray = (length) => Array.from({ length }, (_, i) => _inspect(i));
     const iterKey = "(iteration index)", keyKey = "Key", valuesKey = "Values", indexKey = "(index)";
     const mapIter = T.isMapIterator(tabularData);
-    // NOTE: bun leaves node's `previewEntries(mapIter, true)` commented out
-    // (ConsoleObject.ts:747-751), so a Map ITERATOR is never split into
-    // Key/Values columns — it falls through to the set-like branch below and
-    // each entry renders as a whole `[ k, v ]` array. Only a live Map takes the
-    // three-column form.
     if (T.isMap(tabularData)) {
       const keys = [], values = [];
       let length = 0;
       for (const entry of tabularData) { keys.push(_inspect(entry[0])); values.push(_inspect(entry[1])); length++; }
       return final([iterKey, keyKey, valuesKey], [getIndexArray(length), keys, values]);
     }
-    if (T.isSetIterator(tabularData) || mapIter || T.isSet(tabularData)) {
+    if (mapIter) {
+      // node splits a Map ITERATOR into Key/Values only when it yields PAIRS:
+      // `previewEntries(tabularData, true)[1]` (isKeyValue) is true for
+      // Map#entries, false for Map#keys/#values. previewEntries is a V8
+      // debug-API intrinsic with no JS equivalent (bun leaves the branch
+      // commented out, ConsoleObject.ts:747-751), so recover the distinction
+      // from what the iterator yields: entries yields two-element arrays.
+      const items = [];
+      for (const v of tabularData) items.push(v);
+      const isKeyValue = items.length > 0 &&
+        items.every((v) => Array.isArray(v) && v.length === 2);
+      if (isKeyValue) {
+        return final([iterKey, keyKey, valuesKey], [
+          getIndexArray(items.length),
+          items.map((e) => _inspect(e[0])),
+          items.map((e) => _inspect(e[1])),
+        ]);
+      }
+      return final([iterKey, valuesKey],
+                   [getIndexArray(items.length), items.map((v) => _inspect(v))]);
+    }
+    if (T.isSetIterator(tabularData) || T.isSet(tabularData)) {
       const values = [];
       let length = 0;
       for (const v of tabularData) { values.push(_inspect(v)); length++; }
@@ -1664,7 +1680,8 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
   const kColorMode = Symbol("kColorMode");
   const kInspectOptions = Symbol("kInspectOptions");
   const kCounts = Symbol("counts");
-  const kTimes = Symbol("times");
+  // node keeps the console time map on the PUBLIC `_times` property
+  // (lib/internal/console/constructor.js kBindProperties), not a symbol.
   const kWriteToConsole = Symbol("kWriteToConsole");
   const kGetInspectOptions = Symbol("kGetInspectOptions");
   const kUseStdout = Symbol("stdout");
@@ -1690,9 +1707,9 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     log(...args) { this[kWriteToConsole](kUseStdout, util.formatWithOptions(this[kGetInspectOptions](this._stdout), ...args)); },
     warn(...args) { this[kWriteToConsole](kUseStderr, util.formatWithOptions(this[kGetInspectOptions](this._stderr), ...args)); },
     dir(object, options) { this[kWriteToConsole](kUseStdout, util.inspect(object, Object.assign({ customInspect: false }, this[kGetInspectOptions](this._stdout), options))); },
-    time(label = "default") { label = `${label}`; if (this[kTimes].has(label)) return; this[kTimes].set(label, conNowNs()); },
-    timeEnd(label = "default") { label = `${label}`; const t = this[kTimes].get(label); if (t === undefined) return; this[kWriteToConsole](kUseStdout, label + ": " + conFormatDur(conNowNs() - t)); this[kTimes].delete(label); },
-    timeLog(label = "default", ...data) { label = `${label}`; const t = this[kTimes].get(label); if (t === undefined) return; this.log(label + ": " + conFormatDur(conNowNs() - t), ...data); },
+    time(label = "default") { label = `${label}`; if (this._times.has(label)) return; this._times.set(label, conNowNs()); },
+    timeEnd(label = "default") { label = `${label}`; const t = this._times.get(label); if (t === undefined) return; this[kWriteToConsole](kUseStdout, label + ": " + conFormatDur(conNowNs() - t)); this._times.delete(label); },
+    timeLog(label = "default", ...data) { label = `${label}`; const t = this._times.get(label); if (t === undefined) return; this.log(label + ": " + conFormatDur(conNowNs() - t), ...data); },
     trace(...args) { this[kWriteToConsole](kUseStderr, "Trace: " + util.formatWithOptions(this[kGetInspectOptions](this._stderr), ...args)); },
     assert(expression, ...args) { if (!expression) { args[0] = "Assertion failed" + (args.length === 0 ? "" : ": " + args[0]); this.warn(...args); } },
     clear() { const s = this._stdout; if (s && s.isTTY && typeof s.write === "function") { s.write("[1;1H"); s.write("[0J"); } },
@@ -1732,7 +1749,7 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
       "_stdout": na(stdout), "_stderr": na(stderr), "_ignoreErrors": na(Boolean(ignoreErrors)),
       [kColorMode]: na(colorMode),
       [kInspectOptions]: na((typeof inspectOptions === "object" && inspectOptions !== null) ? inspectOptions : undefined),
-      [kCounts]: na(new Map()), [kTimes]: na(new Map()),
+      [kCounts]: na(new Map()), "_times": na(new Map()),
       [kGroupIndent]: na(""), [kGroupIndentWidth]: na(groupIndentation === undefined ? 2 : groupIndentation),
     });
     const keys = Object.keys(Console.prototype);
@@ -1837,7 +1854,7 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
       [kColorMode]: naGlobal("auto"),
       [kInspectOptions]: naGlobal(undefined),
       [kCounts]: naGlobal(new Map()),
-      [kTimes]: naGlobal(new Map()),
+      "_times": naGlobal(new Map()),
       [kGroupIndent]: naGlobal(""),
       [kGroupIndentWidth]: naGlobal(2),
     });
