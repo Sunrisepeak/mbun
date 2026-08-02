@@ -5,6 +5,26 @@ session that is interrupted (usage limit, crash, restart) can pick up from the
 file rather than from memory. **If you are a fresh session reading this, start
 here.**
 
+## 2026-08-03 — MANIFEST RULE: an entry must have `ran > 0` AND `failed > 0`
+
+Sorting candidate files by "fewest failing assertions first" is **degenerate**, and it cost a W48
+lane its entire budget. A file that is fully skipped upstream has **zero** failing assertions, so
+the sort puts unreachable files at the very top. The generator excluded the `blocked-external`,
+`no-tests` and `ahead-of-reference` classifications but not `all-skipped`, and the resulting
+`js/third_party` manifest captured **15 of the 21 skip-gated files in the whole subtree** — files
+gated by `describe.skip` / `describe.skipIf(!credentials)` / `it.skip` in the vendored corpus
+itself, which no runtime change can reach and which rule 1 forbids editing.
+
+So: **a manifest entry must have `ran > 0` and `failed > 0`**, not merely a non-green
+classification. Check the built manifest's classification histogram before dispatching — one
+command, and it would have caught this. Two other bun manifests the same wave were clean (18/18)
+and nearly clean (16/18), so the failure is silent unless you look.
+
+Corollary for `js/third_party` specifically: its real denominator is the **ungated** set. Of 60
+reachable files, 44 are green and 16 fail for 16 unrelated causes — a broad sweep area, not a
+single-root-cause lane. And the whole reachable set scores in ~80 seconds, so it is cheap, not
+slow; the slowness was one memory-leak stress test.
+
 ## 2026-08-03 — CHECKPOINT FORMAT: every wave comment carries the running total and an ETA
 
 User directive: **"每次 comment 记录真实的推进数量 以及 总进度也一起在表格里 方便观察 以及 后面
