@@ -1292,7 +1292,7 @@ inline constexpr std::string_view kNodeInternalBindingJS = R"JS(
     const async_id_fields = new Float64Array(4);
     async_id_fields[constants.kAsyncIdCounter] = 1;
     async_id_fields[constants.kDefaultTriggerAsyncId] = -1;
-    return {
+    const binding = {
       constants,
       async_hook_fields: new Uint32Array(9),
       async_id_fields,
@@ -1310,6 +1310,19 @@ inline constexpr std::string_view kNodeInternalBindingJS = R"JS(
       registerDestroyHook() {},
       getPromiseHooks: () => [],
     };
+    // The typed arrays above are the LAST RESORT shape, kept so the binding
+    // still answers on a realm where the async_hooks payload never installed.
+    // When it did, node's src/async_wrap.cc equivalent is that payload, so the
+    // binding must expose its live state rather than a second, disconnected
+    // copy: an id queued through async_wrap.queueDestroyAsyncId has to reach the
+    // destroy hooks async_hooks.createHook() registered (test-async-wrap-
+    // destroyid), and a counter that disagrees with the payload's would hand out
+    // ids the rest of the runtime has already used.
+    const shared = G.__mbunAsyncWrapBinding;
+    if (shared) {
+      for (const key of Object.keys(shared)) binding[key] = shared[key];
+    }
+    return binding;
   };
 
   // -------------------------------------------------------------- timers ----

@@ -1094,6 +1094,32 @@ inline constexpr std::string_view kAsyncHooksJS = R"JS(
       value: () => AsyncContextFrame.current() !== undefined || enabledHooksExist(),
     });
 
+    // internalBinding('async_wrap') has to BE this payload's state, not a
+    // parallel set of typed arrays. node's src/async_wrap.cc exposes exactly the
+    // fields internal/async_hooks.js reads and writes, and the corpus reaches
+    // for the binding directly: test-async-wrap-destroyid calls
+    // async_wrap.queueDestroyAsyncId(id) and then waits for the destroy hook
+    // *this* payload owns to fire with that id. With two disconnected copies the
+    // queued id is dropped on the floor and no hook ever sees it. Everything
+    // here is bookkeeping the payload already had; nothing new runs on any
+    // promise or timer path.
+    Object.defineProperty(G, '__mbunAsyncWrapBinding', {
+      configurable: true, enumerable: false,
+      value: {
+        constants,
+        async_hook_fields,
+        async_id_fields,
+        async_ids_stack,
+        execution_async_resources,
+        queueDestroyAsyncId,
+        registerDestroyHook,
+        pushAsyncContext,
+        popAsyncContext,
+        clearAsyncIdStack,
+        executionAsyncResource,
+      },
+    });
+
     G.__mbunAsyncHookInit = (type, resource) => {
       const id = newAsyncId();
       emitInitScript(id, type, getDefaultTriggerAsyncId(), resource || { type });
