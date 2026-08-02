@@ -2225,6 +2225,13 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
       // asserts the propagated error arrives with stack === undefined).
       const d = {};
       try { d.message = e && e.message; } catch (_) {}
+      // JSC spells the stack-exhaustion RangeError with a trailing full stop;
+      // V8 — and therefore node's public contract, which the corpus asserts
+      // verbatim — does not. This is the one message the engines disagree about
+      // that crosses the worker boundary as DATA rather than as console output,
+      // so the serializer that rebuilds the error in the parent is where the
+      // engine's wording is translated into node's.
+      if (d.message === "Maximum call stack size exceeded.") d.message = "Maximum call stack size exceeded";
       try { d.name = e && e.name; } catch (_) {}
       try { d.stack = e && e.stack; } catch (_) { d.noStack = true; }
       try { d.code = e && e.code; } catch (_) {}
