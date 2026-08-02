@@ -1653,6 +1653,16 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
           let name = (eq === -1 ? tok : tok.slice(0, eq));
           while (name.charCodeAt(0) === 45) name = name.slice(1);
           name = name.replace(/_/g, "-");
+          // A token made of nothing but dashes is not a flag and must never be
+          // looked up in the table. `--` is node's END-OF-OPTIONS separator:
+          // everything after it is a positional argument, so validation stops
+          // dead rather than continuing to judge script args as flags. A lone
+          // `-` is node's spelling of "read the program from stdin", also not an
+          // option. test-process-exec-argv passes the parent's own execArgv
+          // straight into a Worker — `['--pending-deprecation', '--']` — which is
+          // exactly how a real caller reaches this, and the first cut of the
+          // allow-list rejected the separator as an unknown flag.
+          if (name === "") { if (tok === "--") break; continue; }
           if (!WORKER_EXEC_OPTIONS.has(name) && !(extra && extra.has(name))) throw invalidExecArgv(what, tok);
           // Needs a value and got none, and there is no following token to take
           // it from.
