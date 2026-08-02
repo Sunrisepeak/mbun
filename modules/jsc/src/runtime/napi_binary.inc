@@ -602,6 +602,21 @@ extern "C" napi_status napi_create_bigint_words(napi_env env, int sign_bit, size
     // well-formed and the engine's own RangeError/OOM is forwarded as
     // napi_pending_exception. test_bigint asserts both halves separately.
     NAPI_RETURN_EARLY_IF_FALSE(env, word_count <= static_cast<size_t>(INT_MAX), napi_invalid_arg);
+    // JSC::JSBigInt::createFromWords reads all `word_count` words before it
+    // decides the result is too large, so an over-long count segfaults on the
+    // caller's (correctly sized) buffer instead of throwing — test_bigint's
+    // MakeBigIntWordsThrow passes uint64_t[10] with word_count == INT_MAX
+    // precisely to exercise that path. Screen the length first, with the same
+    // RangeError V8 raises. maxLengthBits/digitBits mirrors JSBigInt's own
+    // private limit (1 Mibit of digits).
+    constexpr size_t kMaxBigIntWords = (1024 * 1024) / 64;
+    if (word_count > kMaxBigIntWords) {
+        auto scope = DECLARE_THROW_SCOPE(env->vm());
+        JSC::throwException(
+            env->globalObject(), scope,
+            JSC::createRangeError(env->globalObject(), "Maximum BigInt size exceeded"_s));
+        return setLastError(env, napi_pending_exception);
+    }
     JSC::JSBigInt* bigint = JSC::JSBigInt::createFromWords(
         env->globalObject(), std::span<const uint64_t>{words, word_count}, sign_bit != 0);
     NAPI_RETURN_IF_EXCEPTION(env);
