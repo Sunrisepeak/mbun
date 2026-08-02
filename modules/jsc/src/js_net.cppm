@@ -51,6 +51,37 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
   const def = (names, mod) => { for (const n of names) { M[n] = mod; M["node:" + n] = mod; } };
   const EE = (M["events"] && M["events"].EventEmitter) || class { on() { return this; } once() { return this; } off() { return this; } emit() { return false; } };
   const te = new G.TextEncoder(), td = new G.TextDecoder();
+  // node src/connection_wrap.cc + tcp_wrap.cc/pipe_wrap.cc: one nestable-async
+  // `connect` span in the 'node,node.net,node.net.native' compound category,
+  // opened when the uv connect request is queued and closed in AfterConnect --
+  // which runs for a FAILED connect too, carrying the status. The end is bound
+  // to 'connect'/'close' rather than to 'error': adding an 'error' listener
+  // would suppress the throw an unhandled socket error owes the program.
+  const NET_TRACE_CAT = "node,node.net,node.net.native";
+  let netTraceId = 0;
+  const netTraceConnect = (socket, unixPath, host, port) => {
+    const agent = G.__mbunTraceEvents;
+    if (!agent || typeof agent.groupEnabled !== "function" ||
+        !agent.groupEnabled(NET_TRACE_CAT)) return;
+    const id = ++netTraceId;
+    // pipe_wrap.cc names the two halves of a pipe target apart: a leading NUL
+    // is a Linux abstract socket, and the reported path drops it.
+    const begin = unixPath !== null && unixPath !== undefined
+      ? { path_type: String(unixPath).charCodeAt(0) === 0 ? "abstract socket" : "file",
+          pipe_path: String(unixPath).charCodeAt(0) === 0 ? String(unixPath).slice(1) : String(unixPath) }
+      : { ip: host, port: port };
+    agent.emitGroupArgs("b", NET_TRACE_CAT, "connect", id, begin);
+    let ended = false;
+    const end = (status) => {
+      if (ended) return;
+      ended = true;
+      agent.emitGroupArgs("e", NET_TRACE_CAT, "connect", id, { status });
+    };
+    try {
+      socket.once("connect", () => end(0));
+      socket.once("close", (hadError) => end(hadError ? -1 : 0));
+    } catch (e) {}
+  };
   // `internal/timers` owns the private kTimeout symbol. It is only available
   // when the internal module is loaded, so discover it lazily rather than
   // making ordinary net.Socket construction depend on an internal require.
@@ -815,6 +846,7 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
       else { port = +a[0] | 0; if (typeof a[1] === "string") { host = a[1]; cb = typeof a[2] === "function" ? a[2] : null; } else if (typeof a[1] === "function") cb = a[1]; }
       if (cb) this.once("connect", cb);
       this.connecting = true;
+      netTraceConnect(this, unixPath, host, port);
       const self = this;
       // node lib/net.js addClientAbortSignalOption: options.signal aborts the
       // connection with an AbortError. Only Server.listen honoured a signal, so

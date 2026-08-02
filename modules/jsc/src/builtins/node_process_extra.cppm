@@ -1470,8 +1470,20 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
             const e = new Error();
             e.name = "Trace";
             const frames = tracedStack(e).split("\n").slice(1).join("\n");
+            // node tags the warning with the thread that left: the main thread
+            // gets `(node:<pid>)`, a worker `(node:<pid>, thread:<tid>)`
+            // (src/node_errors.cc PrintErrorString callers). mbun runs a worker
+            // as a child process, so the tid comes from worker_threads rather
+            // than from a thread id this process could ask the OS for.
+            let tid = "";
+            try {
+                const wt = G.__mbunNativeModules &&
+                           (G.__mbunNativeModules["worker_threads"] ||
+                            G.__mbunNativeModules["node:worker_threads"]);
+                if (wt && wt.isMainThread === false) tid = ", thread:" + wt.threadId;
+            } catch (e) {}
             const head = "(" + ((proc.release && proc.release.name) || "node") + ":" + proc.pid +
-                         ") WARNING: Exited the environment with code " +
+                         tid + ") WARNING: Exited the environment with code " +
                          (code === undefined || code === null ? (proc.exitCode || 0) : code);
             proc.stderr.write(frames ? head + "\n" + frames + "\n" : head + "\n");
           } catch (e) {}
@@ -2024,6 +2036,26 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
           phases,
           createTracing, getEnabledCategories, getCategoryEnabledBuffer: categoryBuffer,
           isTraceCategoryEnabled: enabled,
+          // The pair node's TRACE_EVENT macros give a module that emits its own
+          // spans: a COMPOUND-category test and a recorder that writes that
+          // compound string verbatim. node:http and node:net call these from
+          // node's own trace sites rather than being wrapped from out here,
+          // because the moments node marks (a ServerResponse being constructed,
+          // a connect request completing) are not reachable from the outside.
+          groupEnabled,
+          emitGroup: (ph, cat, name, id, data) => {
+            if (groupEnabled(cat)) emit(ph, cat, name, id, data);
+          },
+          // The TRACE_EVENT_*1/*2 forms, whose key/value pairs land DIRECTLY in
+          // `args` rather than under `args.data` (node src/tracing/trace_event.h
+          // AddTraceEvent) -- test-trace-events-net-abstract-socket reads
+          // `trace.args.path_type` with no `.data` in between.
+          emitGroupArgs: (ph, cat, name, id, args) => {
+            if (!groupEnabled(cat)) return;
+            const event = { ph, cat, name, args: args === undefined ? {} : args };
+            if (id !== undefined && id !== null) event.id = "0x" + Number(id).toString(16);
+            record(event);
+          },
           enableCategories: (categories) => changeCategories(categories, 1),
           disableCategories: (categories) => changeCategories(categories, -1),
           setTraceCategoryStateUpdateHandler: (handler) => { if (typeof handler === "function") handlers.add(handler); },

@@ -263,7 +263,10 @@ int check_syntax(const std::string& code, const std::string& filename, bool modu
     options.cjs = module;
     auto transformed{mbun::js_parser::transpile(code, options)};
     if (!transformed.ok) {
-        std::println(std::cerr, "{}: SyntaxError: {}", filename, transformed.error);
+        // Same frame node prints for a failed --check (see Runtime::check_syntax):
+        // the filename line, a blank line, then the error on its own line.
+        std::println(std::cerr, "{}:1\n", filename);
+        std::println(std::cerr, "SyntaxError: {}", transformed.error);
         return 1;
     }
     return Runtime::instance().check_syntax(transformed.code, filename);

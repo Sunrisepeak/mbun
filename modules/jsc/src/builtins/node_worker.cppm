@@ -2498,6 +2498,21 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
                           "_debugProcess", "_debugPause", "_debugEnd"]) {
         try { delete proc[name]; } catch (e) {}
       }
+      // node lib/internal/util/trace_sigint.js: setTraceSigInt arms a
+      // PROCESS-wide SIGINT watchdog, so a worker is refused outright. Defined
+      // only here, following process.execve above: on the main thread mbun has
+      // no watchdog to arm, and an absent property is the honest report of that.
+      try {
+        const util = G.__mbunNativeModules &&
+                     (G.__mbunNativeModules["util"] || G.__mbunNativeModules["node:util"]);
+        if (util && typeof util.setTraceSigInt !== "function") {
+          util.setTraceSigInt = function setTraceSigInt() {
+            const e = new TypeError("Calling util.setTraceSigInt is not supported in workers");
+            e.code = "ERR_WORKER_UNSUPPORTED_OPERATION";
+            throw e;
+          };
+        }
+      } catch (e) {}
     };
   }
 
