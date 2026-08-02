@@ -358,6 +358,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W410 | Node global-console warning stderr-routing source fix | 5 | baseline W329 post-W409 4/5 pass + 1 fail; focused target 1/1 pass; W410 five-file regression 5/5 pass; W329 selector 5/5 pass; direct ordering smoke `ORDER 1`; serial release build 59.74s | route the default warning printer through live `process.stderr.write`, preserving console fallback when no writable stderr exists; issue #68 |
 | W411 | Node perf_hooks stale-owner revalidation | 5 + 5 | W330 5/5 pass and W331 5/5 pass; 0 timeout; no build | close stale ResourceTiming BigInt and nodeTiming milestone inventory rows; select the remaining W145 timer owner |
 | W412 | Node non-integer timer bucket source fix | 5 | baseline W145 4/5 pass + 1 fail; focused target 1/1 pass; W145/W327/W335 regressions each 5/5 pass; serial release build 59.88s | normalize real-time queue deadlines and interval periods to integer millisecond buckets while preserving public delay metadata; issue #69; no upstream fixture change |
+| W413 | Node internal `setUnrefTimeout` pump source fix | 5 | baseline 4/5 pass + 1 fail; focused target 1/1 pass; five independent focused repeats 5/5 pass; W413 final 5/5 pass; HTTP/2/socket regression 5/5 pass; serial release build 59.66s | bridge `internal/timers.js` private lists through `scheduleTimer()` to the existing native timer queue; issue #70; no upstream fixture change |
 
 ## W412 Node non-integer timer bucket source fix
 
@@ -379,6 +380,32 @@ measured **5/5 pass, 0 fail, 0 timeout**. Two additional five-job timer
 regressions, W327 clear/refresh/tampering and W335 API/primitive guards, also
 measured **5/5 pass** each. The final serial release build took **59.88s**.
 No upstream fixture changed and no full corpus/workspace-wide test ran.
+
+## W413 Node internal `setUnrefTimeout` pump source fix
+
+The bounded five-job probe measured **4/5 pass, 1 fail, 0 timeout**. The sole
+failure was `test-timers-refresh.js`: both `internal/timers.setUnrefTimeout()`
+callbacks were expected once but ran zero times. The adjacent linked-list,
+same-timeout, unenroll, and unref-interval guards passed.
+
+Issue [#70](https://github.com/Sunrisepeak/mbun/issues/70) records the redacted
+reproduction and source boundary. Node's `internal/timers.js` stores these
+private timers in `timerListQueue`, but mbun does not execute the full Node
+bootstrap that normally calls `internalBinding('timers').setupTimers()`. The
+binding now lazily obtains `getTimerCallbacks()` on the first `scheduleTimer()`
+call, arms the existing global timer queue, passes the shared libuv-style clock
+to `processTimers(now)`, and preserves ref/unref state for the native wake-up.
+
+The first setup-only implementation was rejected by a focused re-test because
+the bootstrap callback was absent in mbun. After the lazy callback bridge, the
+focused target measured **1/1 pass**, the original W413 five-file selector
+measured **5/5 pass, 0 fail, 0 timeout**, and the five-file HTTP/2/socket timer
+regression measured **5/5 pass, 0 fail, 0 timeout**. Five independent focused
+repetitions also measured **5/5 pass**. Direct bounded smokes
+reported `CALL`/`END 1`, internal callback order `1,2`, no output for an
+unref-only timer, and `REFRESH 2`. The final serial release build took
+**59.66s**. No upstream fixture changed and no full corpus/workspace-wide test
+ran.
 
 ## W305 Bun/Deno Event/Performance/URL/crypto leaf probe
 

@@ -1107,16 +1107,39 @@ inline constexpr std::string_view kNodeInternalBindingJS = R"JS(
   };
 
   // -------------------------------------------------------------- timers ----
-  // node src/timers.cc. `lib/internal/timers.js` reads `immediateInfo` /
-  // `timeoutInfo` as shared counter arrays and calls the four scheduling
-  // methods; this runtime owns its own timer wheel, so the methods are no-ops
-  // and the arrays are real (so node's ref-counting arithmetic still balances).
-  // What this buys is that the module *loads* — the corpus reaches into it for
-  // the `kTimeout` symbol.
-  factories["timers"] = () => ({
-    immediateInfo: new Uint32Array(3),
-    timeoutInfo: new Int32Array(1),
-    setupTimers() {},
+  // Bridge internal/timers.js' private timer lists onto the real-time queue.
+  factories["timers"] = () => {
+    const immediateInfo = new Uint32Array(3);
+    const timeoutInfo = new Int32Array(1);
+    let processImmediate = null, processTimers = null, nativeTimer = null;
+    const timerNow = () => Date.now() - LOOP_START_MS;
+    const ensureCallbacks = () => {
+      if (processTimers) return;
+      const timers = req("internal/timers");
+      if (!timers || typeof timers.getTimerCallbacks !== "function") return;
+      const callbacks = timers.getTimerCallbacks(() => {
+        if (G.__mbunRunTicks) G.__mbunRunTicks();
+      });
+      processImmediate = callbacks.processImmediate;
+      processTimers = callbacks.processTimers;
+    };
+    const armTimer = (delay) => {
+      if (nativeTimer !== null) { try { G.clearTimeout(nativeTimer); } catch (_) {} }
+      const wait = Math.max(1, Math.ceil(Math.abs(delay)));
+      nativeTimer = G.setTimeout(() => {
+        nativeTimer = null;
+        const next = processTimers ? processTimers(timerNow()) : 0;
+        if (next) armTimer(Math.abs(next) - timerNow());
+      }, wait);
+      try { if (timeoutInfo[0] > 0) nativeTimer.ref(); else nativeTimer.unref(); } catch (_) {}
+    };
+    const binding = {
+    immediateInfo,
+    timeoutInfo,
+    setupTimers(immediate, timers) {
+      processImmediate = immediate;
+      processTimers = timers;
+    },
     // node returns uv_now(loop): milliseconds since loop start, on the SAME
     // clock its timer deadlines are computed against (see node
     // lib/internal/timers.js:387, which uses this very call as the `start` a
@@ -1136,11 +1159,13 @@ inline constexpr std::string_view kNodeInternalBindingJS = R"JS(
     // Subtracting a start baseline keeps the magnitude SMI-small, which
     // test-timers-now requires (`< 0x3ffffff`, ~18.6h of uptime) and which a
     // raw Date.now() would blow by six orders of magnitude.
-    getLibuvNow: () => Date.now() - LOOP_START_MS,
-    scheduleTimer() {},
+    getLibuvNow: timerNow,
+    scheduleTimer(msecs) { ensureCallbacks(); if (processTimers) armTimer(msecs); },
     toggleTimerRef() {},
     toggleImmediateRef() {},
-  });
+    };
+    return binding;
+  };
 
   // ----------------------------------------------------------------- icu ----
   factories["icu"] = () => ({

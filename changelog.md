@@ -5,6 +5,14 @@
 
 ## 2026-08-02
 
+- W413 Node internal `setUnrefTimeout` pump source fix：`internal/timers.js` 的 private timer list 现在在首次
+  `scheduleTimer()` 时懒加载 `getTimerCallbacks()`，通过现有 native timer queue 调用 `processTimers(now)`，并按
+  ref/unref 状态管理 wake-up。issue #70；baseline **4/5 pass、1 fail、0 timeout**，focused target **1/1 pass**，
+  W413 五文件 selector 和 HTTP/2/socket timer regression 均 **5/5 pass、0 fail、0 timeout**，focused 独立重复
+  **5/5 pass**，serial release build **59.66s**。direct smoke 为 `CALL`/`END 1`、order `1,2`、unref-only 无输出、
+  refresh `2`。未修改
+  upstream fixture、未跑全量 corpus。
+
 - W412 Node non-integer timer bucket source fix：`process_web.cppm` 保留 timer facade 的公开 delay metadata，
   但将 real-time queue 的 deadline 和 interval period 归一到整数毫秒 bucket，修复 Node
   `test-timers-non-integer-delay.js` 的注册顺序。issue #69；baseline W145 **4/5 pass、1 fail**，focused
