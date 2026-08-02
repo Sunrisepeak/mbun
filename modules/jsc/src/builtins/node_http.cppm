@@ -93,6 +93,25 @@ inline constexpr std::string_view kNodeHttpJS = R"JS(
     return httpDCCache;
   };
 
+  // node lib/internal/http.js: one nestable-async span per request, in the
+  // 'node,node.http' compound category, opened where node opens it and closed
+  // where node closes it. The trace agent is installed by the process partition,
+  // so it is read per call rather than captured -- an untraced process never
+  // gets past the first `if`.
+  const TRACE_HTTP = "node,node.http";
+  let httpTraceId = 0;
+  const httpTraceBegin = (message, name) => {
+    const te = G.__mbunTraceEvents;
+    if (!te || typeof te.groupEnabled !== "function" || !te.groupEnabled(TRACE_HTTP)) return;
+    message._traceEventId = ++httpTraceId;
+    te.emitGroup("b", TRACE_HTTP, name, message._traceEventId);
+  };
+  const httpTraceEnd = (message, name, data) => {
+    const te = G.__mbunTraceEvents;
+    if (!te || typeof message._traceEventId !== "number") return;
+    te.emitGroup("e", TRACE_HTTP, name, message._traceEventId, data);
+  };
+
   // -------------------------------------------------- node error factories
   // internal/errors.js message templates, reproduced verbatim so assert.throws
   // shapes ({ code, name, message }) match upstream.
@@ -1019,6 +1038,7 @@ inline constexpr std::string_view kNodeHttpJS = R"JS(
     perfHttpStart(this, "HttpRequest", {
       req: { method: reqMsg && reqMsg.method, url: reqMsg && reqMsg.url, headers: reqMsg && reqMsg.headers },
     });
+    httpTraceBegin(this, "http.server.request");
     // node lib/_http_server.js: the ServerResponse constructor's last act is to
     // publish 'http.server.response.created' with the request it answers.
     const ch = httpDC().serverResponseCreated;
@@ -1039,6 +1059,8 @@ inline constexpr std::string_view kNodeHttpJS = R"JS(
       },
     });
     OutgoingMessage.prototype._finish.call(this);
+    httpTraceEnd(this, "http.server.request",
+                 { url: this.req && this.req.url, statusCode: this.statusCode });
   };
 
   function onServerResponseClose() {
@@ -1961,6 +1983,7 @@ inline constexpr std::string_view kNodeHttpJS = R"JS(
       const ch = httpDC().clientRequestCreated;
       if (ch.hasSubscribers) ch.publish({ request: this });
     }
+    httpTraceBegin(this, "http.client.request");
   }
   Object.setPrototypeOf(ClientRequest.prototype, OutgoingMessage.prototype);
   Object.setPrototypeOf(ClientRequest, OutgoingMessage);
@@ -2196,6 +2219,8 @@ inline constexpr std::string_view kNodeHttpJS = R"JS(
         const ch = httpDC().clientResponseFinish;
         if (ch.hasSubscribers) ch.publish({ request, response: res });
       }
+      httpTraceEnd(request, "http.client.request",
+                   { path: request.path, statusCode: res.statusCode });
       res.req = request;
       res.on("end", responseOnEnd);
       request.on("finish", requestOnFinish);

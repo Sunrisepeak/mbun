@@ -2024,6 +2024,26 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
           phases,
           createTracing, getEnabledCategories, getCategoryEnabledBuffer: categoryBuffer,
           isTraceCategoryEnabled: enabled,
+          // The pair node's TRACE_EVENT macros give a module that emits its own
+          // spans: a COMPOUND-category test and a recorder that writes that
+          // compound string verbatim. node:http and node:net call these from
+          // node's own trace sites rather than being wrapped from out here,
+          // because the moments node marks (a ServerResponse being constructed,
+          // a connect request completing) are not reachable from the outside.
+          groupEnabled,
+          emitGroup: (ph, cat, name, id, data) => {
+            if (groupEnabled(cat)) emit(ph, cat, name, id, data);
+          },
+          // The TRACE_EVENT_*1/*2 forms, whose key/value pairs land DIRECTLY in
+          // `args` rather than under `args.data` (node src/tracing/trace_event.h
+          // AddTraceEvent) -- test-trace-events-net-abstract-socket reads
+          // `trace.args.path_type` with no `.data` in between.
+          emitGroupArgs: (ph, cat, name, id, args) => {
+            if (!groupEnabled(cat)) return;
+            const event = { ph, cat, name, args: args === undefined ? {} : args };
+            if (id !== undefined && id !== null) event.id = "0x" + Number(id).toString(16);
+            record(event);
+          },
           enableCategories: (categories) => changeCategories(categories, 1),
           disableCategories: (categories) => changeCategories(categories, -1),
           setTraceCategoryStateUpdateHandler: (handler) => { if (typeof handler === "function") handlers.add(handler); },
