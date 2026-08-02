@@ -2439,11 +2439,19 @@ export constexpr std::string_view kNetJS_part2 = R"JS(
       requestHeaders["content-length"] = "0";
 
     const tlsOpt = (init && init.tls) || {};
-    const connectOptions = {
+    // mbun's node:http2 forwards its complete connect options object to
+    // tls.connect, so preserve every TLS credential/policy option instead of
+    // hand-picking CA and servername. The one exception is a custom identity
+    // callback: this runtime cannot enforce it when rejectUnauthorized is false
+    // (node:tls admits the peer before invoking the callback), so forced-H2
+    // fetch must fail before sending a request rather than bypass user policy.
+    if (typeof tlsOpt.checkServerIdentity === "function")
+      throw mkErr("HTTP/2 fetch cannot enforce tls.checkServerIdentity", "HTTP2Unsupported");
+    const connectOptions = Object.assign({}, tlsOpt, {
       rejectUnauthorized: tlsOpt.rejectUnauthorized !== false &&
         !(G.process && G.process.env && G.process.env.NODE_TLS_REJECT_UNAUTHORIZED === "0"),
-    };
-    if (tlsOpt.ca !== undefined) connectOptions.ca = tlsOpt.ca;
+    });
+    delete connectOptions.serverName;
     if (tlsOpt.serverName !== undefined) connectOptions.servername = tlsOpt.serverName;
 
     return new Promise((resolve, reject) => {
@@ -2498,16 +2506,25 @@ export constexpr std::string_view kNetJS_part2 = R"JS(
                 reject(new TypeError("Cannot follow redirect with a streaming request body"));
                 return;
               }
-              const next = new G.URL(location, parsed.href).href;
+              const nextURL = new G.URL(location, parsed.href);
+              const next = nextURL.href;
               const nextInit = Object.assign({}, init);
+              const nextHeaders = new G.Headers(nextInit.headers || undefined);
+              // Fetch redirect step 13 / bun CROSS_ORIGIN_STRIPPED_REQUEST_HEADERS:
+              // credentials and an explicit Host belong only to the old origin.
+              if (nextURL.origin !== parsed.origin) {
+                nextHeaders.delete("authorization");
+                nextHeaders.delete("proxy-authorization");
+                nextHeaders.delete("cookie");
+                nextHeaders.delete("host");
+              }
               if (status === 303 || ((status === 301 || status === 302) && method === "POST")) {
                 nextInit.method = "GET";
                 nextInit.body = null;
-                const nextHeaders = new G.Headers(nextInit.headers || undefined);
                 nextHeaders.delete("content-length");
                 nextHeaders.delete("content-type");
-                nextInit.headers = nextHeaders;
               }
+              nextInit.headers = nextHeaders;
               doFetchH2(next, nextInit, depth + 1).then((res) => {
                 res.redirected = true;
                 resolve(res);
