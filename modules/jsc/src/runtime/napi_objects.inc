@@ -878,9 +878,14 @@ static JSC::JSValue loadNapiModule(JSC::JSGlobalObject* globalObject, const std:
         reinterpret_cast<int32_t (*)()>(dlsym(handle, "node_api_module_get_api_version_v1"));
     if (!register_v1) {
         dlclose(handle);
-        JSC::throwTypeError(
+        // port: napi.cpp:754/808 — a .node that exports no registration entry
+        // point is node's ERR_DLOPEN_FAILED "Module has no declared entry
+        // point.", a plain Error. The old wording named the missing symbol,
+        // which reads as a TypeError about the caller's argument instead of a
+        // fact about the module being loaded.
+        JSC::throwException(
             globalObject, scope,
-            "symbol 'napi_register_module_v1' not found in native module. Is this a Node API (napi) module?"_s);
+            JSC::createError(globalObject, "Module has no declared entry point."_s));
         return {};
     }
     int moduleVersion = 8;
