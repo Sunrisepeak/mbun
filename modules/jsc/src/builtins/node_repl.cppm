@@ -1067,7 +1067,11 @@ inline constexpr std::string_view kNodeReplJS = R"JS(
           let dirents;
           try { dirents = fs.readdirSync(dir, { withFileTypes: true }); } catch { continue; }
           for (const dirent of dirents) {
-            if (extensions.includes(path.extname(dirent.name)) || indexes.includes(dirent.name)) {
+            // node's guard here excludes the versioned names 'npm' installs.
+            // mbun's skipped every entry with a requirable extension instead,
+            // which made the `group2.push` below unreachable for files: a
+            // relative `require('./` completed to nothing at all.
+            if (versionedFileNamesRe.test(dirent.name) || dirent.name === ".npm") {
               continue;
             }
             const extension = path.extname(dirent.name);
