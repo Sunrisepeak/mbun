@@ -228,7 +228,8 @@ std::string resolve_entry_path(std::string_view script) {
 int report_run_target_not_found(std::string_view target);
 
 // Run a JS file with process.argv = [runtime, script, ...args] (Node/bun order).
-int run_script(std::string_view script, std::span<const std::string_view> scriptArgs) {
+int run_script(std::string_view script, std::span<const std::string_view> scriptArgs,
+               std::optional<std::string_view> argvScript = std::nullopt) {
     // Best-effort, NON-FATAL bunfig.toml validation (ref bun
     // src/bunfig/arguments.rs load_config): emit a config error to stderr but
     // still run the script (exit unaffected). Parser + "expected string" type
@@ -283,7 +284,7 @@ int run_script(std::string_view script, std::span<const std::string_view> script
     std::vector<std::string> jsArgv;
     jsArgv.reserve(scriptArgs.size() + 2);
     jsArgv.emplace_back("mbun");
-    jsArgv.emplace_back(entry);
+    jsArgv.emplace_back(argvScript.value_or(entry));
     for (std::string_view a : scriptArgs) jsArgv.emplace_back(a);
     mbun::jsc::runtime::set_argv(std::move(jsArgv));
     return mbun::jsc::runtime::run_file(entry);
@@ -3156,7 +3157,36 @@ int exec_as_if_node(std::span<const std::string_view> args) {
         std::filesystem::path abs{std::filesystem::current_path(ec) / target};
         if (!ec) target = abs.lexically_normal().string();
     }
-    return run_script(target, args.subspan(i + 1));
+
+    // RunAsNodeCommand still boots through Bun's normal module resolver. For a
+    // missing extensionless positional that resolver tries the ESM entry order
+    // from resolver/options.rs before reporting not-found. Keep this completion
+    // at the node-shim dispatch point: ordinary `bun run` must retain its
+    // package-script/.bin lookup, while node mode must never enter either one.
+    //
+    // Only the load path gains the suffix. Bun preserves the spelling supplied
+    // by the user in process.argv[1], which as-node.test.ts pins explicitly.
+    std::string loadTarget{target};
+    {
+        std::error_code ec{};
+        const std::filesystem::path literal{target};
+        const bool literalIsFile{std::filesystem::exists(literal, ec) &&
+                                 !std::filesystem::is_directory(literal, ec)};
+        if (!literal.has_extension() && !literalIsFile) {
+            static constexpr std::string_view NODE_ENTRY_EXTENSION_ORDER[]{
+                ".tsx", ".jsx", ".mts", ".ts", ".mjs", ".js", ".cts", ".cjs", ".json"};
+            for (const std::string_view extension : NODE_ENTRY_EXTENSION_ORDER) {
+                std::filesystem::path candidate{target + std::string{extension}};
+                ec.clear();
+                if (std::filesystem::exists(candidate, ec) &&
+                    !std::filesystem::is_directory(candidate, ec)) {
+                    loadTarget = candidate.string();
+                    break;
+                }
+            }
+        }
+    }
+    return run_script(loadTarget, args.subspan(i + 1), target);
 }
 
 } // namespace mbun::app
