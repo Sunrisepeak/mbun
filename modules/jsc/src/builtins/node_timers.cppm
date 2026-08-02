@@ -453,72 +453,130 @@ inline constexpr std::string_view kNodeTimersJS = R"JS(
       const s = options.signal;
       return (s && typeof s === "object") ? s : undefined;
     };
+    // node lib/internal/validators.js, as used by lib/timers/promises.js.
+    // Message shapes come from ERR_INVALID_ARG_TYPE; __recv above already
+    // renders node's "Received ..." tail.
+    // node internal/errors.js: a name containing '.' names a PROPERTY, and
+    // makeNodeErrorWithCode gives every NodeError a toString() of
+    // `${name} [${code}]: ${message}` — assert.rejects(p, /ERR_INVALID_ARG_TYPE/)
+    // matches String(err), so without it the code is invisible to the matcher.
+    const tpErr = (name, expected, v) => {
+      const noun = name.indexOf(".") >= 0 ? "property" : "argument";
+      const e = new TypeError('The "' + name + '" ' + noun + " must be " + expected + ". Received " + __recv(v));
+      e.code = "ERR_INVALID_ARG_TYPE";
+      Object.defineProperty(e, "toString", {
+        value() { return "TypeError [ERR_INVALID_ARG_TYPE]: " + this.message; },
+        configurable: true, writable: true,
+      });
+      return e;
+    };
+    const vNumber = (v, name) => { if (typeof v !== "number") throw tpErr(name, "of type number", v); };
+    const vBoolean = (v, name) => { if (typeof v !== "boolean") throw tpErr(name, "of type boolean", v); };
+    const vObject = (v, name) => {
+      if (v === null || Array.isArray(v) || typeof v !== "object") throw tpErr(name, "of type object", v);
+    };
+    const vAbortSignal = (v, name) => {
+      if (v !== undefined && (v === null || typeof v !== "object" || !("aborted" in v)))
+        throw tpErr(name, "an instance of AbortSignal", v);
+    };
+    // node: `options = kEmptyObject` default; validation runs before any use.
+    const tpValidate = (options) => {
+      vObject(options, "options");
+      if (typeof options.signal !== "undefined") vAbortSignal(options.signal, "options.signal");
+      if (typeof options.ref !== "undefined") vBoolean(options.ref, "options.ref");
+    };
+    const kEmptyObj = Object.freeze({});
 
-    function tpSetTimeout(after = 1, value, options) {
-      const signal = signalOf(options);
-      const ref = options && typeof options === "object" ? options.ref : undefined;
-      return new Promise((resolve, reject) => {
-        if (signal && signal.aborted) return reject(abortError(signal));
-        let onAbort;
-        const t = mySetTimeout(() => {
-          if (signal && onAbort) { try { signal.removeEventListener("abort", onAbort); } catch (_) {} }
-          resolve(value);
-        }, after);
-        if (ref === false && t && typeof t.unref === "function") t.unref();
-        if (signal) {
-          onAbort = () => { myClearTimeout(t); reject(abortError(signal)); };
-          try { signal.addEventListener("abort", onAbort, { once: true }); } catch (_) {}
-        }
-      });
-    }
-    function tpSetImmediate(value, options) {
-      const signal = signalOf(options);
-      const ref = options && typeof options === "object" ? options.ref : undefined;
-      return new Promise((resolve, reject) => {
-        if (signal && signal.aborted) return reject(abortError(signal));
-        let onAbort;
-        const t = mySetImmediate(() => {
-          if (signal && onAbort) { try { signal.removeEventListener("abort", onAbort); } catch (_) {} }
-          resolve(value);
-        });
-        if (ref === false && t && typeof t.unref === "function") t.unref();
-        if (signal) {
-          onAbort = () => { myClearImmediate(t); reject(abortError(signal)); };
-          try { signal.addEventListener("abort", onAbort, { once: true }); } catch (_) {}
-        }
-      });
-    }
-    function tpSetInterval(after = 1, value, options) {
-      const signal = signalOf(options);
-      const ref = options && typeof options === "object" ? options.ref : undefined;
-      return {
-        [Symbol.asyncIterator]() {
-          let done = false;
-          return {
-            next() {
-              if (done) return Promise.resolve({ value: undefined, done: true });
-              if (signal && signal.aborted) { done = true; return Promise.reject(abortError(signal)); }
-              return new Promise((resolve, reject) => {
-                let onAbort;
-                const t = mySetTimeout(() => {
-                  if (signal && onAbort) { try { signal.removeEventListener("abort", onAbort); } catch (_) {} }
-                  resolve({ value, done: false });
-                }, after);
-                if (ref === false && t && typeof t.unref === "function") t.unref();
-                if (signal) {
-                  onAbort = () => { myClearTimeout(t); done = true; reject(abortError(signal)); };
-                  try { signal.addEventListener("abort", onAbort, { once: true }); } catch (_) {}
-                }
-              });
-            },
-            return() {
-              done = true;
-              return Promise.resolve({ value: undefined, done: true });
-            },
-          };
-        },
+    function tpSetTimeout(after, value, options = kEmptyObj) {
+      try {
+        if (typeof after !== "undefined") vNumber(after, "delay");
+        tpValidate(options);
+      } catch (err) { return Promise.reject(err); }
+      const signal = options.signal;
+      const ref = options.ref === undefined ? true : options.ref;
+      if (signal && signal.aborted) return Promise.reject(abortError(signal));
+      let resolve, reject;
+      const promise = new Promise((res, rej) => { resolve = res; reject = rej; });
+      const t = mySetTimeout(() => resolve(value), after);
+      if (ref === false && t && typeof t.unref === "function") t.unref();
+      if (!signal) return promise;
+      // node cancelListenerHandler: a timer that already fired is not cancelled.
+      const oncancel = () => {
+        if (!t._destroyed) { myClearTimeout(t); reject(abortError(signal)); }
       };
+      try { signal.addEventListener("abort", oncancel); } catch (_) {}
+      // node SafePromisePrototypeFinally: drop the listener however we settle.
+      return promise.finally(() => {
+        try { signal.removeEventListener("abort", oncancel); } catch (_) {}
+      });
     }
+    function tpSetImmediate(value, options = kEmptyObj) {
+      try { tpValidate(options); } catch (err) { return Promise.reject(err); }
+      const signal = options.signal;
+      const ref = options.ref === undefined ? true : options.ref;
+      if (signal && signal.aborted) return Promise.reject(abortError(signal));
+      let resolve, reject;
+      const promise = new Promise((res, rej) => { resolve = res; reject = rej; });
+      const t = mySetImmediate(() => resolve(value));
+      if (ref === false && t && typeof t.unref === "function") t.unref();
+      if (!signal) return promise;
+      const oncancel = () => {
+        if (!t._destroyed) { myClearImmediate(t); reject(abortError(signal)); }
+      };
+      try { signal.addEventListener("abort", oncancel); } catch (_) {}
+      return promise.finally(() => {
+        try { signal.removeEventListener("abort", oncancel); } catch (_) {}
+      });
+    }
+    // node lib/timers/promises.js setInterval is an `async function*`: calling
+    // it returns an async GENERATOR, so the returned value is itself the
+    // iterator (`.next()`/`.return()` live on it) as well as the iterable, and
+    // argument validation is deferred to the first next() — both of which
+    // test-timers-interval-promisified.js pins. A single repeating interval
+    // backs it, and ticks that arrive while the consumer is awaiting are
+    // counted (`notYielded`) and replayed rather than dropped.
+    async function* tpSetInterval(after, value, options = kEmptyObj) {
+      if (typeof after !== "undefined") vNumber(after, "delay");
+      tpValidate(options);
+      const signal = options.signal;
+      const ref = options.ref === undefined ? true : options.ref;
+      if (signal && signal.aborted) throw abortError(signal);
+      let onCancel;
+      let interval;
+      try {
+        let notYielded = 0;
+        let callback;
+        interval = mySetInterval(() => {
+          notYielded++;
+          if (callback) { callback(); callback = undefined; }
+        }, after);
+        if (ref === false && interval && typeof interval.unref === "function") interval.unref();
+        if (signal) {
+          onCancel = () => {
+            myClearInterval(interval);
+            if (callback) {
+              callback(Promise.reject(abortError(signal)));
+              callback = undefined;
+            }
+          };
+          try { signal.addEventListener("abort", onCancel, { once: true }); } catch (_) {}
+        }
+        while (!(signal && signal.aborted)) {
+          if (notYielded === 0) await new Promise((resolve) => { callback = resolve; });
+          for (; notYielded > 0; notYielded--) yield value;
+        }
+        throw abortError(signal);
+      } finally {
+        myClearInterval(interval);
+        if (signal && onCancel) { try { signal.removeEventListener("abort", onCancel); } catch (_) {} }
+      }
+    }
+    // node's exports carry the plain names.
+    try {
+      Object.defineProperty(tpSetTimeout, "name", { value: "setTimeout", configurable: true });
+      Object.defineProperty(tpSetImmediate, "name", { value: "setImmediate", configurable: true });
+      Object.defineProperty(tpSetInterval, "name", { value: "setInterval", configurable: true });
+    } catch (_) {}
     // node exposes `scheduler` as an instance of an unconstructable Scheduler
     // class: `new scheduler.constructor()` must throw ERR_ILLEGAL_CONSTRUCTOR.
     let __schedAllow = false;
@@ -543,9 +601,13 @@ inline constexpr std::string_view kNodeTimersJS = R"JS(
     // promisify hooks (node attaches these to the timer functions themselves).
     const custom = Symbol.for("nodejs.util.promisify.custom");
     try {
-      Object.defineProperty(mySetTimeout, custom, { value: (after, value) => tpSetTimeout(after, value), configurable: true });
-      Object.defineProperty(mySetImmediate, custom, { value: (value) => tpSetImmediate(value), configurable: true });
-      Object.defineProperty(mySetInterval, custom, { value: (after, value) => tpSetInterval(after, value), configurable: true });
+      // node lib/timers.js hangs the timers/promises functions THEMSELVES off
+      // the promisify.custom slot, so promisify(timers.setTimeout) === the
+      // timers/promises export (test-timers-timeout-promisified.js asserts
+      // strict equality). A forwarding arrow breaks that identity.
+      Object.defineProperty(mySetTimeout, custom, { value: tpSetTimeout, configurable: true });
+      Object.defineProperty(mySetImmediate, custom, { value: tpSetImmediate, configurable: true });
+      Object.defineProperty(mySetInterval, custom, { value: tpSetInterval, configurable: true });
     } catch (_) {}
 
     // Install wrappers globally and re-register node:timers in place.
