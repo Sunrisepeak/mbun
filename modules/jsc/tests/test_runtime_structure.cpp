@@ -33,6 +33,22 @@ std::size_t line_count(std::string_view source) {
         + (!source.empty() && source.back() != '\n' ? 1U : 0U);
 }
 
+std::string_view function_body(std::string_view source, std::string_view signature) {
+    const auto start{source.find(signature)};
+    if (start == std::string_view::npos) return {};
+    const auto open{source.find('{', start + signature.size())};
+    if (open == std::string_view::npos) return {};
+    std::size_t depth{};
+    for (std::size_t i{open}; i < source.size(); ++i) {
+        if (source[i] == '{') {
+            ++depth;
+        } else if (source[i] == '}' && --depth == 0) {
+            return source.substr(open + 1, i - open - 1);
+        }
+    }
+    return {};
+}
+
 // Collect the filenames (relative to runtime/) referenced by #include lines in
 // `source`. Accepts both `#include "runtime/x.inc"` (from runtime.cppm) and
 // `#include "x.inc"` (from a slice inside runtime/).
@@ -90,6 +106,26 @@ int main() {
         check(line_count(read_source(entry.path())) <= 2000,
               "runtime/" + name + " respects line budget even when unregistered");
     }
+
+    // A deferred N-API finalizer is a fresh callback boundary. A previously
+    // caught addon exception must not poison its NAPI_PREAMBLE, while an error
+    // raised by the finalizer itself must reach the shared uncaught channel.
+    // Keep these two sides together: clearing after the callback made both
+    // ordinary finalizers and throwing finalizers silently disappear (#86).
+    const auto napi{read_source(runtimeDir / "napi" / "mbun_napi.h")};
+    const auto drain{function_body(napi, "inline void drainPendingFinalizers()")};
+    check(!drain.empty(), "deferred N-API finalizer drain exists");
+    const auto lock{drain.find("JSC::JSLockHolder locker{fin.env->vm()}")};
+    const auto prepare{drain.find("prepareFinalizerCallback(fin.env)")};
+    const auto invoke{drain.find("fin.cb(fin.env, fin.data, fin.hint)")};
+    const auto dispatch{drain.find("dispatchFinalizerExceptions(fin.env)")};
+    check(lock != std::string_view::npos && lock < invoke,
+          "N-API finalizer holds the JSC API lock while calling addon code");
+    check(prepare != std::string_view::npos && prepare < invoke,
+          "N-API finalizer starts from a clean callback exception state");
+    check(invoke != std::string_view::npos && dispatch != std::string_view::npos &&
+              dispatch > invoke,
+          "N-API finalizer transfers its own exception to shared uncaught handling");
 
     if (gFailed != 0) {
         std::println(std::cerr, "test_runtime_structure: {} failed", gFailed);

@@ -5,6 +5,9 @@
 import std;
 import mbun.jsc.runtime;
 
+extern "C" void mbun_napi_test_dispatch_finalizer_error(void* context, const char* message);
+extern "C" int mbun_napi_test_drain_two_finalizers(void* context);
+
 namespace {
 
 int gFailed{0};
@@ -55,6 +58,47 @@ int main() {
     expect_num("Object.keys(Bun.TOML.parse('a = 1\\nb = 2\\n[t]\\nx = 3')).length", 3.0);
     expect_num("Bun.TOML.parse('a = 41').a + 1", 42.0);
     expect_num("typeof Bun.nanoseconds() === 'number' ? 1 : 0", 1.0);
+
+#if !defined(_WIN32)
+    // The native finalizer drain has already removed the VM/env exception when
+    // it reaches the process uncaught dispatcher. A broken/missing dispatcher
+    // must therefore arm the shared fatal channel itself rather than drop the
+    // finalizer error. A healthy dispatcher still receives it exactly once.
+    void* napiContext{mbun::jsc::runtime::dns_testing::js_context()};
+    expect_num("(()=>{globalThis.__mbun_fatal=null;globalThis.__mbun_fatal_status=1;"
+               "globalThis.__mbun_uncaught=null;return 1})()",
+               1.0);
+    mbun_napi_test_dispatch_finalizer_error(napiContext, "missing dispatcher");
+    expect_num("globalThis.__mbun_fatal?.[0]?.message==='missing dispatcher'&&"
+               "globalThis.__mbun_fatal_status===1?1:0",
+               1.0);
+
+    expect_num("(()=>{globalThis.__mbun_fatal=null;globalThis.__mbun_fatal_status=1;"
+               "globalThis.__mbun_uncaught=()=>{throw new Error('dispatcher failed')};return 1})()",
+               1.0);
+    mbun_napi_test_dispatch_finalizer_error(napiContext, "original finalizer error");
+    expect_num("globalThis.__mbun_fatal?.[0]?.message==='dispatcher failed'&&"
+               "globalThis.__mbun_fatal_status===7?1:0",
+               1.0);
+
+    expect_num("(()=>{globalThis.__mbun_fatal=null;globalThis.__mbun_fatal_status=1;"
+               "globalThis.__mbunFinalizerDispatchCalls=0;"
+               "globalThis.__mbun_uncaught=()=>{globalThis.__mbunFinalizerDispatchCalls++;"
+               "return true};return 1})()",
+               1.0);
+    mbun_napi_test_dispatch_finalizer_error(napiContext, "handled finalizer error");
+    expect_num("globalThis.__mbunFinalizerDispatchCalls===1&&"
+               "globalThis.__mbun_fatal===null?1:0",
+               1.0);
+
+    expect_num("(()=>{globalThis.__mbun_fatal=null;globalThis.__mbun_fatal_status=1;"
+               "globalThis.__mbun_uncaught=(error)=>{globalThis.__mbun_fatal=[error];"
+               "return false};return 1})()",
+               1.0);
+    expect(mbun_napi_test_drain_two_finalizers(napiContext) == 0,
+           "false uncaught result stops the remaining finalizer batch");
+    expect_num("globalThis.__mbun_fatal?.[0]?.message==='first finalizer failed'?1:0", 1.0);
+#endif
 
     if (gFailed > 0) {
         std::println("test_runtime_smoke: {} failed", gFailed);
