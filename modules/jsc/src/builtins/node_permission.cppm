@@ -258,6 +258,19 @@ inline constexpr std::string_view kNodePermissionJS = R"JS(
   // without adding any protection.
   const disabledUnderModel = ["fsync", "fdatasync", "fchmod", "fchown", "futimes"];
   if (fsMod) {
+    const FileHandle = fsMod.promises && fsMod.promises.FileHandle;
+    if (FileHandle && FileHandle.prototype && typeof FileHandle.prototype.chown === "function") {
+      const original = FileHandle.prototype.chown;
+      FileHandle.prototype.chown = function (...args) {
+        // Run the original first for its fd/uid/gid validation. It has no
+        // fchown syscall behind it, so success is replaced with node's model-on
+        // refusal without exposing an operation between validation and denial.
+        return Promise.resolve(original.apply(this, args)).then(() => {
+          throw PN.denyError("", "", "fchown API is disabled when Permission Model is enabled.");
+        });
+      };
+    }
+
     for (const base of disabledUnderModel) {
       for (const name of [base, base + "Sync"]) {
         const original = fsMod[name];
