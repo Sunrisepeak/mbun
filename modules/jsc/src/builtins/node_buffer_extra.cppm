@@ -117,20 +117,19 @@ inline constexpr std::string_view kNodeBufferExtraJS = R"JS(
       const originalStringRepeat = String.prototype.repeat;
       Object.defineProperty(String.prototype, "repeat", {
         value: function repeat(count) {
-          // Keep the engine's conversion/error behavior for non-numeric counts
-          // (including Symbols and coercion side effects). The numeric fast path
-          // is sufficient to enforce Node's fixed V8 string limit before JSC
-          // attempts the allocation.
-          if (typeof count !== "number" || !Number.isFinite(count))
-            return originalStringRepeat.call(this, count);
           if (this == null) return originalStringRepeat.call(this, count);
           const text = String(this);
-          const repetitions = count < 0 ? Math.ceil(count) : Math.floor(count);
+          // Unary + performs the spec's ToNumber exactly once: objects retain
+          // their coercion side effects, while Symbol and BigInt still throw.
+          // Pass the resulting primitive to JSC so it cannot coerce count again.
+          const number = +count;
+          const repetitions = Number.isNaN(number) ? 0
+            : (number < 0 ? Math.ceil(number) : Math.floor(number));
           if (repetitions > 0 && text.length > 0 &&
               repetitions > MAX_STRING_LENGTH / text.length) {
             throw new RangeError("Invalid string length");
           }
-          return originalStringRepeat.call(text, count);
+          return originalStringRepeat.call(text, repetitions);
         },
         writable: true,
         enumerable: false,

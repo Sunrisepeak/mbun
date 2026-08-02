@@ -43,6 +43,7 @@ inline constexpr std::string_view kZlibStreamJS = R"JS(
       zlibMaxOutputLength = value;
     return zmod;
   };
+  const zlibArmFailures = [];
   for (const name of ["zlib", "node:zlib"]) {
     try {
       Object.defineProperty(M, name, {
@@ -50,8 +51,17 @@ inline constexpr std::string_view kZlibStreamJS = R"JS(
         enumerable: true,
         configurable: true,
       });
-    } catch (_) {}
+      if (Object.getOwnPropertyDescriptor(M, name).get !== armZlibMaxOutputLength)
+        throw new Error("accessor was not installed");
+    } catch (error) {
+      zlibArmFailures.push(name + ": " + ((error && error.message) || String(error)));
+    }
   }
+  // Bootstrap must remain usable if an embedding freezes its registry, but the
+  // missed require edge must never be silent: embedders/tests can inspect this
+  // stable diagnostic and fail deterministically.
+  if (zlibArmFailures.length)
+    G.__mbunZlibArmError = zlibArmFailures.join("; ");
   G.__mbunZlibArmKMax = armZlibMaxOutputLength;
   const Transform = streamMod.Transform;
   const finished = streamMod.finished;
@@ -736,20 +746,22 @@ inline constexpr std::string_view kZlibStreamJS = R"JS(
     zstdDecompressSync: { kind: K_ZDEC, Engine: ZstdDecompress },
   };
   const asyncOf = { inflateSync: "inflate", inflateRawSync: "inflateRaw", gunzipSync: "gunzip", unzipSync: "unzip", brotliDecompressSync: "brotliDecompress", zstdDecompressSync: "zstdDecompress" };
-  const enforceDefaultOutputLimit = (result, opts) => {
-    // An explicit maxOutputLength is already passed to the native one-shot
-    // helper. This branch supplies Node's captured default for bootstrap-backed
-    // modules, whose native facade otherwise has no require-time cap.
-    if (opts && typeof opts === "object" && opts.maxOutputLength !== undefined)
-      return result;
-    if (result && typeof result.byteLength === "number" &&
-        result.byteLength > zlibMaxOutputLength) {
-      const error = new RangeError("Cannot create a Buffer larger than " +
-                                   zlibMaxOutputLength + " bytes");
-      error.code = "ERR_BUFFER_TOO_LARGE";
-      throw error;
+  const nativeDecodeOpts = (opts) => {
+    if (opts === undefined || opts === null || typeof opts === "object") {
+      const nativeOpts = opts && typeof opts === "object" ? Object.create(opts) : {};
+      // Resolve an explicit getter once, then shadow it on the derived object;
+      // the native helper cannot trigger a second coercion or mutate the caller.
+      const explicitMax = opts && typeof opts === "object" ? opts.maxOutputLength : undefined;
+      Object.defineProperty(nativeOpts, "maxOutputLength", {
+        value: explicitMax === undefined ? zlibMaxOutputLength : explicitMax,
+        writable: true,
+        enumerable: true,
+        configurable: true,
+      });
+      return nativeOpts;
     }
-    return result;
+    // Preserve the native type error for invalid primitive options.
+    return opts;
   };
   for (const name of Object.keys(decoderOneShots)) {
     const cfg = decoderOneShots[name];
@@ -762,7 +774,7 @@ inline constexpr std::string_view kZlibStreamJS = R"JS(
         const buf = decodeThroughHandle(cfg, data, opts, F_SYNC);
         return opts.info ? { buffer: buf, engine: Object.create(cfg.Engine.prototype) } : buf;
       }
-      try { return enforceDefaultOutputLimit(orig(data, opts), opts); }
+      try { return orig(data, nativeDecodeOpts(opts)); }
       catch (e) {
         // The whole-buffer natives collapse every decode failure into one generic
         // message; node distinguishes truncated input ("unexpected end of file")
