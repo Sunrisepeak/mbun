@@ -476,6 +476,28 @@ stress/subprocess coverage without a test summary. `bun-server.test.ts` and
 `bun-serve-propagate-errors.test.ts` remain parked as separate owners. No
 upstream fixture changed and no full corpus/workspace-wide test ran.
 
+## W419 Bun missing-file static route source fix
+
+The focused W418 slices showed two forms of the same missing-file contract:
+`Response(Bun.file(...))` initially absent and a file deleted after route
+creation both returned an empty 200 instead of falling through to `fetch`.
+Five independent minimal Linux processes reproduced the initial behavior
+identically; the response body exposed the BunFile marker and `ENOENT`.
+
+Issue [#74](https://github.com/Sunrisepeak/mbun/issues/74) records the redacted
+reproduction. The source fix keeps a non-enumerable filesystem path on
+BunFile handles and makes both native epoll and JS fallback route dispatch
+discard only path-backed missing static responses. Function routes, fd/FIFO
+handles, existing files, and ordinary Response/Blob routes retain their
+previous dispatch path.
+
+After a **61.02s** serial release build, five independent minimal processes
+reported fallback for both `/response` and `/direct`. Five focused corpus
+lanes measured **4/5 pass, 1/5 fail, 0 timeout**: the two missing-file tests,
+the deleted-after-route test, and HEAD serving passed; the remaining lane
+failed only on the separate Last-Modified metadata owner. No upstream fixture
+changed and no full corpus/workspace-wide test ran.
+
 ## W305 Bun/Deno Event/Performance/URL/crypto leaf probe
 
 The bounded five-job Bun selector covered Deno Event, Performance, URL,

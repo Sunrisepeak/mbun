@@ -5,6 +5,8 @@
 
 ## 2026-08-02
 
+- W419 Bun missing-file static route source fix：修复 `Response(Bun.file(...))` 与 direct BunFile route 在文件不存在或 route 创建后文件被删除时返回空 200 的问题；path-backed missing static response 现在回退到 `fetch`，fd/FIFO、函数 route 和现有文件路径不变。issue #74；serial release build **61.02s**；五个独立最小进程均验证 `/response` 与 `/direct` fallback，五个 focused corpus lane **4/5 pass、1/5 fail、0 timeout**，唯一剩余为独立 Last-Modified owner。未修改 upstream fixture、未跑全量 corpus。
+
 - W418 Bun static-file route source fix：`Bun.serve({ routes })` 现在接受直接的 `Bun.file(...)`/Blob 静态 route value，并复用既有 Response clone/framing 路径；issue #73。初始五文件 probe 为 **2 green / 3 test-failure、90 passed / 91 failed / 186 ran / 363 expects**，失败文件在 setup 阶段被同一条 route validation 拦截；修复后为 **2 green / 2 test-failure / 1 timeout、89 passed / 10 failed / 100 ran / 361 expects**。五个独立最小进程均确认 direct route accepted，wire probe 返回 **200 + 6185 body bytes**；剩余为 Last-Modified、missing-file fallback、Range、header snapshot 与 stress/subprocess 等独立 owner，未声称完整 `bun-serve-file` 通过。W416 HTTP/2 guard **5/5 pass**、W417 Bun serve leaf **5/5 green / 79 passed / 0 failed / 80 ran** 同批记录；未修改 upstream fixture、未跑全量 corpus。
 
 - W415 Node HTTP/2 internal request-submit seam source fix：修复 live `ClientHttp2Session.request()` 绕过

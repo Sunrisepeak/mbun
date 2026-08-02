@@ -428,6 +428,7 @@ inline constexpr std::string_view kYamlBlockMarkdownJS = R"JS(  // ---- block mo
         const slot = (k, v) => Object.defineProperty(f, k, { value: v, writable: true, enumerable: false, configurable: true });
         slot("__size", size);
         slot("__name", p);
+        slot("__mbunPath", isFd ? "" : fsPath);
         slot("__lastModified", 0);
         if (!ioerr && (!isFd || fdSize >= 0)) {
           const protoU8 = Object.getOwnPropertyDescriptor(G.Blob.prototype, "_u8");

@@ -182,6 +182,19 @@ export constexpr std::string_view kNetJS_part2 = R"JS(
   // path as an explicitly constructed Response.
   const isStaticBody = (v) => isResponseLike(v) || (typeof G.Blob === "function" && v instanceof G.Blob);
   const asStaticResponse = (v) => isResponseLike(v) ? v : new G.Response(v);
+  // A missing BunFile is a route miss, not an empty successful response. Keep
+  // function routes untouched: only a static response selected by compilation
+  // can fall through to the server's fetch handler this way.
+  const isMissingStaticResponse = (v) => {
+    const b = v && v._b;
+    if (!b || !b.__isBunFile) return false;
+    if (b.__mbunIoErr) return true;
+    const p = b.__mbunPath;
+    if (!p) return false; // fd/FIFO-backed handles are not path-missing routes.
+    try { (M["fs"] || M["node:fs"]).statSync(p); return false; }
+    catch (e) { return true; }
+  };
+  const usableRouteMatch = (m) => m && (typeof m.handler === "function" || !isMissingStaticResponse(m.handler)) ? m : null;
   const hexVal = (c) => (c >= 48 && c <= 57) ? c - 48 : (c >= 97 && c <= 102) ? c - 87 : (c >= 65 && c <= 70) ? c - 55 : -1;
   // Decode a raw (latin1) path segment: percent-decode, then lossy UTF-8 decode.
   const decodeParam = (seg) => {
@@ -608,12 +621,13 @@ export constexpr std::string_view kNetJS_part2 = R"JS(
       for (let i = 0; i + 1 < hdrs.length; i += 2) req.headers.append(hdrs[i], hdrs[i + 1]);
       serverObj.pendingRequests++;
       const matched = handlerRef.routes ? handlerRef.routes.match(tgt.path, ev.method) : null;
-      req.params = matched ? matched.params : {};
+      const route = usableRouteMatch(matched);
+      req.params = route ? route.params : {};
       let out;
       if (tooLarge) {
         out = new G.Response(null, { status: 413 });
-      } else if (matched) {
-        const h = matched.handler;
+      } else if (route) {
+        const h = route.handler;
         if (typeof h === "function") { try { out = h.call(serverObj, req, serverObj); } catch (e) { out = handleError(e); } }
         else out = (h && typeof h.clone === "function") ? h.clone() : h;   // static Response (clone per request)
       } else if (typeof handlerRef.fetch === "function") {
@@ -904,10 +918,11 @@ export constexpr std::string_view kNetJS_part2 = R"JS(
             serverObj.pendingRequests++;
             sock._httpBusy = true;
             const matched = handlerRef.routes ? handlerRef.routes.match(tgt.path, parser.method) : null;
-            req.params = matched ? matched.params : {};
+            const route = usableRouteMatch(matched);
+            req.params = route ? route.params : {};
             let out;
-            if (matched) {
-              const h = matched.handler;
+            if (route) {
+              const h = route.handler;
               if (typeof h === "function") { try { out = h.call(serverObj, req, serverObj); } catch (e) { out = handleError(e); } }
               else out = (h && typeof h.clone === "function") ? h.clone() : h;   // static Response (clone per request)
             } else if (typeof handlerRef.fetch === "function") {
