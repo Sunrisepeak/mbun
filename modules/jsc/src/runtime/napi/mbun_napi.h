@@ -548,11 +548,31 @@ inline void prepareFinalizerCallback(napi_env env) {
     env->clearPendingException();
 }
 
-// Hand an error raised by a finalizer to the same process-level uncaught path
-// used by timer/I/O callbacks. That path offers process capture/listeners first
-// and arms Runtime's fatal channel only when nobody claims the error.
-inline void dispatchFinalizerException(napi_env env, JSC::JSValue error) {
+// The JS dispatcher is intentionally writable (workers and node:domain wrap
+// it), so dispatch itself can fail. Bypass that user-configurable slot and arm
+// the fatal channel's backing properties directly: the native pump reads them
+// after every phase, and putDirect cannot run a hostile setter.
+inline void armFinalizerFatal(napi_env env, JSC::JSValue error, int status) {
     if (env == nullptr || error.isEmpty()) return;
+    JSC::VM& vm{env->vm()};
+    JSC::Strong<JSC::Unknown> rooted{vm, error};
+    auto catcher = DECLARE_TOP_EXCEPTION_SCOPE(vm);
+    catcher.clearException();
+    env->clearPendingException();
+    JSC::JSGlobalObject* globalObject{env->globalObject()};
+    JSC::JSArray* fatal{JSC::constructEmptyArray(globalObject, nullptr, 1)};
+    fatal->putDirectIndex(globalObject, 0, rooted.get());
+    globalObject->putDirect(vm, JSC::Identifier::fromString(vm, "__mbun_fatal"_s), fatal);
+    globalObject->putDirect(vm, JSC::Identifier::fromString(vm, "__mbun_fatal_status"_s),
+                            JSC::jsNumber(status));
+}
+
+// Hand an error raised by a finalizer to the same process-level uncaught path
+// used by timer/I/O callbacks. Return false after fail-closed fallback so the
+// drain stops: a later finalizer must not clear the fatal error at its fresh
+// callback boundary.
+inline bool dispatchFinalizerException(napi_env env, JSC::JSValue error) {
+    if (env == nullptr || error.isEmpty()) return true;
     JSC::JSGlobalObject* globalObject{env->globalObject()};
     JSContextRef ctx{toRef(globalObject)};
     JSObjectRef global{JSContextGetGlobalObject(ctx)};
@@ -560,33 +580,66 @@ inline void dispatchFinalizerException(napi_env env, JSC::JSValue error) {
     JSValueRef lookupException{nullptr};
     JSValueRef candidate{JSObjectGetProperty(ctx, global, name, &lookupException)};
     JSStringRelease(name);
-    if (lookupException != nullptr || candidate == nullptr ||
-        !JSValueIsObject(ctx, candidate)) {
-        return;
+    if (lookupException != nullptr) {
+        armFinalizerFatal(env, toJS(globalObject, lookupException), 7);
+        return false;
+    }
+    if (candidate == nullptr || !JSValueIsObject(ctx, candidate)) {
+        armFinalizerFatal(env, error, 1);
+        return false;
     }
     JSObjectRef handler{JSValueToObject(ctx, candidate, nullptr)};
-    if (handler == nullptr || !JSObjectIsFunction(ctx, handler)) return;
+    if (handler == nullptr || !JSObjectIsFunction(ctx, handler)) {
+        armFinalizerFatal(env, error, 1);
+        return false;
+    }
     JSValueRef argument{toRef(globalObject, error)};
     JSValueRef dispatchException{nullptr};
     JSObjectCallAsFunction(ctx, handler, nullptr, 1, &argument, &dispatchException);
+    if (dispatchException != nullptr) {
+        armFinalizerFatal(env, toJS(globalObject, dispatchException), 7);
+        return false;
+    }
+    return true;
 }
 
-inline void dispatchFinalizerExceptions(napi_env env) {
-    if (env == nullptr) return;
+inline bool dispatchFinalizerExceptions(napi_env env) {
+    if (env == nullptr) return true;
     JSC::VM& vm{env->vm()};
     auto catcher = DECLARE_TOP_EXCEPTION_SCOPE(vm);
-    JSC::Strong<JSC::Unknown> vmException;
-    if (JSC::Exception* exception{catcher.exception()}) {
-        vmException.set(vm, exception->value());
+    JSC::Strong<JSC::Unknown> exception;
+    if (JSC::Exception* vmException{catcher.exception()}) {
+        exception.set(vm, vmException->value());
         catcher.clearException();
     }
-    JSC::Strong<JSC::Unknown> napiException;
     if (env->hasPendingException()) {
-        napiException.set(vm, env->pendingException());
+        if (!exception) exception.set(vm, env->pendingException());
         env->clearPendingException();
     }
-    if (vmException) dispatchFinalizerException(env, vmException.get());
-    if (napiException) dispatchFinalizerException(env, napiException.get());
+    if (!exception) return true;
+    return dispatchFinalizerException(env, exception.get());
+}
+
+extern "C" __attribute__((visibility("hidden"))) void mbun_napi_test_dispatch_finalizer_error(
+    void* opaqueContext, const char* message) {
+    auto ctx = static_cast<JSContextRef>(opaqueContext);
+    JSC::JSGlobalObject* globalObject{toJS(ctx)};
+    JSC::JSLockHolder locker{globalObject->vm()};
+    JSStringRef text{JSStringCreateWithUTF8CString(message)};
+    JSValueRef argument{JSValueMakeString(ctx, text)};
+    JSStringRelease(text);
+    JSValueRef creationException{nullptr};
+    JSObjectRef error{JSObjectMakeError(ctx, 1, &argument, &creationException)};
+    if (creationException != nullptr || error == nullptr) return;
+    NapiEnv env{globalObject, NAPI_VERSION, "[finalizer dispatch test]"};
+    JSC::JSValue errorValue{toJS(globalObject, error)};
+    // Model the defensive dual-store case: one callback error can be visible
+    // through both the VM and napi_env. The drain must select and dispatch it
+    // once, not offer the same exception to process twice.
+    env.scheduleException(errorValue);
+    (void)env.throwPendingException();
+    env.scheduleException(errorValue);
+    (void)dispatchFinalizerExceptions(&env);
 }
 
 // Drain the deferred (GC-time) finalizer task queue. Only called from
@@ -601,7 +654,7 @@ inline void drainPendingFinalizers() {
             ScopedHandleScope scope;
             prepareFinalizerCallback(fin.env);
             fin.cb(fin.env, fin.data, fin.hint);
-            dispatchFinalizerExceptions(fin.env);
+            if (!dispatchFinalizerExceptions(fin.env)) return;
         }
     }
 }
