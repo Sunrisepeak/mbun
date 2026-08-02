@@ -636,9 +636,14 @@ inline constexpr std::string_view kNodeDiagJS = R"JS(
         throw argTypeError("options", "object", options);
       if (typeof validateStream !== "boolean") throw argTypeError("options.validateStream", "boolean", validateStream);
 
+      // Bun's styleText has no stream gate at all: it always emits the escape
+      // codes. Node's gates on the target stream, defaulting to process.stdout.
+      // We keep node's gate for the case node actually asserts on -- an
+      // explicitly supplied `stream` -- and follow bun when the caller names no
+      // stream, which is the only shape the two runtimes disagree about.
       let skipColorize;
-      if (validateStream) {
-        const stream = (options && options.stream !== undefined) ? options.stream : (G.process && G.process.stdout);
+      if (validateStream && options && options.stream !== undefined) {
+        const stream = options.stream;
         if (!isStreamish(stream))
           throw argTypeError("stream", ["ReadableStream", "WritableStream", "Stream"], stream);
         skipColorize = !shouldColorize(stream);

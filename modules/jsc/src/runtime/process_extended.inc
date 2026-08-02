@@ -707,8 +707,13 @@ void execve_mark_cloexec_above_stdio() {
 // asserts `err.errno > 0`), alongside code/syscall/path.
 JSValueRef execve_throw_errno(JSContextRef ctx, JSValueRef* exc, int e, const std::string& path) {
     const std::string code{fd_errno_code(e)};
-    const std::string msg{(code.empty() ? "E" + std::to_string(e) : code) + ": "
-                          + fd_errno_message(e) + ", execve '" + path + "'"};
+    // node ErrnoException(isolate, errno, syscall, msg, path) formats as
+    // "<CODE>, <strerror> '<path>'" -- NOT the libuv "CODE: msg, syscall 'path'"
+    // shape used by the fs bindings. execve reaches JS through ErrnoException
+    // (node_process_methods.cc Execve -> ThrowErrnoException), and bun's
+    // BunProcess.cpp builds the identical string, so both corpora read this one.
+    const std::string msg{(code.empty() ? "E" + std::to_string(e) : code) + ", "
+                          + fd_errno_message(e) + " '" + path + "'"};
     JSValueRef m{make_string(ctx, msg)};
     JSObjectRef err{JSObjectMakeError(ctx, 1, &m, nullptr)};
     if (!code.empty()) set_prop(ctx, err, "code", make_string(ctx, code));
