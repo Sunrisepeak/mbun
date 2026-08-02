@@ -11,6 +11,12 @@
   DNS callback 仍须等 backend release。未回退 runtime timer 语义、未 skip CI；上一轮
   W423 gate 的 GCC 唯一失败为该测试，LLVM 已通过，修复后需重新取得 Linux CI 绿灯。
 
+- W425 GCC workspace gate timer-order test correction：将真实 `localhost` resolver
+  的 timer-before-DNS 顺序断言改为已有 delayed DNS backend 的确定性场景，先保持
+  worker 阻塞并验证 timer 已到期，再 release backend 验证 DNS callback 顺序。未改
+  runtime timer 语义、未 skip CI、未重写结果；W424 rerun 的 GCC 唯一失败已定位为
+  该同类 1ms wall-clock race，需重新取得 Linux CI 绿灯。
+
 - W423 Bun.file conditional-request response source fix：Bun.serve 现在对 BunFile
   按 `If-None-Match → If-Modified-Since → Range` 顺序处理 GET/HEAD 条件请求，匹配
   validator 返回无 body 的 304，非匹配 `If-None-Match` 保持 200 并跳过 IMS，非

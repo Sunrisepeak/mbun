@@ -7033,6 +7033,19 @@ surface on Linux:
   混修；下一轮必须从 fresh bounded measurement 选单一 owner。W55 无构建、无全量
   corpus，资源策略继续保持 3–5 jobs，并在 swap/disk 低水位时只做小型 probe。
 
+### W425 GCC workspace gate timer-order test correction
+
+- The W424 rerun fixed the held-backend assertion but exposed the same timing
+  assumption in the earlier `test_lookup_does_not_block_the_js_turn`: a real
+  `localhost` resolver could finish before the runtime's minimum 1ms timer
+  bucket, so the test's required `timer`-before-`dns` ordering was not
+  deterministic under GCC.
+- The test now uses the existing delayed DNS backend, waits for the worker to
+  enter, proves the timer fires while DNS is held, verifies no DNS callback has
+  arrived, then releases the backend and verifies the callback order. Runtime
+  semantics and the ordering assertion remain unchanged; no CI skip or result
+  rewrite is involved.
+
 ### W424 GCC workspace gate timer-order test correction
 
 - The first W423 Linux gate reached a real GCC-only failure in
