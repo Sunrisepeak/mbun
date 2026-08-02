@@ -960,6 +960,12 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
             if (typeof ip !== "string") continue;
             const f = (a.family === 4 || a.family === 6) ? a.family : _famOf(ip);
             if (f !== 4 && f !== 6) continue;
+            // node checks the BlockList while it is BUILDING the candidate list
+            // and destroys the socket on the first blocked address. It is not an
+            // attempt that can be retried past, so it never joins the
+            // AggregateError (test-net-blocklist reads err.code directly).
+            if (_blockList && _blockList.check(ip, f === 6 ? "ipv6" : "ipv4"))
+              return failWith(mkErr("IP is blocked by net.BlockList", "ERR_IP_BLOCKED"));
             if (!firstFam) firstFam = f;
             if (bucket[f].indexOf(ip) !== -1) continue;
             bucket[f].push(ip);
@@ -979,10 +985,6 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
             const ip = order[i];
             const f = _famOf(ip);
             attempted.push(ip + ":" + port);
-            if (_blockList && _blockList.check(ip, f === 6 ? "ipv6" : "ipv4")) {
-              errors.push(mkErr("IP is blocked by net.BlockList", "ERR_IP_BLOCKED"));
-              continue;
-            }
             let fdA;
             try { fdA = NN.connect(ip, port, _localAddr, _localPort, _attemptTimeout); }
             catch (e) { errors.push(connectError(e, ip, port)); continue; }
