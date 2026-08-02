@@ -595,12 +595,19 @@ inline bool dispatchFinalizerException(napi_env env, JSC::JSValue error) {
     }
     JSValueRef argument{toRef(globalObject, error)};
     JSValueRef dispatchException{nullptr};
-    JSObjectCallAsFunction(ctx, handler, nullptr, 1, &argument, &dispatchException);
+    JSValueRef dispatchResult{
+        JSObjectCallAsFunction(ctx, handler, nullptr, 1, &argument, &dispatchException)};
     if (dispatchException != nullptr) {
         armFinalizerFatal(env, toJS(globalObject, dispatchException), 7);
         return false;
     }
-    return true;
+    if (dispatchResult == nullptr) {
+        armFinalizerFatal(env, error, 1);
+        return false;
+    }
+    // The shared dispatcher returns false after it has armed fatal state. As
+    // with tick/timer drains, stop this batch without overwriting that state.
+    return JSValueToBoolean(ctx, dispatchResult);
 }
 
 inline bool dispatchFinalizerExceptions(napi_env env) {
@@ -657,6 +664,27 @@ inline void drainPendingFinalizers() {
             if (!dispatchFinalizerExceptions(fin.env)) return;
         }
     }
+}
+
+static void testFailingFinalizer(napi_env env, void*, void*) {
+    (void)napi_throw_error(env, nullptr, "first finalizer failed");
+}
+
+static void testCountingFinalizer(napi_env, void* data, void*) {
+    ++*static_cast<int*>(data);
+}
+
+extern "C" __attribute__((visibility("hidden"))) int mbun_napi_test_drain_two_finalizers(
+    void* opaqueContext) {
+    auto ctx = static_cast<JSContextRef>(opaqueContext);
+    JSC::JSGlobalObject* globalObject{toJS(ctx)};
+    NapiEnv env{globalObject, NAPI_VERSION, "[finalizer drain test]"};
+    int secondCalls{0};
+    auto& queue{NapiState::singleton().pendingFinalizers};
+    queue.push_back({&env, testFailingFinalizer, nullptr, nullptr});
+    queue.push_back({&env, testCountingFinalizer, &secondCalls, nullptr});
+    drainPendingFinalizers();
+    return secondCalls;
 }
 
 // ── callback info (port: napi.h NAPICallFrame) ─────────────────────────────

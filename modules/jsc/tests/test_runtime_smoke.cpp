@@ -6,6 +6,7 @@ import std;
 import mbun.jsc.runtime;
 
 extern "C" void mbun_napi_test_dispatch_finalizer_error(void* context, const char* message);
+extern "C" int mbun_napi_test_drain_two_finalizers(void* context);
 
 namespace {
 
@@ -89,6 +90,14 @@ int main() {
     expect_num("globalThis.__mbunFinalizerDispatchCalls===1&&"
                "globalThis.__mbun_fatal===null?1:0",
                1.0);
+
+    expect_num("(()=>{globalThis.__mbun_fatal=null;globalThis.__mbun_fatal_status=1;"
+               "globalThis.__mbun_uncaught=(error)=>{globalThis.__mbun_fatal=[error];"
+               "return false};return 1})()",
+               1.0);
+    expect(mbun_napi_test_drain_two_finalizers(napiContext) == 0,
+           "false uncaught result stops the remaining finalizer batch");
+    expect_num("globalThis.__mbun_fatal?.[0]?.message==='first finalizer failed'?1:0", 1.0);
 #endif
 
     if (gFailed > 0) {
