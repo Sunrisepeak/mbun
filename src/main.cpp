@@ -75,6 +75,53 @@ int main(int argc, char* argv[]) {
     }
     publish_dialect(resolvedDialect);
 
+    // ── NODE_OPTIONS may not select a startup MODE.
+    //    node marks every option kAllowedInEnvvar or not (src/node_options.cc);
+    //    the ones it withholds are those that decide WHAT the process runs
+    //    rather than how it runs — printing a version or help text, an eval
+    //    string, the REPL, a syntax check, the test runner, or the `--`
+    //    terminator. Meeting one in NODE_OPTIONS is fatal before any JS runs:
+    //    "<argv0>: <opt> is not allowed in NODE_OPTIONS", exit 9
+    //    (test-cli-node-options-disallowed enumerates exactly this set).
+    //
+    //    This is node's DENY set, not the complement of its allow set. mbun
+    //    accepts node flags it has not modelled everywhere else, so rejecting by
+    //    allowlist here would turn every uncatalogued flag into a hard startup
+    //    failure — a much larger claim than the one node is making.
+    {
+        static constexpr std::string_view kNotAllowedInNodeOptions[]{
+            "--version", "-v",  "--help",           "--", "-h", "--eval",  "-e",
+            "--print",   "-p",  "-pe",              "-ep",
+            "--check",   "-c",  "--interactive",    "-i",
+            "--v8-options", "--expose_internals", "--expose-internals", "--test"};
+        const auto refuse{[&](std::string_view word) {
+            if (word.empty()) return false;
+            std::string_view name{word};
+            if (const std::size_t eq{word.find('=')}; eq != std::string_view::npos) {
+                name = word.substr(0, eq);
+            }
+            for (const std::string_view bad : kNotAllowedInNodeOptions) {
+                if (name != bad) continue;
+                std::println(std::cerr, "{}: {} is not allowed in NODE_OPTIONS",
+                             argc > 0 ? argv[0] : "mbun", word);
+                return true;
+            }
+            return false;
+        }};
+        if (const char* nodeOptions{std::getenv("NODE_OPTIONS")}; nodeOptions != nullptr) {
+            std::string token{};
+            for (const char c : std::string_view{nodeOptions}) {
+                if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
+                    if (!token.empty() && refuse(token)) return 9;
+                    token.clear();
+                } else {
+                    token.push_back(c);
+                }
+            }
+            if (!token.empty() && refuse(token)) return 9;
+        }
+    }
+
     // ── --enable-fips / --force-fips on a non-FIPS OpenSSL → refuse to start.
     //    node ProcessFipsOptions() (src/crypto/crypto_util.cc) asks OpenSSL for a
     //    FIPS provider and, when there is none, node.cc:1246 reports
