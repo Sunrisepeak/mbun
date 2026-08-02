@@ -1347,6 +1347,18 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
       "test-reporter test-reporter-destination test-shard test-skip-pattern test-timeout " +
       "tls-cipher-list tls-keylog trace-event-categories trace-event-file-pattern " +
       "unhandled-rejections watch-path").split(" "));
+  // NODE_OPTIONS is parsed against a DIFFERENT and larger table than a worker's
+  // execArgv: node's kAllowedInEnvvar, which admits options that are
+  // process-wide precisely because the environment applies to the process.
+  // `--title` is the case the corpus pins from both sides — refused in execArgv
+  // (test-worker-execargv-invalid) and accepted in NODE_OPTIONS
+  // (test-worker-node-options, whose fixture copies the parent's env wholesale).
+  // Only a genuinely UNKNOWN option is refused here.
+  const NODE_OPTIONS_EXTRA = new Set((
+      "diagnostic-dir interpreted-frames-native-stack max-old-space-size " +
+      "max-semi-space-size perf-basic-prof perf-basic-prof-only-functions perf-prof " +
+      "perf-prof-unwinding-info stack-trace-limit title tls-keylog " +
+      "max-http-header-size v8-pool-size").split(" "));
   const invalidExecArgv = (what, tok) => {
     const e = new Error("Initiated Worker with invalid " + what + ": " + tok);
     e.code = "ERR_WORKER_INVALID_EXEC_ARGV";
@@ -1631,7 +1643,7 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
       // Allow-list rather than deny-list, because that is the shape of the
       // question: "is this one of the options a thread may carry", not "is this
       // one of the bad ones". Anything not listed is refused.
-      const validateExecArgvList = (list, what) => {
+      const validateExecArgvList = (list, what, extra) => {
         for (let i = 0; i < list.length; i++) {
           const tok = String(list[i]);
           // A bare token is the VALUE of the option before it (`--require foo`),
@@ -1641,7 +1653,7 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
           let name = (eq === -1 ? tok : tok.slice(0, eq));
           while (name.charCodeAt(0) === 45) name = name.slice(1);
           name = name.replace(/_/g, "-");
-          if (!WORKER_EXEC_OPTIONS.has(name)) throw invalidExecArgv(what, tok);
+          if (!WORKER_EXEC_OPTIONS.has(name) && !(extra && extra.has(name))) throw invalidExecArgv(what, tok);
           // Needs a value and got none, and there is no following token to take
           // it from.
           if (eq === -1 && WORKER_EXEC_OPTIONS_WITH_VALUE.has(name) &&
@@ -1655,9 +1667,13 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
       // same table before the thread starts — an unparseable NODE_OPTIONS is the
       // same ERR_WORKER_INVALID_EXEC_ARGV. Only an EXPLICIT env is checked: an
       // inherited one already survived this process's own startup.
-      if (options.env && options.env !== SHARE_ENV && typeof options.env.NODE_OPTIONS === "string") {
+      // …and never re-checked when it is the value THIS process already started
+      // with: a copied env carries the parent's NODE_OPTIONS unchanged, and the
+      // parent accepting it at startup is the whole proof it is valid.
+      if (options.env && options.env !== SHARE_ENV && typeof options.env.NODE_OPTIONS === "string" &&
+          options.env.NODE_OPTIONS !== (proc.env && proc.env.NODE_OPTIONS)) {
         validateExecArgvList(options.env.NODE_OPTIONS.split(/\s+/).filter((s) => s !== ""),
-                             "NODE_OPTIONS env variable");
+                             "NODE_OPTIONS env variable", NODE_OPTIONS_EXTRA);
       }
       // Serialise BEFORE the structuredClone check: the encoder is what knows
       // about the transfer list, and it owns the "needs transfer but was not
