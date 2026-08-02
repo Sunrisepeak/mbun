@@ -1230,6 +1230,7 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
   const pathM = M["path"] || M["node:path"];
   const fsM = M["fs"] || M["node:fs"];
   const osM = M["os"] || M["node:os"];
+  const streamM = M["stream"] || M["node:stream"];
   const workerRegistry = new Map();  // threadId -> Worker (parent side)
   let nextThreadId = 1;
 
@@ -1831,10 +1832,48 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
       // asked for the streams (options.stdout / options.stderr / options.stdin).
       this.stdin = options.stdin ? child.stdin : null;
       if (!options.stdin && child.stdin) { try { child.stdin.end(); } catch (e) {} }
-      this.stdout = child.stdout;
-      this.stderr = child.stderr;
-      if (!options.stdout && child.stdout) child.stdout.on("data", (d) => { try { proc.stdout.write(d); } catch (e) {} });
-      if (!options.stderr && child.stderr) child.stderr.on("data", (d) => { try { proc.stderr.write(d); } catch (e) {} });
+      // node's worker stdout/stderr are MESSAGE PORTS, not pipes: the worker's
+      // process.stdout is a Writable whose every write becomes one message, and
+      // the parent turns each message back into exactly one 'data' chunk. Chunk
+      // BOUNDARIES are therefore part of the contract, and the corpus asserts
+      // them directly — test-worker-no-stdin-stdout-interaction wants ten writes
+      // to arrive as ten 'data' events, and test-worker-message-port-drain
+      // matches each worker line against a whole chunk.
+      //
+      // An mbun worker is a child PROCESS whose fd 1 is an OS pipe, and a pipe
+      // has no message boundaries at all: ten quick writes coalesce in the
+      // kernel buffer and the parent reads one chunk (measured: 1 event, not 10;
+      // and "1 threadId: 1\n2 threadId: 1" as a single chunk). So the worker's
+      // writes ride the IPC channel as 'so'/'se' frames — the same channel the
+      // messages use, which is also what makes the drain test's ORDERING hold —
+      // and this stream is where they are re-emitted, one chunk per frame.
+      //
+      // child.stdout is still merged in rather than dropped: anything that
+      // reaches the child's real fd 1 without passing through its
+      // process.stdout (the runtime's own fatal-error printer, a grandchild
+      // process, a native write) has no frame and would otherwise vanish.
+      const mkStdioStream = () => {
+        if (!streamM || typeof streamM.PassThrough !== "function") return null;
+        try { return new streamM.PassThrough(); } catch (e) { return null; }
+      };
+      const outStream = mkStdioStream();
+      const errStream = mkStdioStream();
+      this._outStream = outStream;
+      this._errStream = errStream;
+      this.stdout = outStream || child.stdout;
+      this.stderr = errStream || child.stderr;
+      if (child.stdout) child.stdout.on("data", (d) => {
+        if (outStream) { try { outStream.write(d); return; } catch (e) {} }
+        if (!options.stdout) { try { proc.stdout.write(d); } catch (e) {} }
+      });
+      if (child.stderr) child.stderr.on("data", (d) => {
+        if (errStream) { try { errStream.write(d); return; } catch (e) {} }
+        if (!options.stderr) { try { proc.stderr.write(d); } catch (e) {} }
+      });
+      // node pipes the worker's stdio into the parent's unless the caller asked
+      // to own the stream (options.stdout / options.stderr).
+      if (!options.stdout && outStream) outStream.on("data", (d) => { try { proc.stdout.write(d); } catch (e) {} });
+      if (!options.stderr && errStream) errStream.on("data", (d) => { try { proc.stderr.write(d); } catch (e) {} });
       workerRegistry.set(tid, this);
 
       const self = this;
@@ -1880,6 +1919,16 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
           if (m.d && m.d.code) err.code = m.d.code;
           if (typeof self.onerror === "function") self.onerror(err);
           self.emit("error", err);
+        } else if (m.t === "so" || m.t === "se") {
+          // One stdio write in the worker, re-emitted here as exactly one chunk.
+          // base64 because the IPC channel carries JSON and a worker's stdout is
+          // a byte stream, not text.
+          const s = m.t === "so" ? self._outStream : self._errStream;
+          let buf = null;
+          try { buf = G.Buffer.from(String(m.d), "base64"); } catch (e) { buf = null; }
+          if (buf === null) return;
+          if (s) { try { s.write(buf); } catch (e) {} }
+          else { try { (m.t === "so" ? proc.stdout : proc.stderr).write(buf); } catch (e) {} }
         } else if (m.t === "me") {
           self.emit("messageerror", new Error(String(m.d)));
         } else if (m.t === "wm" && typeof m.id === "number") {
@@ -1916,6 +1965,10 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
         self.threadName = null;
         workerRegistry.delete(tid);
         if (self._tempFile) { try { fsM.unlinkSync(self._tempFile); } catch (e) {} self._tempFile = null; }
+        // The synthetic stdio streams have no fd to close themselves on: end
+        // them with the thread, so a reader waiting on 'end' is not left open.
+        if (self._outStream) { try { self._outStream.end(); } catch (e) {} }
+        if (self._errStream) { try { self._errStream.end(); } catch (e) {} }
         self.emit("exit", self._exitCode);
         const rs = self._exitResolvers.splice(0);
         for (const r of rs) r(self._exitCode);
@@ -2315,6 +2368,52 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
         const realChdir = proc.chdir;
         rawChdirW = realChdir.bind(proc);
       }
+      // ---- stdio as messages, not as a pipe ---------------------------------
+      // node's worker stdout/stderr ARE message ports (internal/worker/io.js
+      // WritableWorkerStdio): one write is one message, and the parent turns it
+      // back into one 'data' chunk. mbun's worker is a child process whose fd 1
+      // is an OS pipe, which has no boundaries — ten writes coalesce into one
+      // read and the corpus notices (see the parent-side note above). Sending
+      // each write as its own IPC frame restores the boundary AND the ordering
+      // against postMessage, since both now ride the same channel.
+      //
+      // Installed from HERE rather than at partition-assembly time because
+      // process.stdout does not exist yet when the worker_threads partition is
+      // evaluated; node_process_extra calls this after the process object is
+      // complete. The real stream stays underneath as the fallback for a frame
+      // that cannot be built or sent.
+      const frameStdio = (stream, tag) => {
+        if (!stream || typeof stream.write !== "function" || stream.write.__mbunFramed) return;
+        const realWrite = stream.write;
+        const framed = function write(chunk, enc, cb) {
+          if (typeof enc === "function") { cb = enc; enc = undefined; }
+          let buf = null;
+          try {
+            buf = (G.Buffer && G.Buffer.isBuffer(chunk))
+                ? chunk
+                : (chunk instanceof Uint8Array ? G.Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength)
+                                               : G.Buffer.from(String(chunk), enc || "utf8"));
+          } catch (e) { buf = null; }
+          if (buf === null || !wsendable()) return realWrite.call(this, chunk, enc, cb);
+          let sent = false;
+          try { sent = wsend({ t: tag, d: buf.toString("base64") }); } catch (e) { sent = false; }
+          if (!sent) return realWrite.call(this, chunk, enc, cb);
+          // node's WritableWorkerStdio calls the write callback once the message
+          // is handed off, i.e. asynchronously but unconditionally
+          // (test-worker-no-stdin-stdout-interaction passes common.mustSucceed()
+          // as that callback).
+          if (typeof cb === "function") {
+            try { proc.nextTick(() => cb(null)); } catch (e) { try { cb(null); } catch (_) {} }
+          }
+          return true;
+        };
+        try {
+          framed.__mbunFramed = true;
+          stream.write = framed;
+        } catch (e) {}
+      };
+      frameStdio(proc.stdout, "so");
+      frameStdio(proc.stderr, "se");
       const unsupported = (name) => {
         const f = function () {
           const e = new TypeError("process." + name + "() is not supported in workers");
