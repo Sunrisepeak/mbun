@@ -227,6 +227,7 @@
         set_native_fn(ctx_, cryptoAsymNative, "ecdhConvertKey", 3, node_asym_ecdh_convert_host);
         set_native_fn(ctx_, cryptoAsymNative, "okpDerive", 2, node_asym_okp_derive_host);
         set_native_fn(ctx_, cryptoAsymNative, "kmac", 5, node_asym_kmac_host);
+        set_native_fn(ctx_, cryptoAsymNative, "argon2", 9, node_asym_argon2_host);
         set_native_fn(ctx_, cryptoAsymNative, "keyType", 3, node_asym_key_type_host);
         set_native_fn(ctx_, cryptoAsymNative, "keyExport", 7, node_asym_key_export_host);
         set_native_fn(ctx_, cryptoAsymNative, "jwkExport", 3, node_asym_jwk_export_host);

@@ -199,6 +199,7 @@
 #include <openssl/encoder.h>
 #include <openssl/err.h>
 #include <openssl/evp.h>
+#include <openssl/kdf.h>  // node:crypto argon2 (OpenSSL >= 3.2 ARGON2D/I/ID KDF, crypto_asym.inc)
 #include <openssl/objects.h>
 #include <openssl/param_build.h>
 #include <openssl/params.h>
