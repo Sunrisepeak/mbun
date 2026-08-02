@@ -497,6 +497,14 @@ JSValueRef compile_cache_enable_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, s
         result.cache_directory = handler.base_directory();
     } else {
         result = handler.enable(dir, portable);
+        // Upstream Environment::EnableCompileCache traces whatever explanation
+        // Enable() produced -- a denied permission, an uncreatable directory --
+        // rather than leaving the caller as the only one who can see it. That
+        // trace is the only report a NODE_COMPILE_CACHE run gets, since nothing
+        // in JS ever looks at the status on that path.
+        if (!result.message.empty()) {
+            handler.debug_("[compile cache] " + result.message + "\n");
+        }
     }
 
     const JSValueRef entries[3]{
