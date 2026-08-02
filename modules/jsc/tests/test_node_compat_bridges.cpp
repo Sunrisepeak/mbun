@@ -19,6 +19,13 @@ void expect_number(std::string_view source, double expected, std::string_view na
 }  // namespace
 
 int main() {
+    // Member tests bypass the CLI's resolve_dialect() dispatch. Select Node
+    // before the first eval initializes the singleton runtime so these probes
+    // exercise the same builtin branches as the compat/node corpus.
+    mbun::jsc::runtime::set_dialect(mbun::jsc::runtime::Dialect::Node);
+    expect_number(
+        "globalThis.__mbunDialect === 'node' ? 1 : 0",
+        1, "node compatibility probes run in the Node dialect");
     expect_number(
         "(()=>{try{const fs=require('node:fs');"
         "const p=require('node:util').promisify(fs.exists);"
