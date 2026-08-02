@@ -147,7 +147,14 @@ bool collect_simple_segments(const SimpleAtom& atom, LowerCtx& ctx,
 // Read one variable out of the environment the lowered plan will run under.
 // `have_env` means the caller supplied an explicit envp (`$\`...\`.env({...})`),
 // in which case the process environment is NOT what the command will see.
+// Returns nullopt when the value cannot be read *as the command will see it*.
+// `state_mutated` is the same guard eval_cmdsubst uses and is load-bearing here
+// for the same reason: `HOME=lmao && echo ~` lowers the assignment stage first,
+// so a lookup performed while building the plan would still observe the pre-
+// assignment value and bake it into the argv (bunshell.test.ts tilde_expansion
+// "modified $HOME or $USERPROFILE"). After a mutation the word punts, as before.
 std::optional<std::string> lookup_env(const LowerCtx& ctx, std::string_view name) {
+    if (ctx.state_mutated) return std::nullopt;
     if (ctx.have_env && ctx.envp != nullptr) {
         for (char* entry : *ctx.envp) {
             if (entry == nullptr) continue;
