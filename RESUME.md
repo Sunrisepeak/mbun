@@ -43,6 +43,36 @@ second `AbortSignal` had replaced mbun's platform one wholesale — the surrende
 exists to end. Residual gap: composite-signal abort ordering (`01234` vs mbun's `41230`),
 which needs node's dependant-signal registry in mbun's platform `AbortSignal`. Its own lane.
 
+### A STRUCTURAL CEILING, measured: workers are processes, and ~10 corpus files cannot pass
+
+This matters for the 100% goal specifically, so it is stated here rather than buried in a
+lane report. **An mbun `Worker` is a separate process, not a thread**, and JSC allocates
+`SharedArrayBuffer` backing stores itself, so mbun cannot back one with `MAP_SHARED` — a SAB
+crossing the worker boundary is a **copy**. W46's worker lane enumerated what that costs, file
+by file, out of the 17 still red in `test-worker-*`:
+
+- genuinely shared memory: `beforeexit-throw-exit`, `message-channel-sharedarraybuffer`,
+  `workerdata-sharedarraybuffer`, `http2-generic-streams-terminate`, `stack-overflow-stack-size`
+- cross-process `Atomics.wait`/`notify` on top of that (JSC's wait list is per-process, not a
+  futex): `messaging-errors-timeout`, `cwd-race-condition`
+- shared WASM memory: `message-port-wasm-threads`
+- one process-wide `environ` (`SHARE_ENV` written in the worker, visible in the parent):
+  `process-env-shared`
+- one shared fd table — the parent `fstat()`s an fd *number* the worker opened:
+  `track-unmanaged-fds`
+
+Three more (`cli-options`, `message-not-serializable`, `cwd-race-condition`) are **harness**-gated
+rather than thread-gated: they need `--expose-internals` on the *parent*, and the corpus runner
+deliberately does not emulate `// Flags:`.
+
+So 100% of `test-worker-*` is not reachable by fixing worker bugs. It requires either changing
+mbun's worker model to real threads — a campaign-scale decision with its own performance and
+isolation consequences — or accepting a documented ceiling here. **Do not size future worker
+lanes as if those ten files were in play.** The 4 that are genuinely reachable and unattempted
+are `data-url` (exit code 13 for an unsettled top-level await in an ESM entry — runtime-wide,
+not worker-specific), `message-port-transfer-filehandle`, `messaging` (needs globally-sequential
+threadId allocation plus cross-process BroadcastChannel) and `message-type-unknown`.
+
 ### CORRECTION from W46: "loadable" is not "portable"
 
 W46 sized four lanes as port-shaped on the strength of the numbers above, and two of them
