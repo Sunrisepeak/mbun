@@ -1752,7 +1752,48 @@ inline constexpr std::string_view kNodeInternalBindingJS = R"JS(
       EVP_PKEY_ML_DSA_87: undefined, EVP_PKEY_ML_KEM_512: undefined,
       EVP_PKEY_ML_KEM_768: undefined, EVP_PKEY_ML_KEM_1024: undefined,
       kKeyVariantAES_OCB_128: undefined,
-      Argon2Job: undefined,
+      // node src/crypto/crypto_util.h CryptoJobMode + src/crypto/crypto_argon2.h.
+      kCryptoJobAsync: 0, kCryptoJobSync: 1, kCryptoJobWebCrypto: 2,
+      kTypeArgon2d: 0, kTypeArgon2i: 1, kTypeArgon2id: 2,
+      // node src/crypto/crypto_argon2.cc Argon2Job. The C++ original is a
+      // ThreadPoolWork subclass whose `run()` either derives inline (sync) or
+      // schedules onto the threadpool and reports through `ondone`; the observable
+      // contract the corpus drives is exactly that pair, plus the tuple shape
+      // `[err, result]` for the sync arm. mbun's KDF bridge is a synchronous
+      // OpenSSL call, so the async arm defers the REPORT rather than the work —
+      // the difference is invisible to a caller and keeps one code path.
+      //
+      // Errors are values here, not throws: node's JS callers destructure
+      // `{ 0: err, 1: result }` and test `err !== undefined`, so a throwing
+      // run() would escape past them.
+      Argon2Job: class Argon2Job {
+        constructor(mode, message, nonce, parallelism, tagLength, memory, passes,
+                    secret, associatedData, type) {
+          this.mode = mode;
+          this.ondone = undefined;
+          this.args = [type, message, nonce, parallelism, tagLength, memory, passes,
+                       secret, associatedData];
+        }
+        run() {
+          const AN = globalThis.__mbunCryptoAsymNative;
+          let err;
+          let result;
+          try {
+            if (!AN || typeof AN.argon2 !== "function") {
+              throw new Error("Argon2 derivation failed");
+            }
+            result = AN.argon2(...this.args);
+          } catch (e) {
+            err = e;
+            result = undefined;
+          }
+          // kCryptoJobSync
+          if (this.mode === 1) { return [err, result]; }
+          const ondone = this.ondone;
+          queueMicrotask(() => { if (typeof ondone === "function") ondone.call(this, err, result); });
+          return undefined;
+        }
+      },
       KmacJob: undefined,
       // node's C++ SecureContext. mbun's TLS owns its own context, so this is
       // the shape node's internal/tls/common.js drives — enough for that module

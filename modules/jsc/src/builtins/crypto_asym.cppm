@@ -1206,6 +1206,105 @@ inline constexpr std::string_view kCryptoAsymJS = R"JS(
     queueMicrotask(() => callback(null, k));
   };
 
+  // ---- argon2 / argon2Sync ----------------------------------------------
+  // Port of node lib/internal/crypto/argon2.js check() + the two entry points.
+  // The KDF itself is OpenSSL's (AN.argon2); everything here is node's parameter
+  // policy, kept in JS because that is where node keeps it — the native bridge
+  // adds no policy of its own, so these validators are the only gate and must
+  // reproduce node's errors exactly, not merely reject the same inputs.
+  // ref: node lib/internal/validators.js validateInteger/validateUint32,
+  //      lib/internal/crypto/util.js getArrayBufferOrView.
+  const MAX_U32 = 4294967295;
+  const outOfRange = (name, range, received) => {
+    const e = new RangeError('The value of "' + name + '" is out of range. It must be ' +
+      range + ". Received " + (typeof received === "number" ? String(received) : argRecv(received)));
+    e.code = "ERR_OUT_OF_RANGE"; return e;
+  };
+  const argTypeError = (name, expected, value) => {
+    const e = new TypeError('The "' + name + '" argument must be of type ' + expected +
+      ". Received " + argRecv(value));
+    e.code = "ERR_INVALID_ARG_TYPE"; return e;
+  };
+  const validateInteger = (value, name, min, max) => {
+    if (typeof value !== "number") throw argTypeError(name, "number", value);
+    if (!Number.isInteger(value)) throw outOfRange(name, "an integer", value);
+    if (value < min || value > max) throw outOfRange(name, ">= " + min + " && <= " + max, value);
+  };
+  // node's getArrayBufferOrView: a string is decoded with `encoding`, an
+  // ArrayBuffer is wrapped, any other non-view is an argument-type error. It
+  // returns a VIEW over the caller's memory — no copy — which is what makes
+  // `parameters.message.byteLength` meaningful below.
+  const getArrayBufferOrView = (buffer, name, encoding) => {
+    if (isView(buffer)) return buffer;
+    if (typeof buffer === "string") return Buffer.from(buffer, encoding === undefined ? "utf8" : encoding);
+    if (buffer instanceof ArrayBuffer || (buffer != null && buffer[Symbol.toStringTag] === "SharedArrayBuffer")) {
+      return new Uint8Array(buffer);
+    }
+    const e = new TypeError('The "' + name + '" argument must be of type string or an instance of ' +
+      "ArrayBuffer, Buffer, TypedArray, or DataView. Received " + argRecv(buffer));
+    e.code = "ERR_INVALID_ARG_TYPE"; throw e;
+  };
+  const ARGON2_TYPE = { __proto__: null, argon2d: 0, argon2i: 1, argon2id: 2 };
+  const argon2Check = (algorithm, parameters) => {
+    if (typeof algorithm !== "string") throw argTypeError("algorithm", "string", algorithm);
+    if (ARGON2_TYPE[algorithm] === undefined) {
+      const e = new TypeError("The argument 'algorithm' must be one of: 'argon2d', 'argon2i', " +
+        "'argon2id'. Received " + argRecv(algorithm));
+      e.code = "ERR_INVALID_ARG_VALUE"; throw e;
+    }
+    const type = ARGON2_TYPE[algorithm];
+    if (parameters === null || typeof parameters !== "object" || Array.isArray(parameters)) {
+      throw argTypeError("parameters", "object", parameters);
+    }
+    const parallelism = parameters.parallelism;
+    const tagLength = parameters.tagLength;
+    const memory = parameters.memory;
+    const passes = parameters.passes;
+    const message = getArrayBufferOrView(parameters.message, "parameters.message");
+    validateInteger(message.byteLength, "parameters.message.byteLength", 0, MAX_U32);
+    const nonce = getArrayBufferOrView(parameters.nonce, "parameters.nonce");
+    validateInteger(nonce.byteLength, "parameters.nonce.byteLength", 8, MAX_U32);
+    validateInteger(parallelism, "parameters.parallelism", 1, 16777215);
+    validateInteger(tagLength, "parameters.tagLength", 4, MAX_U32);
+    validateInteger(memory, "parameters.memory", 8 * parallelism, MAX_U32);
+    // validateUint32(passes, name, /* positive */ true).
+    if (typeof passes !== "number") throw argTypeError("parameters.passes", "number", passes);
+    if (!Number.isInteger(passes)) throw outOfRange("parameters.passes", "an integer", passes);
+    if (passes < 1 || passes > MAX_U32) {
+      throw outOfRange("parameters.passes", ">= 1 && <= " + MAX_U32, passes);
+    }
+    // node passes these WITHOUT a name to getArrayBufferOrView, so a bad value
+    // reports `undefined` as the argument name; keep the quirk rather than
+    // inventing a better message the corpus does not expect.
+    let secret = new Uint8Array(0);
+    if (parameters.secret !== undefined) {
+      secret = getArrayBufferOrView(parameters.secret, undefined);
+      validateInteger(secret.byteLength, "parameters.secret.byteLength", 0, MAX_U32);
+    }
+    let associatedData = new Uint8Array(0);
+    if (parameters.associatedData !== undefined) {
+      associatedData = getArrayBufferOrView(parameters.associatedData, undefined);
+      validateInteger(associatedData.byteLength, "parameters.associatedData.byteLength", 0, MAX_U32);
+    }
+    return { message, nonce, secret, associatedData, tagLength, passes, parallelism, memory, type };
+  };
+  const argon2Derive = (p) =>
+    Buffer.from(AN.argon2(p.type, p.message, p.nonce, p.parallelism, p.tagLength,
+                          p.memory, p.passes, p.secret, p.associatedData));
+  C.argon2Sync = function argon2Sync(algorithm, parameters) {
+    return argon2Derive(argon2Check(algorithm, parameters));
+  };
+  C.argon2 = function argon2(algorithm, parameters, callback) {
+    // node validates the parameters BEFORE the callback, so a bad parameter
+    // throws synchronously even when the callback is also wrong.
+    const p = argon2Check(algorithm, parameters);
+    if (typeof callback !== "function") throw argTypeError("callback", "function", callback);
+    let result;
+    let error;
+    try { result = argon2Derive(p); } catch (err) { error = err; }
+    queueMicrotask(() => (error !== undefined ? callback(error) : callback(null, result)));
+  };
+
   // ---- generateKeyPair / generateKeyPairSync ----
   // node validates the key type synchronously; unknown types (incl. the PQC
   // ml-dsa/ml-kem/slh-dsa families on an OpenSSL build without them) throw
