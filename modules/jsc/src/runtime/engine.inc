@@ -1111,63 +1111,28 @@ public:
     // be launched from a temporary cwd, so the normal cwd-based package walk
     // cannot find them. When an internal request originates from a file in the
     // vendored tree, add that tree's `lib` directory as a resolver root.
-    //
-    // The walk starts at the REQUESTING file, which means it only ever succeeds
-    // for code that already lives inside the vendored tree. Everything else —
-    // an mbun builtin bridging to node's lib through createRequire(<user file>),
-    // a user script, a test fixture written to a temp dir — got "cannot find
-    // package 'internal'" even though the module it asked for is sitting in the
-    // tree mbun ships. That is why lanes keep hand-writing stubs next to a real
-    // vendored implementation. So when, and only when, the walk from the
-    // requesting file finds nothing, retry it from the entry script, the cwd and
-    // the executable, and let each level also answer with a `compat/node/lib`
-    // (where mbun vendors the tree, as opposed to a checkout of node itself
-    // whose lib/ is at its root). Purely additive: a request that resolved
-    // before takes the first branch and never reaches the fallback.
-    static bool append_node_lib_root_(std::vector<std::string>& out,
-                                      const std::filesystem::path& start) {
-        std::error_code ec;
-        std::filesystem::path dir{start};
-        if (dir.empty()) return false;
-        if (!dir.is_absolute()) dir = std::filesystem::absolute(dir, ec);
-        if (ec) return false;
-        dir = dir.lexically_normal();
-        for (int depth{0}; depth < 64; ++depth) {
-            for (const std::filesystem::path lib :
-                 {dir / "lib", dir / "compat" / "node" / "lib"}) {
-                ec.clear();
-                if (std::filesystem::is_directory(lib / "internal", ec)) {
-                    const std::string root{lib.lexically_normal().string()};
-                    if (std::ranges::find(out, root) == out.end()) out.emplace_back(root);
-                    return true;
-                }
-            }
-            const std::filesystem::path parent{dir.parent_path()};
-            if (parent == dir || parent.empty()) break;
-            dir = parent;
-        }
-        return false;
-    }
-
     static std::vector<std::string> node_paths_for_(std::string_view spec,
                                                     const std::string& fromDir) {
         std::vector<std::string> out{node_paths_from_env()};
         if (!spec.starts_with("internal/")) return out;
 
-        if (append_node_lib_root_(out, std::filesystem::path{fromDir})) return out;
-
-        // Fallbacks, in the order that keeps the vendored tree of the program
-        // being run ahead of the one next to the binary.
         std::error_code ec;
-        if (gArgv.size() > 1 && !gArgv[1].empty()) {
-            if (append_node_lib_root_(out, std::filesystem::path{gArgv[1]}.parent_path())) {
+        std::filesystem::path dir{fromDir};
+        if (dir.empty()) return out;
+        if (!dir.is_absolute()) dir = std::filesystem::absolute(dir, ec);
+        if (ec) return out;
+        dir = dir.lexically_normal();
+        for (int depth{0}; depth < 64; ++depth) {
+            const std::filesystem::path lib{dir / "lib"};
+            if (std::filesystem::is_directory(lib / "internal", ec)) {
+                const std::string root{lib.lexically_normal().string()};
+                if (std::ranges::find(out, root) == out.end()) out.emplace_back(root);
                 return out;
             }
+            const std::filesystem::path parent{dir.parent_path()};
+            if (parent == dir || parent.empty()) break;
+            dir = parent;
         }
-        const std::filesystem::path cwd{std::filesystem::current_path(ec)};
-        if (!ec && append_node_lib_root_(out, cwd)) return out;
-        const std::string exe{exe_path()};
-        if (!exe.empty()) (void)append_node_lib_root_(out, std::filesystem::path{exe}.parent_path());
         return out;
     }
 
