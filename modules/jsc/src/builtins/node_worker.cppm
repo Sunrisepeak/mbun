@@ -1562,6 +1562,12 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
       const tid = nextThreadId++;
       this.threadId = tid;
       this.threadName = wname;
+      // node writes the worker's thread_name metadata row into the trace file
+      // (src/node_worker.cc Worker::Worker). No-op while tracing is off.
+      try {
+        const T = G.__mbunTraceEvents;
+        if (T && typeof T.emitWorkerThreadName === "function") T.emitWorkerThreadName(wname, tid);
+      } catch (e) {}
       this._tempFile = null;
       let entry;
       let isEval = false;

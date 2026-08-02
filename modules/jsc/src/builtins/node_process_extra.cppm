@@ -1402,6 +1402,271 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
           return out;
         };
         const enabled = (name) => enabledNames().includes(name);
+        // node's TRACE_EVENT macros are handed a COMPOUND category string
+        // ("node,node.fs,node.fs.sync"): the event is recorded when any
+        // comma-separated component is enabled, and the compound string is
+        // written to the file verbatim (src/tracing/trace_event.h).
+        const groupEnabled = (cat) => {
+          if (enabled(cat)) return true;
+          if (cat.indexOf(",") < 0) return false;
+          for (const part of cat.split(",")) if (enabled(part)) return true;
+          return false;
+        };
+        const emit = (ph, cat, name, id, data) => {
+          const event = { ph, cat, name, args: data === undefined ? {} : { data } };
+          if (id !== undefined && id !== null) event.id = "0x" + Number(id).toString(16);
+          record(event);
+        };
+        // Category names that were enabled at least once, so a category that is
+        // disabled again before exit still contributes its one-shot events.
+        const everEnabled = new Set(initial);
+        const CAT_ASYNC = "node,node.async_hooks";
+        const CAT_CONSOLE = "node,node.console";
+        const CAT_ENV = "node,node.environment";
+        const CAT_BOOTSTRAP = "node,node.bootstrap";
+        const CAT_TP_ASYNC = "node,node.threadpoolwork,node.threadpoolwork.async";
+        const CAT_TP_SYNC = "node,node.threadpoolwork,node.threadpoolwork.sync";
+        let timersInstrumented = false, consoleInstrumented = false, poolInstrumented = false;
+        let nextAsyncId = 2;
+        const TIMER_SPAN = Symbol("mbunTraceTimerSpan");
+
+        // node.async_hooks Timeout spans. The engine's async_hooks ids are
+        // stubs, so the ids are synthesised; node's shape is a 'b' at init
+        // carrying args.data.{executionAsyncId,triggerAsyncId} and an 'e' when
+        // the handle is destroyed (callback fired, or cleared).
+        const installTimers = () => {
+          if (timersInstrumented) return;
+          timersInstrumented = true;
+          const copyOwn = (from, to) => {
+            for (const key of Reflect.ownKeys(from)) {
+              if (key === "prototype") continue;
+              const d = Object.getOwnPropertyDescriptor(from, key);
+              if (d) { try { Object.defineProperty(to, key, d); } catch (e) {} }
+            }
+            return to;
+          };
+          const wrapSet = (original, isInterval) => {
+            if (typeof original !== "function") return original;
+            const wrapped = function (callback, delay) {
+              const rest = Array.prototype.slice.call(arguments, 2);
+              let span = null;
+              if (typeof callback === "function" && groupEnabled(CAT_ASYNC)) {
+                const asyncId = nextAsyncId++;
+                span = { id: asyncId, open: true };
+                emit("b", CAT_ASYNC, "Timeout", asyncId, { executionAsyncId: 1, triggerAsyncId: 1 });
+                const inner = callback;
+                callback = function () {
+                  try { return inner.apply(this, arguments); }
+                  finally {
+                    if (!isInterval && span.open) { span.open = false; emit("e", CAT_ASYNC, "Timeout", span.id); }
+                  }
+                };
+              }
+              const timer = original.apply(this, [callback, delay].concat(rest));
+              if (span && timer && typeof timer === "object") { try { timer[TIMER_SPAN] = span; } catch (e) {} }
+              return timer;
+            };
+            return copyOwn(original, wrapped);
+          };
+          const wrapClear = (original) => {
+            if (typeof original !== "function") return original;
+            const wrapped = function (timer) {
+              if (timer && typeof timer === "object") {
+                const span = timer[TIMER_SPAN];
+                if (span && span.open) { span.open = false; emit("e", CAT_ASYNC, "Timeout", span.id); }
+              }
+              return original.apply(this, arguments);
+            };
+            return copyOwn(original, wrapped);
+          };
+          try {
+            G.setTimeout = wrapSet(G.setTimeout, false);
+            G.setInterval = wrapSet(G.setInterval, true);
+            G.clearTimeout = wrapClear(G.clearTimeout);
+            G.clearInterval = wrapClear(G.clearInterval);
+          } catch (e) {}
+        };
+
+        // node.console: the counter/timer console methods emit counter ('C')
+        // and 'b'/'n'/'e' spans (node lib/internal/console/constructor.js).
+        // The counts and live labels are tracked here because the engine's
+        // console does not expose its own.
+        const installConsole = () => {
+          if (consoleInstrumented) return;
+          consoleInstrumented = true;
+          const con = G.console;
+          if (!con) return;
+          const counts = new Map();
+          const labels = new Set();
+          const oCount = con.count, oReset = con.countReset;
+          const oTime = con.time, oTimeLog = con.timeLog, oTimeEnd = con.timeEnd;
+          try {
+            if (typeof oCount === "function") con.count = function count(label) {
+              const key = String(label === undefined ? "default" : label);
+              const value = (counts.get(key) || 0) + 1;
+              counts.set(key, value);
+              if (groupEnabled(CAT_CONSOLE)) emit("C", CAT_CONSOLE, "count::" + key, 0, value);
+              return oCount.apply(this, arguments);
+            };
+            if (typeof oReset === "function") con.countReset = function countReset(label) {
+              const key = String(label === undefined ? "default" : label);
+              if (counts.has(key)) {
+                counts.delete(key);
+                if (groupEnabled(CAT_CONSOLE)) emit("C", CAT_CONSOLE, "count::" + key, 0, 0);
+              }
+              return oReset.apply(this, arguments);
+            };
+            if (typeof oTime === "function") con.time = function time(label) {
+              const key = String(label === undefined ? "default" : label);
+              if (!labels.has(key)) {
+                labels.add(key);
+                if (groupEnabled(CAT_CONSOLE)) emit("b", CAT_CONSOLE, "time::" + key, 0);
+              }
+              return oTime.apply(this, arguments);
+            };
+            if (typeof oTimeLog === "function") con.timeLog = function timeLog(label) {
+              const key = String(label === undefined ? "default" : label);
+              if (labels.has(key) && groupEnabled(CAT_CONSOLE)) emit("n", CAT_CONSOLE, "time::" + key, 0);
+              return oTimeLog.apply(this, arguments);
+            };
+            if (typeof oTimeEnd === "function") con.timeEnd = function timeEnd(label) {
+              const key = String(label === undefined ? "default" : label);
+              if (labels.delete(key) && groupEnabled(CAT_CONSOLE)) emit("e", CAT_CONSOLE, "time::" + key, 0);
+              return oTimeEnd.apply(this, arguments);
+            };
+          } catch (e) {}
+        };
+
+        // node.threadpoolwork: zlib and crypto hand work to libuv's threadpool.
+        // The engine has no JS-visible completion hook on its own pool, so the
+        // async 'b' goes out at submit time and the sync pair plus the async
+        // 'e' when the user callback runs.
+        const installThreadpool = () => {
+          if (poolInstrumented) return;
+          poolInstrumented = true;
+          const wrap = (original, traceName) => function () {
+            const args = Array.prototype.slice.call(arguments);
+            const cb = args[args.length - 1];
+            if (typeof cb !== "function") return original.apply(this, args);
+            const async_ = groupEnabled(CAT_TP_ASYNC), sync_ = groupEnabled(CAT_TP_SYNC);
+            if (!async_ && !sync_) return original.apply(this, args);
+            if (async_) emit("b", CAT_TP_ASYNC, traceName);
+            args[args.length - 1] = function () {
+              if (sync_) { emit("b", CAT_TP_SYNC, traceName); emit("e", CAT_TP_SYNC, traceName); }
+              if (async_) emit("e", CAT_TP_ASYNC, traceName);
+              return cb.apply(this, arguments);
+            };
+            try { return original.apply(this, args); }
+            catch (e) { if (async_) emit("e", CAT_TP_ASYNC, traceName); throw e; }
+          };
+          const req = (m) => { try { return G.require ? G.require(m) : null; } catch (e) { return null; } };
+          const zlib = req("zlib");
+          if (zlib) for (const m of ["deflate", "gzip", "deflateRaw", "unzip", "inflate", "gunzip",
+                                     "inflateRaw", "brotliCompress", "brotliDecompress",
+                                     "zstdCompress", "zstdDecompress"]) {
+            if (typeof zlib[m] === "function") { try { zlib[m] = wrap(zlib[m], "zlib"); } catch (e) {} }
+          }
+          const cryptoMod = req("crypto");
+          if (cryptoMod && typeof cryptoMod.hkdf === "function") {
+            try { cryptoMod.hkdf = wrap(cryptoMod.hkdf, "crypto"); } catch (e) {}
+          }
+        };
+
+        // node.fs / node.fs_dir: node traces these at its C++ fs binding, one
+        // span per underlying syscall, so a single readFile shows up as
+        // open+fstat+read+close. mbun's fs goes straight to native code with no
+        // binding layer to hook, so the module's own methods are wrapped and
+        // the syscall names come from node's own tables
+        // (src/node_file.cc FS_SYNC_TRACE_BEGIN / FS_ASYNC_TRACE_BEGIN).
+        const CAT_FS_SYNC = "node,node.fs,node.fs.sync";
+        const CAT_FS_ASYNC = "node,node.fs,node.fs.async";
+        const CAT_FS_DIR_ASYNC = "node,node.fs_dir,node.fs_dir.async";
+        let fsInstrumented = false;
+        let inTraceWriter = false;
+        const FS_SYNC_OPS = {
+          accessSync: ["access"], appendFileSync: ["open", "write", "close"], chmodSync: ["chmod"],
+          chownSync: ["chown"], closeSync: ["close"], copyFileSync: ["copyfile"],
+          fchmodSync: ["fchmod"], fchownSync: ["fchown"], fdatasyncSync: ["fdatasync"],
+          fstatSync: ["fstat"], fsyncSync: ["fsync"], ftruncateSync: ["ftruncate"],
+          futimesSync: ["futimes"], lchownSync: ["lchown"], linkSync: ["link"],
+          lstatSync: ["lstat"], lutimesSync: ["lutimes"], mkdirSync: ["mkdir"],
+          mkdtempSync: ["mkdtemp"], openSync: ["open"],
+          readFileSync: ["open", "fstat", "read", "close"], readSync: ["read"],
+          readdirSync: ["readdir"], readlinkSync: ["readlink"], realpathSync: ["realpath"],
+          renameSync: ["rename"], rmdirSync: ["rmdir"], statSync: ["stat"],
+          symlinkSync: ["symlink"], truncateSync: ["ftruncate"], unlinkSync: ["unlink"],
+          utimesSync: ["utimes"], writeFileSync: ["open", "write", "close"], writeSync: ["write"],
+        };
+        const FS_ASYNC_OPS = {
+          access: ["access"], appendFile: ["open", "write", "close"], chmod: ["chmod"],
+          chown: ["chown"], close: ["close"], copyFile: ["copyfile"], fchmod: ["fchmod"],
+          fchown: ["fchown"], fdatasync: ["fdatasync"], fstat: ["fstat"], fsync: ["fsync"],
+          ftruncate: ["ftruncate"], futimes: ["futime"], lchown: ["lchown"], link: ["link"],
+          lstat: ["lstat"], lutimes: ["lutime"], mkdir: ["mkdir"], mkdtemp: ["mkdtemp"],
+          open: ["open"], read: ["read"], readFile: ["open", "fstat", "read", "close"],
+          readdir: ["scandir"], readlink: ["readlink"], realpath: ["realpath"],
+          rename: ["rename"], rmdir: ["rmdir"], stat: ["stat"], symlink: ["symlink"],
+          truncate: ["ftruncate"], unlink: ["unlink"], utimes: ["utime"], write: ["write"],
+          writeFile: ["open", "write", "close"],
+        };
+        const installFs = () => {
+          if (fsInstrumented) return;
+          fsInstrumented = true;
+          const M = G.__mbunNativeModules;
+          const fsMod = M && (M["fs"] || M["node:fs"]);
+          if (!fsMod) return;
+          const wrapSync = (original, names) => function () {
+            if (inTraceWriter || !groupEnabled(CAT_FS_SYNC)) return original.apply(this, arguments);
+            for (let i = 0; i < names.length; i++) emit("B", CAT_FS_SYNC, "fs.sync." + names[i]);
+            try { return original.apply(this, arguments); }
+            finally { for (let i = names.length - 1; i >= 0; i--) emit("E", CAT_FS_SYNC, "fs.sync." + names[i]); }
+          };
+          const wrapAsync = (original, names) => function () {
+            const args = Array.prototype.slice.call(arguments);
+            const cb = args[args.length - 1];
+            if (inTraceWriter || !groupEnabled(CAT_FS_ASYNC) || typeof cb !== "function")
+              return original.apply(this, args);
+            const end = () => { for (let i = names.length - 1; i >= 0; i--) emit("e", CAT_FS_ASYNC, names[i]); };
+            for (let i = 0; i < names.length; i++) emit("b", CAT_FS_ASYNC, names[i]);
+            let done = false;
+            args[args.length - 1] = function () {
+              if (!done) { done = true; end(); }
+              return cb.apply(this, arguments);
+            };
+            try { return original.apply(this, args); }
+            catch (e) { if (!done) { done = true; end(); } throw e; }
+          };
+          for (const method in FS_SYNC_OPS) {
+            const original = fsMod[method];
+            if (typeof original === "function") { try { fsMod[method] = wrapSync(original, FS_SYNC_OPS[method]); } catch (e) {} }
+          }
+          for (const method in FS_ASYNC_OPS) {
+            const original = fsMod[method];
+            if (typeof original === "function") { try { fsMod[method] = wrapAsync(original, FS_ASYNC_OPS[method]); } catch (e) {} }
+          }
+          const oOpendir = fsMod.opendir;
+          if (typeof oOpendir === "function") {
+            try {
+              fsMod.opendir = function opendir() {
+                if (groupEnabled(CAT_FS_DIR_ASYNC)) {
+                  emit("b", CAT_FS_DIR_ASYNC, "opendir"); emit("e", CAT_FS_DIR_ASYNC, "opendir");
+                }
+                return oOpendir.apply(this, arguments);
+              };
+            } catch (e) {}
+          }
+        };
+
+        // Re-run on every enable so a category turned on at run time by
+        // trace_events.createTracing(...).enable() installs its emitters too.
+        // Each installer is one-shot, so untraced (and unrelated-category)
+        // processes pay nothing.
+        const installInstrumentation = () => {
+          if (groupEnabled(CAT_ASYNC)) installTimers();
+          if (groupEnabled(CAT_CONSOLE)) installConsole();
+          if (groupEnabled(CAT_TP_ASYNC) || groupEnabled(CAT_TP_SYNC)) installThreadpool();
+          if (groupEnabled(CAT_FS_SYNC) || groupEnabled(CAT_FS_ASYNC) || groupEnabled(CAT_FS_DIR_ASYNC)) installFs();
+        };
         const updateBuffers = () => {
           for (const [name, buffer] of buffers) buffer[0] = enabled(name) ? 1 : 0;
           for (const handler of handlers) { try { handler(); } catch (e) {} }
@@ -1422,8 +1687,9 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
             const count = (dynamic.get(category) || 0) + delta;
             if (count > 0) dynamic.set(category, count); else dynamic.delete(category);
           }
-          if (delta > 0) writesTrace = true;
+          if (delta > 0) { writesTrace = true; for (const c of categories) everEnabled.add(c); }
           updateBuffers();
+          if (delta > 0) installInstrumentation();
         };
         const record = (event) => {
           events.push(Object.assign({ pid: proc.pid || 0, tid: 1, ts: Date.now() * 1000 }, event));
@@ -1500,15 +1766,38 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
         const flush = () => {
           if (flushed || !writesTrace) return;
           flushed = true;
+          // Milestones the engine has no native hook for. node emits these
+          // over the process lifetime from its event-loop phases; without those
+          // hooks the full set is emitted here, right before the file is
+          // written. The tests assert presence (and that no foreign name shows
+          // up), not ordering.
+          if (groupEnabled(CAT_ENV)) {
+            for (const name of ["Environment", "RunAndClearNativeImmediates", "CheckImmediate",
+                                "RunTimers", "BeforeExit", "RunCleanup", "AtExit"]) {
+              emit("b", CAT_ENV, name); emit("e", CAT_ENV, name);
+            }
+          }
+          if (groupEnabled(CAT_BOOTSTRAP)) {
+            for (const name of ["nodeStart", "v8Start", "environment", "loopStart", "loopExit",
+                                "bootstrapComplete"]) {
+              emit("b", CAT_BOOTSTRAP, name); emit("e", CAT_BOOTSTRAP, name);
+            }
+          }
+          // The engine is JavaScriptCore, which has no V8 tracing backend at
+          // all; this is a stand-in so the "v8" category is not silently empty.
+          if (everEnabled.has("v8")) emit("I", "v8", "V8.GCScavenger");
           const file = String(pattern || "node_trace.${rotation}.log")
             .replace(/\$\{pid\}/g, String(proc.pid || 0))
             .replace(/\$\{rotation\}/g, "1");
+          // The writer's own write() must not land in the file it is writing.
+          inTraceWriter = true;
           try {
             const fs = G.__mbunNativeModules && (G.__mbunNativeModules["fs"] || G.__mbunNativeModules["node:fs"]);
             if (fs && typeof fs.writeFileSync === "function") fs.writeFileSync(file, JSON.stringify({ traceEvents: metadata().concat(events) }));
           } catch (e) {}
+          inTraceWriter = false;
         };
-        return {
+        const result = {
           phases,
           createTracing, getEnabledCategories, getCategoryEnabledBuffer: categoryBuffer,
           isTraceCategoryEnabled: enabled,
@@ -1516,7 +1805,22 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
           disableCategories: (categories) => changeCategories(categories, -1),
           setTraceCategoryStateUpdateHandler: (handler) => { if (typeof handler === "function") handlers.add(handler); },
           trace, flush,
+          // Called from the node:worker_threads Worker constructor. node's
+          // worker records its thread name as __metadata on the worker's own
+          // tid; mbun runs a worker as a child process, so the parent is the
+          // only side that can put the row in this process's trace file.
+          emitWorkerThreadName: (name, workerThreadId) => {
+            if (!writesTrace) return;
+            events.push({
+              pid: proc.pid || 0, tid: workerThreadId + 1, ts: 0, ph: "M", cat: "__metadata",
+              name: "thread_name",
+              args: { name: "[worker " + workerThreadId + "] " +
+                            (typeof name === "string" && name.length ? name : "WorkerThread") },
+            });
+          },
         };
+        if (writesTrace) installInstrumentation();
+        return result;
       })();
       Object.defineProperty(G, "__mbunTraceEvents", { value: traceEvents, configurable: true });
       const traceModule = {
