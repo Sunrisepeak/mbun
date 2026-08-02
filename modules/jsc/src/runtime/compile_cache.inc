@@ -503,7 +503,17 @@ JSValueRef compile_cache_enable_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, s
 
     auto& handler{CompileCacheHandler::get()};
     CompileCacheHandler::EnableResult result;
-    if (handler.enabled()) {
+    // NODE_DISABLE_COMPILE_CACHE wins over everything, including an already
+    // enabled cache: upstream Environment::EnableCompileCache tests it before it
+    // looks at the handler at all. Nothing is created and no directory is
+    // recorded, so getCompileCacheDir() keeps reading undefined. The trace is
+    // the only place the reason is visible -- the status alone cannot say WHY a
+    // run declined to cache.
+    if (const char* disabled{std::getenv("NODE_DISABLE_COMPILE_CACHE")}; disabled != nullptr) {
+        result.status = CompileCacheEnableStatus::kDisabled;
+        result.message = "Disabled by NODE_DISABLE_COMPILE_CACHE";
+        handler.debug_("[compile cache] " + result.message + ".\n");
+    } else if (handler.enabled()) {
         // node reports ALREADY_ENABLED and leaves the first directory in place;
         // the second directory is never created (a test counts the entries in
         // the temp dir to prove exactly that).
