@@ -999,6 +999,14 @@
         JSObjectRef s3n{JSObjectMake(ctx_, nullptr, nullptr)};
         set_fn(ctx_, s3n, "sign", s3_sign_cb);
         set_prop(ctx_, global, "__mbunS3Native", s3n);
+        // node's module compile cache (compile_cache.inc). node:module's
+        // enableCompileCache/getCompileCacheDir/flushCompileCache are thin
+        // wrappers over these; the cache itself is owned by the loader.
+        JSObjectRef ccn{JSObjectMake(ctx_, nullptr, nullptr)};
+        set_fn(ctx_, ccn, "enable", compile_cache_enable_cb);
+        set_fn(ctx_, ccn, "getDir", compile_cache_dir_cb);
+        set_fn(ctx_, ccn, "flush", compile_cache_flush_cb);
+        set_prop(ctx_, global, "__mbunCompileCacheNative", ccn);
         // Binary-safe subprocess/pipe ops (base64 across the JS boundary) for
         // Bun.spawn(stdin:"pipe"), Bun.spawnSync binary stdio, and Bun.stdin.
         JSObjectRef pn{JSObjectMake(ctx_, nullptr, nullptr)};
