@@ -56,8 +56,8 @@ inline constexpr std::string_view kNodeReplJS = R"JS(
   const { Console } = req("console");
   const moduleMod = req("module");
   const CJSModule = moduleMod.Module || moduleMod;
-  // Primordials used by node's RegExp.$1..$9 save/restore protocol. Capture
-  // and uncurry exec before user code can replace RegExp.prototype.exec.
+  // Primordial used by node's evaluator scans and RegExp.$1..$9 save/restore
+  // protocol. Capture and uncurry exec before user code can replace it.
   const RegExpPrototypeExec = Function.prototype.call.bind(RegExp.prototype.exec);
   const ObjectGetOwnPropertyDescriptor = Object.getOwnPropertyDescriptor;
   const IntrinsicTypeError = TypeError;
@@ -369,7 +369,9 @@ inline constexpr std::string_view kNodeReplJS = R"JS(
         lastQuoteContinued = false;
         while (i < n) {
           if (code[i] === "\\") {
-            if (/[\r\n\u2028\u2029]/.test(code[i + 1] || "")) lastQuoteContinued = true;
+            if (RegExpPrototypeExec(/[\r\n\u2028\u2029]/, code[i + 1] || "") !== null) {
+              lastQuoteContinued = true;
+            }
             i += 2;
             continue;
           }
@@ -473,7 +475,8 @@ inline constexpr std::string_view kNodeReplJS = R"JS(
   function isRecoverableError(e, code) {
     // Wrap a leading `{` in parentheses first, exactly as node does, so an
     // incomplete object literal counts as recoverable.
-    if (/^\s*\{/.test(code) && isRecoverableError(e, `(${code}`)) return true;
+    if (RegExpPrototypeExec(/^\s*\{/, code) !== null &&
+        isRecoverableError(e, `(${code}`)) return true;
 
     const err = parseThrows(code);
     if (err === null) return false;
@@ -1336,7 +1339,8 @@ inline constexpr std::string_view kNodeReplJS = R"JS(
         if (err === null) {
           for (;;) {
             try {
-              if (self.replMode === REPL_MODE_STRICT && !/^\s*$/.test(code)) {
+              if (self.replMode === REPL_MODE_STRICT &&
+                  RegExpPrototypeExec(/^\s*$/, code) === null) {
                 code = `'use strict'; void 0;\n${code}`;
               }
               script = new vm.Script(code, { filename: file, displayErrors: false });

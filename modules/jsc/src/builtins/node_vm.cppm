@@ -49,6 +49,7 @@ inline constexpr std::string_view kNodeVmJS = R"JS(
   const gOPD = Object.getOwnPropertyDescriptor;
   const ownKeys = Reflect.ownKeys;
   const RegExpPrototypeExec = Function.prototype.call.bind(RegExp.prototype.exec);
+  const StringPrototypeSlice = Function.prototype.call.bind(String.prototype.slice);
 
   const contexts = new WeakSet();
   const records = new WeakMap();
@@ -707,11 +708,19 @@ inline constexpr std::string_view kNodeVmJS = R"JS(
   function prepareDynImport(code, callback, getWrap) {
     const src = `${code}`;
     DYNIMPORT_RE.lastIndex = 0;
-    if (RegExpPrototypeExec(DYNIMPORT_RE, src) === null) return null;
+    let match = RegExpPrototypeExec(DYNIMPORT_RE, src);
+    if (match === null) return null;
     const id = dynNextId++;
-    DYNIMPORT_RE.lastIndex = 0;
     dynRegistry[id] = makeDynImportHandler(callback, getWrap);
-    return src.replace(DYNIMPORT_RE, DYN_REGISTRY + "[" + id + "](");
+    const replacement = DYN_REGISTRY + "[" + id + "](";
+    let rewritten = "";
+    let cursor = 0;
+    do {
+      rewritten += StringPrototypeSlice(src, cursor, match.index) + replacement;
+      cursor = match.index + match[0].length;
+      match = RegExpPrototypeExec(DYNIMPORT_RE, src);
+    } while (match !== null);
+    return rewritten + StringPrototypeSlice(src, cursor);
   }
 
   class Script {

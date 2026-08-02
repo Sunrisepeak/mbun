@@ -43,6 +43,35 @@ int main() {
         1, "node REPL capture restoration uses the primordial RegExp exec");
     expect_number(
         "(()=>{const repl=require('node:repl'),stream=require('node:stream'),io=new stream.PassThrough();"
+        "const server=repl.start({input:io,output:io,terminal:false,prompt:'',replMode:repl.REPL_MODE_STRICT});"
+        "const original=RegExp.prototype.exec;let calls=0,value=-1,thrown='';"
+        "RegExp.prototype.exec=()=>{throw new Error('poison-exec')};"
+        "try{server.eval('1+1\\n',server.context,'REPL1',(err,result)=>{calls++;value=err?0:result})}"
+        "catch(err){thrown=err&&err.message}finally{RegExp.prototype.exec=original;server.close()}"
+        "return calls===1&&value===2&&thrown===''?1:0})()",
+        1, "node strict REPL whitespace detection uses the primordial RegExp exec");
+    expect_number(
+        "(()=>{const repl=require('node:repl'),stream=require('node:stream'),io=new stream.PassThrough();"
+        "const server=repl.start({input:io,output:io,terminal:false,prompt:'',replMode:repl.REPL_MODE_STRICT});"
+        "const original=RegExp.prototype.exec;let calls=0,firstSyntax=false,syntax=false,thrown='';"
+        "RegExp.prototype.exec=()=>{throw new Error('poison-exec')};"
+        "try{server.eval(\"\\x27foo\\\\\\n\",server.context,'REPL1',(err)=>{calls++;firstSyntax=err&&err.name==='SyntaxError'});"
+        "server.eval('const =\\n',server.context,'REPL2',(err)=>{calls++;syntax=err&&err.name==='SyntaxError'})}"
+        "catch(err){thrown=err&&err.message}finally{RegExp.prototype.exec=original;server.close()}"
+        "return calls===2&&firstSyntax&&syntax&&thrown===''?1:0})()",
+        1, "node strict REPL error recovery uses the primordial RegExp exec");
+    expect_number(
+        "(()=>{const vm=require('node:vm'),original=RegExp.prototype.exec;"
+        "let simple=-1,sourceMap=false,dynamic=false,thrown='';"
+        "RegExp.prototype.exec=()=>{throw new Error('poison-exec')};"
+        "try{simple=new vm.Script('1+1').runInThisContext();"
+        "new vm.Script('//# sourceMappingURL=x\\n1');sourceMap=true;"
+        "new vm.Script('import(\\\"x\\\")',{importModuleDynamically(){}});dynamic=true}"
+        "catch(err){thrown=err&&err.message}finally{RegExp.prototype.exec=original}"
+        "return simple===2&&sourceMap&&dynamic&&thrown===''?1:0})()",
+        1, "node vm dynamic import rewriting uses the primordial RegExp exec");
+    expect_number(
+        "(()=>{const repl=require('node:repl'),stream=require('node:stream'),io=new stream.PassThrough();"
         "const server=repl.start({input:io,output:io,terminal:false,prompt:''});"
         "const original=Object.getOwnPropertyDescriptor(RegExp,'$1');"
         "const marker=new TypeError('RegExp.$N getters require RegExp constructor as |this|');"
