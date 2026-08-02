@@ -3103,7 +3103,74 @@ export constexpr std::string_view kNetJS_part2 = R"JS(
       return doFetch(url, init, 0);
     } catch (e) { return Promise.reject(e); }
   };
-  G.fetch.preconnect = function () {};
+  // fetch.preconnect(url) -- open the TCP connection now and park it in the
+  // same keepalive hive doFetch() checks out from, so the first real request to
+  // that origin skips the connect round trip.
+  // PORT-SOURCE: compat/bun/src/runtime/webcore/fetch.rs Bun__fetchPreconnect
+  // (:228) for the validation order and the exact messages, and
+  // compat/bun/src/http/AsyncHTTP.rs preconnect() (:404) for "connect, then
+  // release the socket into the pool without sending anything".
+  //
+  // Only http:// is actually dialed. A TLS preconnect would have to park a
+  // socket mid-handshake -- poolTake() hands a `tls: true` entry straight to
+  // the request writer as if the handshake had completed -- so https validates
+  // its URL and otherwise no-ops rather than poisoning the hive.
+  G.fetch.preconnect = function (input) {
+    if (arguments.length < 1)
+      throw new TypeError("Not enough arguments to fetch.preconnect. Expected 1, got 0.");
+    // bun runs the argument through jsc::URL::href_from_js first: anything the
+    // WHATWG parser rejects (""/" "/"http://:0") is a dead BunString -> the
+    // INVALID_ARG_TYPE "Invalid URL" arm, ahead of every scheme/host check.
+    let u;
+    try { u = new G.URL(String(input)); }
+    catch (e) { const er = new TypeError("Invalid URL"); er.code = "ERR_INVALID_ARG_TYPE"; throw er; }
+    const proto = u.protocol;
+    if (proto !== "http:" && proto !== "https:" && proto !== "s3:")
+      throw new TypeError("URL must be HTTP or HTTPS");
+    if (!u.hostname) { const er = new TypeError("fetch() URL must not be a blank string."); er.code = "ERR_INVALID_ARG_TYPE"; throw er; }
+    // has_valid_port(): an explicit :0 is not dialable. WHATWG drops the
+    // default port from `u.port`, so an empty string is the valid default.
+    if (u.port !== "" && !(+u.port >= 1 && +u.port <= 65535))
+      throw new TypeError("Invalid port");
+    if (proto !== "http:") return undefined;
+    // Strip the brackets a WHATWG IPv6 host carries; NN.connect() takes a bare
+    // address, and poolKey() is built from doFetch's bracket-free host too.
+    const host = u.hostname.replace(/^\[|\]$/g, "");
+    const port = u.port ? +u.port : 80;
+    try {
+      const fd = NN.connect(host, port);
+      if (NN.setSockBuf) { try { NN.setSockBuf(fd, 3, 60); } catch (e) {} }
+      // Same key doFetch() computes for a plain-http request: no TLS terms.
+      if (!poolPut(poolKey(host, port, false, false, "", ""), host, fd, false)) {
+        try { NN.close(fd); } catch (e) {}
+      }
+    } catch (e) {
+      // bun's preconnect is fire-and-forget: a refused connection is dropped on
+      // the HTTP thread and never surfaces to the caller.
+    }
+    return undefined;
+  };
+  // `--fetch-preconnect <URL>` (repeatable) dials before the entry module runs.
+  // PORT-SOURCE: compat/bun/src/runtime/cli/run_command.rs do_preconnect (:837),
+  // called from Run::start (:1090) ahead of the entry module load.
+  // __mbunHttpNative is installed by the C++ binding pass, which may not have
+  // run when this image is evaluated, so fall back to the first microtask —
+  // still before any user code, and the kernel completes the handshake whether
+  // or not the child ever polls the socket.
+  const __mbunDoCliPreconnects = function () {
+    let list;
+    try {
+      const HN = G.__mbunHttpNative;
+      list = HN && typeof HN.preconnectUrls === "function" ? HN.preconnectUrls() : null;
+    } catch (e) { return; }
+    if (!list || !list.length) return;
+    for (let i = 0; i < list.length; i++) {
+      try { G.fetch.preconnect(list[i]); }
+      catch (e) { try { console.error("error: " + ((e && e.message) || e) + ": " + list[i]); } catch (e2) {} }
+    }
+  };
+  if (G.__mbunHttpNative) __mbunDoCliPreconnects();
+  else if (G.queueMicrotask) G.queueMicrotask(__mbunDoCliPreconnects);
 })();
 )JS";
 

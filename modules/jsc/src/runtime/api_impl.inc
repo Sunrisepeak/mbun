@@ -68,6 +68,10 @@ void set_tsconfig_override(std::string path) { gTsconfigOverride = std::move(pat
 // `--user-agent <STR>`: default User-Agent for fetch (bun Arguments.rs:1062).
 void set_user_agent(std::string ua) { gUserAgent = std::move(ua); }
 
+// `--fetch-preconnect <URL>`: repeatable, order-preserving (bun run_command.rs
+// walks the list in argv order).
+void add_fetch_preconnect(std::string url) { gFetchPreconnect.push_back(std::move(url)); }
+
 // Evaluate JS source, returning its numeric value or an error string. Bindings
 // are installed. Used by the smoke test (eval "Bun.semver.order(...)" == -1) and
 // reusable by the bun:test runner (T3.4).

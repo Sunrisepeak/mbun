@@ -266,6 +266,11 @@ std::string gTsconfigOverride{};
 // ref: bun cli/Arguments.rs:1062 → bun_http::OVERRIDDEN_DEFAULT_USER_AGENT.
 std::string gUserAgent{};
 
+// `--fetch-preconnect <URL>` (repeatable) — origins to dial before the entry
+// module loads, so the first fetch to each skips the connect round trip.
+// ref: bun cli/Arguments.rs:1104 → run_command.rs do_preconnect (:837).
+std::vector<std::string> gFetchPreconnect{};
+
 // ── the Permission Model (node --permission / --allow-*) ────────────────────
 // One instance per process, exactly like node's Environment::permission(). It
 // starts DISABLED and every gate below is a no-op in that state, so an ordinary
