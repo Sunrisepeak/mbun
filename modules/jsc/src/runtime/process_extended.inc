@@ -796,6 +796,19 @@ std::optional<JSValueRef> builtin_module(JSContextRef ctx, const std::string& mo
             return bt;
         }
     }
+    // node's schemeless block list (lib/internal/bootstrap/realm.js
+    // `schemelessBlockList`): four builtins are requirable ONLY with the
+    // `node:` scheme, so a bare `require("test")` must miss the builtin table
+    // entirely and fall through to the ordinary node_modules resolver — that is
+    // what lets a userland package named `test` shadow the runner. mbun
+    // registered both keys, so bare `test` returned the builtin `nodeTest`
+    // function and `node_modules/test/index.js` was unreachable. The `node:`-
+    // prefixed spec is a different string and is unaffected; the
+    // BuiltinModule shim in this file already models the same list for
+    // `module.isBuiltin` / `builtinModules`.
+    if (mod == "test" || mod == "test/reporters" || mod == "sqlite" || mod == "quic") {
+        return std::nullopt;
+    }
     // pure-JS node builtins: globalThis.__mbunNativeModules[mod]
     JSValueRef reg{get_prop(ctx, global, "__mbunNativeModules")};
     if (JSValueIsObject(ctx, reg)) {
