@@ -25,6 +25,15 @@ using namespace mbun::app;
 
 int main(int argc, char* argv[]) {
     mbun::platform::raise_file_descriptor_limit();
+    // Worker/fork pass the parent's normalized --tsconfig-override through a
+    // one-hop internal environment key while leaving process.execArgv raw. Copy
+    // then erase it before any runtime/JS environment snapshot can expose it.
+    if (const char* inherited{std::getenv("MBUN_INTERNAL_TSCONFIG_OVERRIDE")};
+        inherited != nullptr) {
+        std::string path{inherited};
+        mbun::platform::unset_env_var("MBUN_INTERNAL_TSCONFIG_OVERRIDE");
+        if (!path.empty()) set_inherited_tsconfig_override(std::move(path));
+    }
     // process.argv0 — node snapshots the ORIGINAL argv[0] before anything can
     // rewrite it, and the corpus respawns the runtime through it. Recorded first
     // so every dispatch below (compiled program, node emulation, run, -e) agrees.

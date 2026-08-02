@@ -252,6 +252,17 @@
         // executable's baked `--compile-exec-argv` flags survive; the JS layer
         // (node_process_extra) only fills in an empty array when it is missing.
         set_prop(ctx_, process, "execArgv", build_string_array_(gExecArgv));
+        // The normalized parse-time path is process infrastructure used only by
+        // Worker/fork's internal spawn. Keep it distinct from process.execArgv,
+        // whose original token spelling and order are public Node API.
+        if (!gTsconfigOverride.empty()) {
+            JSStringRef name{JSStringCreateWithUTF8CString("__mbunTsconfigOverride")};
+            JSObjectSetProperty(ctx_, process, name, make_string(ctx_, gTsconfigOverride),
+                                kJSPropertyAttributeDontEnum | kJSPropertyAttributeReadOnly |
+                                    kJSPropertyAttributeDontDelete,
+                                nullptr);
+            JSStringRelease(name);
+        }
         // `--title=<name>` among the runtime's own flags renames the process.
         // ref: bun src/cli/Arguments.rs (--title) — the JS layer below only
         // defaults this when nothing set it.

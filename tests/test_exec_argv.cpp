@@ -69,6 +69,12 @@ int main() {
     expect_eq(derive({"--snapshot-blob", "b.bin", "--build-snapshot", "file.js"}),
               {"--snapshot-blob", "b.bin", "--build-snapshot"},
               "--snapshot-blob consumes its value token");
+    expect_eq(derive({"--smol", "--tsconfig-override", "config/tsconfig.json", "file.ts"}),
+              {"--smol", "--tsconfig-override", "config/tsconfig.json"},
+              "tsconfig override keeps raw spelling and order in execArgv");
+    expect_eq(derive({"--tsconfig-override=config/tsconfig.json", "file.ts"}),
+              {"--tsconfig-override=config/tsconfig.json"},
+              "inline tsconfig override remains one raw execArgv token");
     // …but a boolean flag must NOT swallow the script.
     expect_eq(derive({"--expose-gc", "file.js"}), {"--expose-gc"},
               "a boolean flag never swallows the script");

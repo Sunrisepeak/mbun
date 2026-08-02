@@ -199,6 +199,13 @@ public:
     // can require() local helpers and see Bun.*/node globals.
     std::expected<void, std::string> install_cjs_env(const std::string& dir,
                                                      const std::string& file) {
+        // Bun parses an explicit override while constructing the runtime's
+        // transpiler, before user code. Missing/read/malformed diagnostics are
+        // global log errors, not a reason to abort command execution. Cache the
+        // null result so later imports do not print the diagnostic twice.
+        if (!gTsconfigOverride.empty()) {
+            (void)load_tsconfig_(std::filesystem::path{gTsconfigOverride});
+        }
         const bool pendingDeprecation{
             std::find(gExecArgv.begin(), gExecArgv.end(), "--pending-deprecation") != gExecArgv.end()};
         std::string js{"globalThis.__dirname = " + json_quote_(dir) + ";\n" +

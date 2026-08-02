@@ -48,8 +48,20 @@ Flags:
 
 std::vector<std::string> gCliPreloads{};
 
+// Worker/fork are processes in this runtime. They inherit the parent's raw
+// execArgv for Node compatibility, but a relative --tsconfig-override in that
+// public array must not be reinterpreted after the parent has chdir()ed. Their
+// spawn boundary passes the already-normalized absolute path out of band; main
+// consumes it before JS exists and records that it is authoritative here.
+std::optional<std::string> gInheritedTsconfigOverride{};
+
 void set_cli_preloads(std::vector<std::string> preloads) {
     gCliPreloads = std::move(preloads);
+}
+
+void set_inherited_tsconfig_override(std::string path) {
+    gInheritedTsconfigOverride = path;
+    mbun::jsc::runtime::set_tsconfig_override(std::move(path));
 }
 
 // A bare path argument that looks like a runnable script (bun-style `bun x.js`).
@@ -139,7 +151,7 @@ bool has_node_test_flag(std::span<const std::string_view> args) {
         // A value-taking Node flag owns the next token, so `--require preload
         // --test` remains a test-runner invocation rather than treating the
         // preload path as a script.
-        if (a.find('=') == std::string_view::npos && mbun::cli::node_flag_takes_value(a) &&
+        if (a.find('=') == std::string_view::npos && mbun::cli::exec_argv_flag_takes_value(a) &&
             i + 1 < args.size()) ++i;
     }
     return false;
@@ -2387,6 +2399,11 @@ void apply_cwd_flag(std::string_view dir) {
 // receive one stable absolute config path; resolving later from an importing
 // module would incorrectly make the option depend on that modules directory.
 bool apply_tsconfig_override(std::string value) {
+    // A Worker/fork child still carries the parent's RAW process.execArgv. Its
+    // one-hop internal handoff is the normalized parse-time path and therefore
+    // wins over re-parsing that relative public spelling in the child's cwd.
+    if (gInheritedTsconfigOverride) return true;
+
     std::error_code ec{};
     const std::filesystem::path cwd{std::filesystem::current_path(ec)};
     if (ec) {
@@ -2394,11 +2411,11 @@ bool apply_tsconfig_override(std::string value) {
         return false;
     }
     value = mbun::cli::resolve_tsconfig_override_path(value, cwd);
-    const auto loaded{mbun::resolver::load_tsconfig_override(build_os_fs(), value)};
-    if (!loaded.config) {
-        std::println(std::cerr, "error: {}", loaded.error);
-        return false;
-    }
+    // Bun's runtime resolver logs an explicit missing/read/malformed config but
+    // keeps resolving with no config. Do not validate here: doing so prevented
+    // run/eval/test/node/repl user code from executing at all. Engine::
+    // load_tsconfig_ owns the one-time diagnostic when resolution first needs
+    // the config. Build deliberately retains its eager fatal check below.
     mbun::jsc::runtime::set_tsconfig_override(std::move(value));
     return true;
 }
@@ -3018,7 +3035,44 @@ int run_embedded_program(const mbun::bundler::standalone_exe::Program& program,
 // is cosmetic. `-i` also forces the REPL when stdin is NOT a tty, which is the
 // only way the corpus can drive it (17 test-repl-* files spawn `mbun -i` /
 // `mbun --interactive` with piped stdio).
+bool apply_node_frontend_options(std::span<const std::string_view> args) {
+    mbun::cli::TsconfigOverrideArg tsconfig{};
+    for (std::size_t i{}; i < args.size(); ++i) {
+        const std::string_view a{args[i]};
+        if (a == "-e" || a == "--eval" || a == "-p" || a == "--print" || a == "-pe" ||
+            a == "-ep") {
+            break;
+        }
+        if (!a.starts_with("-") || a == "-") break;
+        if (const std::size_t n{mbun::cli::take_tsconfig_override(args, i, tsconfig)}; n > 0) {
+            if (!tsconfig.parseError.empty()) {
+                std::println(std::cerr, "error: {}", tsconfig.parseError);
+                return false;
+            }
+            i += n - 1;
+            continue;
+        }
+        if (a == "--cwd" && i + 1 < args.size()) {
+            apply_cwd_flag(args[++i]);
+            continue;
+        }
+        if (a.starts_with("--cwd=")) {
+            apply_cwd_flag(a.substr(6));
+            continue;
+        }
+        if (a.find('=') == std::string_view::npos && mbun::cli::node_flag_takes_value(a) &&
+            i + 1 < args.size()) {
+            ++i;
+        }
+    }
+
+    // As in Bun's full option-table parse, cwd is applied before the raw
+    // tsconfig value is joined regardless of their command-line order.
+    return !tsconfig.value || apply_tsconfig_override(*tsconfig.value);
+}
+
 int exec_interactive(std::span<const std::string_view> args) {
+    if (!apply_node_frontend_options(args)) return 1;
     // node lib/internal/main/repl.js: `--input-type` selects a module kind for
     // the entry point, and a REPL has none — node prints this on stderr and
     // exits kInvalidCommandLineArgument (9). test-repl-unsupported-option
@@ -3109,7 +3163,15 @@ bool take_interactive_flag(std::vector<std::string_view>& args) {
             continue;
         }
         if (a == "-e" || a == "--eval" || a == "-p" || a == "--print") { i += 2; continue; }
-        if (a.starts_with("-") && a != "-") { ++i; continue; }
+        if (a.starts_with("-") && a != "-") {
+            if (a.find('=') == std::string_view::npos &&
+                mbun::cli::exec_argv_flag_takes_value(a) && i + 1 < args.size()) {
+                i += 2;
+            } else {
+                ++i;
+            }
+            continue;
+        }
         break;
     }
     return interactive;
@@ -3127,6 +3189,7 @@ bool take_interactive_flag(std::vector<std::string_view>& args) {
 // WARN_ON_UNRECOGNIZED_FLAG) — node-mode must not reject node's own flags.
 int exec_as_if_node(std::span<const std::string_view> args) {
     mbun::cli::run::set_pretend_to_be_node(true);
+    if (!apply_node_frontend_options(args)) return 1;
 
     std::vector<std::string> preloads{};
     std::size_t i{0};
@@ -3187,7 +3250,7 @@ int exec_as_if_node(std::span<const std::string_view> args) {
         // (its `=value` rides along in the same token). A separate value token is
         // skipped only for flags known to take one, so boolean flags do not
         // accidentally swallow the script path.
-        if (a.find('=') == std::string_view::npos && mbun::cli::node_flag_takes_value(a) &&
+        if (a.find('=') == std::string_view::npos && mbun::cli::exec_argv_flag_takes_value(a) &&
             i + 1 < args.size()) {
             ++i;  // consume the value token
         }

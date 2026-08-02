@@ -693,15 +693,13 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
         if (value !== undefined) childEnv[key] = String(value);
       }
       if (ipcIndex >= 0) {
-        // node advertises the child's end of the channel through NODE_CHANNEL_FD
-        // (lib/internal/child_process.js spawn()); the fd number is the slot index.
-        // The serialization mode travels the same way, in
-        // NODE_CHANNEL_SERIALIZATION_MODE, so the child frames its half
-        // identically without being told twice.
+        // node advertises the IPC fd and serialization through the environment.
         const e = {};
         for (const k of Object.keys(childEnv)) e[k] = childEnv[k];
         e.NODE_CHANNEL_FD = String(ipcIndex);
         e.NODE_CHANNEL_SERIALIZATION_MODE = options.serialization === "advanced" ? "advanced" : "json";
+        if (options.__mbunTsconfig && G.process.__mbunTsconfigOverride)
+          e.MBUN_INTERNAL_TSCONFIG_OVERRIDE = G.process.__mbunTsconfigOverride;
         sopts.env = e;
       } else {
         sopts.env = childEnv;
@@ -1420,11 +1418,10 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     } else {
       stdio = stdio.slice();
     }
-    // node prepends the parent's execArgv (or options.execArgv) before the
-    // module path so the child inherits the same runtime flags.
+    // node prepends the inherited (or explicit) execArgv before the module.
     const execArgv = options.execArgv !== undefined ? options.execArgv : ((G.process && G.process.execArgv) || []);
     const child = new ChildProcess();
-    child.spawn({ file: exe, args: [exe].concat((execArgv || []).map(toStr), [toStr(modulePath)], (args || []).map(toStr)), cwd: options.cwd, env: options.env, stdio, detached: options.detached, timeout: options.timeout, killSignal: options.killSignal, signal: options.signal, serialization: validateSerialization(options.serialization) });
+    child.spawn({ file: exe, args: [exe].concat((execArgv || []).map(toStr), [toStr(modulePath)], (args || []).map(toStr)), cwd: options.cwd, env: options.env, stdio, detached: options.detached, timeout: options.timeout, killSignal: options.killSignal, signal: options.signal, serialization: validateSerialization(options.serialization), __mbunTsconfig: options.execArgv === undefined });
     return child;
   }
 
