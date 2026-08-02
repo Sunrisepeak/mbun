@@ -48,6 +48,7 @@ inline constexpr std::string_view kNodeVmJS = R"JS(
   const ObjectDefineProperty = Object.defineProperty;
   const gOPD = Object.getOwnPropertyDescriptor;
   const ownKeys = Reflect.ownKeys;
+  const RegExpPrototypeExec = Function.prototype.call.bind(RegExp.prototype.exec);
 
   const contexts = new WeakSet();
   const records = new WeakMap();
@@ -549,7 +550,7 @@ inline constexpr std::string_view kNodeVmJS = R"JS(
   function parseSourceMapURL(code) {
     const re = /(?:^|\n)[ \t]*\/\/[#@][ \t]+sourceMappingURL=([^\s'"]+)[ \t]*(?=\n|$)/g;
     let m, last;
-    while ((m = re.exec(code)) !== null) last = m[1];
+    while ((m = RegExpPrototypeExec(re, code)) !== null) last = m[1];
     return last;
   }
 
@@ -706,7 +707,7 @@ inline constexpr std::string_view kNodeVmJS = R"JS(
   function prepareDynImport(code, callback, getWrap) {
     const src = `${code}`;
     DYNIMPORT_RE.lastIndex = 0;
-    if (!DYNIMPORT_RE.test(src)) return null;
+    if (RegExpPrototypeExec(DYNIMPORT_RE, src) === null) return null;
     const id = dynNextId++;
     DYNIMPORT_RE.lastIndex = 0;
     dynRegistry[id] = makeDynImportHandler(callback, getWrap);

@@ -56,6 +56,31 @@ inline constexpr std::string_view kNodeReplJS = R"JS(
   const { Console } = req("console");
   const moduleMod = req("module");
   const CJSModule = moduleMod.Module || moduleMod;
+  // Primordials used by node's RegExp.$1..$9 save/restore protocol. Capture
+  // and uncurry exec before user code can replace RegExp.prototype.exec.
+  const RegExpPrototypeExec = Function.prototype.call.bind(RegExp.prototype.exec);
+  const ObjectGetOwnPropertyDescriptor = Object.getOwnPropertyDescriptor;
+  const IntrinsicTypeError = TypeError;
+  const legacyCaptureGetters = new Array(10);
+  const legacyCaptureReadable = new Array(10).fill(true);
+  for (let idx = 1; idx < legacyCaptureGetters.length; idx += 1) {
+    const key = `$${idx}`;
+    const descriptor = ObjectGetOwnPropertyDescriptor(RegExp, key);
+    legacyCaptureGetters[idx] = descriptor && descriptor.get;
+    try {
+      void RegExp[key];
+    } catch (captureError) {
+      // JSC issue #65 is an intrinsic capability failure. Classify it while
+      // the original accessor identity is known, before a user can install a
+      // getter with a spoofed copy of the same error text.
+      if (!(captureError instanceof IntrinsicTypeError) ||
+          captureError.message !==
+            "RegExp.$N getters require RegExp constructor as |this|") {
+        throw captureError;
+      }
+      legacyCaptureReadable[idx] = false;
+    }
+  }
 
   // node internal/errors.js: an E() error carries kIsNodeError, so both
   // defaultPrepareStackTrace and NodeError#toString render the code into the
@@ -475,7 +500,8 @@ inline constexpr std::string_view kNodeReplJS = R"JS(
   const startsWithBraceRegExp = /^\s*{/;
   const endsWithSemicolonRegExp = /;\s*$/;
   function isObjectLiteral(code) {
-    return startsWithBraceRegExp.test(code) && !endsWithSemicolonRegExp.test(code);
+    return RegExpPrototypeExec(startsWithBraceRegExp, code) !== null &&
+      RegExpPrototypeExec(endsWithSemicolonRegExp, code) === null;
   }
 
   let nextREPLResourceNumber = 1;
@@ -1225,21 +1251,15 @@ inline constexpr std::string_view kNodeReplJS = R"JS(
         `${regExMatchSeparator}(.*)$`);
 
       function saveRegExpMatches() {
-        try {
-          for (let idx = 1; idx < savedRegExMatches.length; idx += 1) {
-            savedRegExMatches[idx] = RegExp[`$${idx}`];
-          }
-        } catch (captureError) {
-          // JSC currently exposes the legacy static captures through accessors
-          // whose receiver check rejects its own RegExp constructor (issue #65).
-          // That runtime defect must not replace an otherwise successful REPL
-          // evaluation with an unrelated TypeError. Keep the normal node path
-          // active for runtimes where the accessors are readable.
-          if (!(captureError instanceof TypeError) ||
-              captureError.message !==
-                "RegExp.$N getters require RegExp constructor as |this|") {
-            throw captureError;
-          }
+        for (let idx = 1; idx < savedRegExMatches.length; idx += 1) {
+          const key = `$${idx}`;
+          const descriptor = ObjectGetOwnPropertyDescriptor(RegExp, key);
+          if (!legacyCaptureReadable[idx] && descriptor &&
+              descriptor.get === legacyCaptureGetters[idx]) continue;
+          // A replaced getter or data property is user-observable state. Read
+          // it normally and propagate every error it raises, including one
+          // whose message happens to match issue #65.
+          savedRegExMatches[idx] = RegExp[key];
         }
       }
 
@@ -1338,7 +1358,8 @@ inline constexpr std::string_view kNodeReplJS = R"JS(
 
         // Restore the captures hidden by REPL bookkeeping before user code runs,
         // matching node's default evaluator protocol.
-        regExMatcher.exec(savedRegExMatches.join(regExMatchSeparator));
+        RegExpPrototypeExec(regExMatcher,
+                            savedRegExMatches.join(regExMatchSeparator));
 
         let finished = false;
         function finishExecution(e, r) {

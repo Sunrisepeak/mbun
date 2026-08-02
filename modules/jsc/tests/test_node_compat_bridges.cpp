@@ -29,9 +29,36 @@ int main() {
     expect_number(
         "(()=>{try{const repl=require('node:repl');const stream=require('node:stream');"
         "const io=new stream.PassThrough();const server=repl.start({input:io,output:io,terminal:false,prompt:''});"
-        "let result=-1;server.eval('1+1\\n',server.context,'REPL1',(err,value)=>{result=err?0:value===2?1:0});"
-        "server.close();return result}catch{return -1}})()",
-        1, "node REPL default evaluation completes despite unavailable legacy RegExp captures");
+        "let calls=0,result=-1;server.eval('1+1\\n',server.context,'REPL1',(err,value)=>{calls++;result=err?0:value===2?1:0});"
+        "server.close();return calls===1&&result===1?1:0}catch{return -1}})()",
+        1, "node REPL default evaluation calls back exactly once despite unavailable legacy RegExp captures");
+    expect_number(
+        "(()=>{const repl=require('node:repl'),stream=require('node:stream'),io=new stream.PassThrough();"
+        "const server=repl.start({input:io,output:io,terminal:false,prompt:'',useGlobal:true});"
+        "const original=RegExp.prototype.exec;let calls=0,value=-1,thrown='';"
+        "RegExp.prototype.exec=()=>{throw new Error('poison-exec')};"
+        "try{server.eval('1+1\\n',server.context,'REPL1',(err,result)=>{calls++;value=err?0:result})}"
+        "catch(err){thrown=err&&err.message}finally{RegExp.prototype.exec=original;server.close()}"
+        "return calls===1&&value===2&&thrown===''?1:0})()",
+        1, "node REPL capture restoration uses the primordial RegExp exec");
+    expect_number(
+        "(()=>{const repl=require('node:repl'),stream=require('node:stream'),io=new stream.PassThrough();"
+        "const server=repl.start({input:io,output:io,terminal:false,prompt:''});"
+        "const original=Object.getOwnPropertyDescriptor(RegExp,'$1');"
+        "const marker=new TypeError('RegExp.$N getters require RegExp constructor as |this|');"
+        "let calls=0,thrown=null;Object.defineProperty(RegExp,'$1',{configurable:true,get(){throw marker}});"
+        "try{server.eval('1+1\\n',server.context,'REPL1',()=>{calls++})}catch(err){thrown=err}"
+        "finally{Object.defineProperty(RegExp,'$1',original);server.close()}"
+        "return calls===0&&thrown===marker?1:0})()",
+        1, "node REPL propagates a user capture getter even when its message matches issue 65");
+    expect_number(
+        "(()=>{try{void RegExp.$1}catch{return 1}"
+        "const repl=require('node:repl'),stream=require('node:stream'),io=new stream.PassThrough();"
+        "const server=repl.start({input:io,output:io,terminal:false,prompt:'',useGlobal:true});"
+        "let first=0,second=0,value;server.eval('/(alpha)/.exec(\\\"alpha\\\");0\\n',server.context,'REPL1',(err)=>{first++;if(err)value=err});"
+        "/(outside)/.exec('outside');server.eval('RegExp.$1\\n',server.context,'REPL2',(err,result)=>{second++;value=err||result});"
+        "server.close();return first===1&&second===1&&value==='alpha'?1:0})()",
+        1, "node REPL restores the prior capture before the next evaluation when legacy captures are supported");
     expect_number(
         "(()=>{try{const fs=require('node:fs');"
         "const p=require('node:util').promisify(fs.exists);"
