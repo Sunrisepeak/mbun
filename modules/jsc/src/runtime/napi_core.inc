@@ -709,10 +709,16 @@ extern "C" napi_status napi_get_and_clear_last_exception(napi_env env, napi_valu
 extern "C" napi_status napi_fatal_exception(napi_env env, napi_value err) {
     NAPI_PREAMBLE_NO_THROW_SCOPE(env);
     NAPI_CHECK_ARG(env, err);
-    // node reports through 'uncaughtException'; minimal port: print + keep going
+    // port: node_api.cc napi_fatal_exception -> node::errors::TriggerUncaughtException.
+    // This used to print the message to stderr and return, which is NOT what the
+    // API means: the error must be delivered to process 'uncaughtException'
+    // listeners, and only kill the process when nothing claims it. The printing
+    // version made test_fatal_exception's mustCall listener fire zero times.
+    // dispatchFinalizerException is the same delivery path the deferred
+    // finalizer drain uses (__mbun_uncaught, then the fatal channel when
+    // unclaimed), which is exactly node's escalation.
     JSC::JSValue value = toJSValue(err);
-    WTF::String message = value.toWTFStringForConsole(env->globalObject());
-    fprintf(stderr, "napi_fatal_exception: %s\n", message.utf8().data());
+    (void)mbun::napi_rt::dispatchFinalizerException(env, value);
     return clearLastError(env);
 }
 
