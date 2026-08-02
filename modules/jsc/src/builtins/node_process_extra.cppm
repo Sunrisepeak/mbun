@@ -2769,18 +2769,21 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
           return true;
         },
       };
-      for (const name of Object.keys(defs)) {
-        if (name in G) continue;
-        Object.defineProperty(G, name, {
-          configurable: true,
-          enumerable: false,
-          get() { return hasFlag() ? defs[name] : undefined; },
-          set(v) {
-            Object.defineProperty(G, name, {
-              value: v, writable: true, configurable: true, enumerable: false,
-            });
-          },
-        });
+      // Defined ONLY under the flag, and the presence of the property is the
+      // observable -- not just its value. A lazy `get(){ return hasFlag() ? … }`
+      // accessor is always an OWN PROPERTY, and the REPL completes globals from
+      // ObjectGetOwnPropertyNames(globalThis) (node repl.js
+      // filteredOwnPropertyNames keeps every identifier-shaped own name,
+      // enumerable or not), so a flagless process still offered
+      // `isOneByteString` for the input `I` -- one extra entry in the middle of
+      // test-repl-tab-complete's "works with builtin values" list.
+      if (hasFlag()) {
+        for (const name of Object.keys(defs)) {
+          if (name in G) continue;
+          Object.defineProperty(G, name, {
+            value: defs[name], writable: true, configurable: true, enumerable: false,
+          });
+        }
       }
     } catch (e) {}
   } catch (e) {}
