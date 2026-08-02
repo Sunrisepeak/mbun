@@ -2552,6 +2552,10 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
       fired++; T.fired++;
       if (bail) break;
     }
+    // As a LIFETIME counter the cap above silently stopped firing every timer
+    // after the process's 200_000th (setTimeout's leak fixtures exited 0
+    // mid-loop). Budget not exhausted => not a runaway => forget the count.
+    if (fired < budget) T.fired = 0;
     const now2 = Date.now();
     let due = 0; for (let i = 0; i < T.q.length; i++) if (T.q[i].at <= now2) due++;
     return due;
