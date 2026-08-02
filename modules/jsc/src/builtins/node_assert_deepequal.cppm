@@ -594,64 +594,9 @@ inline constexpr std::string_view kNodeAssertDeepEqualJS = R"JS(
     const instanceMethodNames = [
       "fail", "ok", "equal", "notEqual", "deepEqual", "notDeepEqual",
       "strictEqual", "notStrictEqual", "deepStrictEqual", "notDeepStrictEqual",
-      "partialDeepStrictEqual", "throws", "rejects", "doesNotThrow",
-      "doesNotReject", "ifError", "match", "doesNotMatch",
+      "throws", "rejects", "doesNotThrow", "doesNotReject", "ifError",
+      "match", "doesNotMatch",
     ];
-    const partialDeepStrictEqual = function partialDeepStrictEqual(actual, expected, message) {
-      const compare = (received, wanted, memo) => {
-        if (Object.is(received, wanted)) return true;
-        if (received === null || wanted === null ||
-            typeof received !== "object" || typeof wanted !== "object") return false;
-        if (isWeakMap(received) || isWeakMap(wanted) || isWeakSet(received) || isWeakSet(wanted)) return false;
-        const remembered = memo.get(received);
-        if (remembered === wanted) return true;
-        memo.set(received, wanted);
-        try {
-          if (Array.isArray(received) || Array.isArray(wanted)) {
-            if (!Array.isArray(received) || !Array.isArray(wanted) || received.length < wanted.length) return false;
-            for (let i = 0; i < wanted.length; ++i)
-              if (!(i in received) || !(i in wanted) || !compare(received[i], wanted[i], memo)) return false;
-          } else if (isMap(received) || isMap(wanted)) {
-            if (!isMap(received) || !isMap(wanted) || mapSize.call(received) < mapSize.call(wanted)) return false;
-            for (const [key, value] of wanted) {
-              if (!received.has(key) || !compare(received.get(key), value, memo)) return false;
-            }
-          } else if (isSet(received) || isSet(wanted)) {
-            if (!isSet(received) || !isSet(wanted) || setSize.call(received) < setSize.call(wanted)) return false;
-            for (const wantedValue of wanted) {
-              let found = false;
-              for (const receivedValue of received) {
-                if (compare(receivedValue, wantedValue, memo)) { found = true; break; }
-              }
-              if (!found) return false;
-            }
-          } else if ((taTag(received) !== undefined) || (taTag(wanted) !== undefined)) {
-            if (taTag(received) !== taTag(wanted) || received.byteLength < wanted.byteLength) return false;
-            const actualBytes = bytesOf(received), expectedBytes = bytesOf(wanted);
-            let offset = 0;
-            for (const byte of expectedBytes) {
-              while (offset < actualBytes.length && actualBytes[offset] !== byte) ++offset;
-              if (offset === actualBytes.length) return false;
-              ++offset;
-            }
-          } else if (isError(received) || isError(wanted)) {
-            if (!isError(received) || !isError(wanted) || received.name !== wanted.name) return false;
-            if (wanted.message !== "" && !compare(received.message, wanted.message, memo)) return false;
-          }
-          for (const key of ownKeys(wanted)) {
-            if (!Object.prototype.hasOwnProperty.call(received, key) ||
-                !compare(received[key], wanted[key], memo)) return false;
-          }
-          return true;
-        } finally {
-          memo.delete(received);
-        }
-      };
-      if (!compare(actual, expected, new Map()))
-        throw assertionError(message, actual, expected, "partialDeepStrictEqual",
-          eqMsg(actual, expected, "partially and strictly deep-equal"));
-    };
-    assertMod.partialDeepStrictEqual = partialDeepStrictEqual;
 
     function Assert(options) {
       if (!new.target) {
@@ -659,15 +604,18 @@ inline constexpr std::string_view kNodeAssertDeepEqualJS = R"JS(
         error.code = "ERR_CONSTRUCT_CALL_REQUIRED";
         throw error;
       }
-      options = Object.assign({ strict: true, skipPrototype: false }, options || {});
+      options = options || {};
       if (options.diff !== undefined && options.diff !== "simple" && options.diff !== "full") {
         const error = new TypeError("The property 'options.diff' must be one of: 'simple', 'full'. Received '" + options.diff + "'");
         error.code = "ERR_INVALID_ARG_VALUE";
         throw error;
       }
-      Object.defineProperty(this, kAssertOptions, { value: options });
+      // Only retain options this bridge implements. In particular, do not
+      // advertise skipPrototype until the comparator can honor it end to end.
+      const assertOptions = { strict: options.strict !== false, diff: options.diff };
+      Object.defineProperty(this, kAssertOptions, { value: assertOptions });
       this.AssertionError = AssertionError;
-      if (options.strict) {
+      if (assertOptions.strict) {
         this.equal = this.strictEqual;
         this.deepEqual = this.deepStrictEqual;
         this.notEqual = this.notStrictEqual;
@@ -678,11 +626,12 @@ inline constexpr std::string_view kNodeAssertDeepEqualJS = R"JS(
       Assert.prototype[name] = function (...args) {
         const options = this && this[kAssertOptions];
         const targetName = options && options.strict && strictAliases[name] ? strictAliases[name] : name;
-        const target = targetName === "partialDeepStrictEqual" ? partialDeepStrictEqual : assertMod[targetName];
+        const target = assertMod[targetName];
         try {
-          return target.apply(assertMod, args);
+          return target.apply(this, args);
         } catch (error) {
-          if (error && typeof error === "object") error.diff = options && options.diff !== undefined ? options.diff : "simple";
+          if (error instanceof AssertionError)
+            error.diff = options && options.diff !== undefined ? options.diff : "simple";
           throw error;
         }
       };
