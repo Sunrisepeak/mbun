@@ -1,0 +1,16 @@
+compat/bun/test/js/third_party/@azure/service-bus/azure-service-bus.test.ts
+compat/bun/test/js/third_party/body-parser/express-memory-leak.test.ts
+compat/bun/test/js/third_party/grpc-js/test-end-to-end.test.ts
+compat/bun/test/js/third_party/mongodb/mongodb.test.ts
+compat/bun/test/js/third_party/nodemailer/nodemailer.test.ts
+compat/bun/test/js/third_party/pg/pg.test.ts
+compat/bun/test/js/third_party/postgres/postgres.test.ts
+compat/bun/test/js/third_party/socket.io/socket.io-messaging-many.test.ts
+compat/bun/test/js/third_party/socket.io/socket.io-middleware.test.ts
+compat/bun/test/js/third_party/socket.io/socket.io-namespaces.test.ts
+compat/bun/test/js/third_party/socket.io/socket.io-server-attachment.test.ts
+compat/bun/test/js/third_party/socket.io/socket.io-socket-middleware.test.ts
+compat/bun/test/js/third_party/socket.io/socket.io-socket-timeout.test.ts
+compat/bun/test/js/third_party/socket.io/socket.io-utility-methods.test.ts
+compat/bun/test/js/third_party/socket.io/socket.io.test.ts
+compat/bun/test/js/third_party/stripe/stripe.test.ts
