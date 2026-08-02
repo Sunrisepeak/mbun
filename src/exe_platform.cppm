@@ -15,6 +15,7 @@ module;
 #include <unistd.h>
 #endif
 #if defined(_WIN32)
+#include <io.h>
 #include <stdlib.h>
 #endif
 
@@ -32,6 +33,10 @@ inline constexpr bool is_windows = false;
 
 // Raise the soft descriptor limit where the host platform supports RLIMIT_NOFILE.
 void raise_file_descriptor_limit();
+
+// Whether this process's stdin is a terminal. node splits its no-script startup
+// on exactly this: a TTY gets the REPL, anything else is a script piped in.
+bool stdin_is_terminal();
 
 // Set the runtime switch consumed by process.dlopen when --no-addons is used.
 void set_no_addons_env();
@@ -112,6 +117,14 @@ void raise_file_descriptor_limit() {
             }
         }
     }
+}
+
+bool stdin_is_terminal() {
+#if defined(_WIN32)
+    return _isatty(0) != 0;
+#else
+    return ::isatty(STDIN_FILENO) == 1;
+#endif
 }
 
 void set_no_addons_env() {

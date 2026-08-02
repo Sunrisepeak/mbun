@@ -382,6 +382,23 @@ int main(int argc, char* argv[]) {
         return !globalTsconfig.value || apply_tsconfig_override(*globalTsconfig.value);
     }};
 
+    // node's stdin main script (lib/internal/main/eval_stdin.js): with no file to
+    // run, node reads the WHOLE of stdin and evaluates it as the main module —
+    // either because an explicit `-` operand asked for it, or because a bare
+    // invocation found stdin was not a terminal (a terminal is the REPL instead).
+    // `-` is not an option, so it keeps its argv slot: `mbun - --opt` must put
+    // --opt at process.argv[2], which is what test-stdin-script-child-option
+    // asserts.
+    if ((!args.empty() && args[0] == "-") ||
+        (args.empty() && !mbun::platform::stdin_is_terminal())) {
+        if (!applyGlobalTsconfig()) return 1;
+        std::vector<std::string> jsArgv{"mbun"};
+        for (const std::string_view a : args) jsArgv.emplace_back(a);
+        mbun::jsc::runtime::set_argv(std::move(jsArgv));
+        const std::string source{std::istreambuf_iterator<char>{std::cin}, {}};
+        return mbun::jsc::runtime::run_eval(source);
+    }
+
     // Node-style re-exec: a leading `--flag` that is neither a bun run-flag nor
     // an eval flag, followed later by a positional entry point, is how the Node
     // corpus re-spawns `process.execPath` (`mbun --expose-gc file.js`,
@@ -424,9 +441,21 @@ int main(int argc, char* argv[]) {
         // `mbun -e <code>` / `mbun --eval <code>`: evaluate a JS/TS string.
         if (is_eval_flag(args[0])) {
             if (!applyGlobalTsconfig()) return 1;
-            if (args.size() < 2) {
+            // node's `--print` is a BOOLEAN option (node_options.cc), separate
+            // from `--eval`'s string, so the two compose: `-p -e 42` is one
+            // eval whose result is printed. Taking only args[0] made args[1]
+            // ("-e") the source, and `mbun -p -e 42` died with
+            // "ReferenceError: e is not defined" (test-cli-eval runs exactly
+            // that, alongside '-pe' and '--print').
+            std::size_t code_at{0};
+            bool prints{false};
+            while (code_at < args.size() && is_eval_flag(args[code_at])) {
+                prints = prints || eval_flag_prints(args[code_at]);
+                ++code_at;
+            }
+            if (args.size() <= code_at) {
                 std::println(std::cerr, "{}: {} requires an argument",
-                             argc > 0 ? argv[0] : "mbun", args[0]);
+                             argc > 0 ? argv[0] : "mbun", args[code_at - 1]);
                 return 9;
             }
             // argv omits the script slot in eval mode: bun builds argv as
@@ -441,12 +470,12 @@ int main(int argc, char* argv[]) {
                 // exactly <args>. Only the FIRST one is consumed — with
                 // `-- --` the second `--` is a real argument.
                 // ref: regression 17294.
-                auto rest{std::span{args}.subspan(2)};
+                auto rest{std::span{args}.subspan(code_at + 1)};
                 if (!rest.empty() && rest[0] == "--") rest = rest.subspan(1);
                 for (std::string_view a : rest) jsArgv.emplace_back(a);
             }
             mbun::jsc::runtime::set_argv(std::move(jsArgv));
-            std::string code{args[1]};
+            std::string code{args[code_at]};
             // `-p`/`--print` prints the result.
             //
             // node lib/internal/process/execution.js evalScript compiles
@@ -461,13 +490,13 @@ int main(int argc, char* argv[]) {
             // through common.spawnPromisified(process.execPath, ['-pe', ...])
             // and asserts the child's stderr is empty
             // (test-timers-{timeout,immediate,interval}-promisified).
-            if (eval_flag_prints(args[0])) {
-                code = "console.log(eval(" + js_quote(args[1]) + "))";
+            if (prints) {
+                code = "console.log(eval(" + js_quote(args[code_at]) + "))";
             }
             // node/bun expose the ORIGINAL eval source as process._eval
             // (run-eval.test.ts). Set it on the same first line so source-map
             // line numbers are unchanged; args[1] is the pre-wrap source.
-            code = "process._eval=" + js_quote(args[1]) + ";" + code;
+            code = "process._eval=" + js_quote(args[code_at]) + ";" + code;
             // run_eval() prepends node's addBuiltinLibsToObject shim, so both
             // this path and the `node`-argv0 emulation get the builtin globals.
             return mbun::jsc::runtime::run_eval(code);
