@@ -2628,6 +2628,8 @@ export constexpr std::string_view kNetJS_part2 = R"JS(
     if (!haveAccept) lines.push("Accept: */*");
     for (const kv of hdrs) lines.push(kv[0] + ": " + kv[1]);
     if (bodyBytes && !haveCL) lines.push("Content-Length: " + bodyBytes.length);
+    else if (!haveCL && method !== "GET" && method !== "HEAD" && method !== "OPTIONS" && method !== "TRACE")
+      lines.push("Content-Length: 0");
     const reqBytes = bodyBytes
       ? concatU8([te.encode(lines.join("\r\n") + "\r\n\r\n"), bodyBytes])
       : te.encode(lines.join("\r\n") + "\r\n\r\n");
