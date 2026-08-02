@@ -1827,12 +1827,19 @@ inline constexpr std::string_view kNodeReplJS = R"JS(
       }
 
       const replModule = new CJSModule("<repl>");
+      // node leaves `filename` null here ("In REPL, parent.filename is null",
+      // loader.js _resolveLookupPaths): that is what makes a relative require
+      // resolve against ['.'] — the cwd, never node_modules — and what makes
+      // the require stack read `<repl>` rather than a synthesised path
+      // (test-repl-require, nodejs/node#30808). Only `paths` is seeded, from
+      // the same "<cwd>/repl" anchor node's _resolveLookupPaths reaches.
+      let anchor;
       try {
-        replModule.filename = path.resolve("repl");
+        anchor = path.resolve("repl");
       } catch {
-        replModule.filename = path.resolve(path.dirname(process.execPath), "repl");
+        anchor = path.resolve(path.dirname(process.execPath), "repl");
       }
-      replModule.paths = CJSModule._nodeModulePaths(replModule.filename);
+      replModule.paths = CJSModule._nodeModulePaths(anchor);
 
       Object.defineProperty(context, "module", {
         configurable: true, writable: true, value: replModule,
@@ -1920,7 +1927,28 @@ inline constexpr std::string_view kNodeReplJS = R"JS(
   const kStandaloneREPL = Symbol("kStandaloneREPL");
 
   function makeRequireFunction(mod) {
-    const r = (id) => mod.require(id);
+    // node's Module._resolveFilename throws a plain Error carrying `code`,
+    // the "Require stack:" tail and `requireStack` (the parent chain, using
+    // `cursor.filename || cursor.id`). The REPL module has no filename, so the
+    // stack is exactly its id, `<repl>` (test-repl-require). mbun resolves
+    // natively and reports a ResolveMessage instead, so translate it here,
+    // where the requiring module is known.
+    const r = (id) => {
+      try {
+        return mod.require(id);
+      } catch (e) {
+        if (e === null || typeof e !== "object" || e.code !== "MODULE_NOT_FOUND" ||
+            Array.isArray(e.requireStack)) {
+          throw e;
+        }
+        const requireStack = [mod.filename || mod.id];
+        const err = new Error(
+          `Cannot find module '${id}'\nRequire stack:\n- ${requireStack.join("\n- ")}`);
+        err.code = "MODULE_NOT_FOUND";
+        err.requireStack = requireStack;
+        throw err;
+      }
+    };
     r.resolve = (request, options) =>
       CJSModule._resolveFilename(request, mod, false, options);
     r.resolve.paths = (request) => CJSModule._resolveLookupPaths(request, mod);
