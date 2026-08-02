@@ -610,7 +610,11 @@ inline constexpr std::string_view kNodeReplJS = R"JS(
     if (captureInstalled) return;
     captureInstalled = true;
     getReplContext();
-    G.__mbunReplUncaughtCapture = (err) => {
+    // defineProperty, not assignment: node's test/common leak check enumerates
+    // globalThis's own properties and fails any test that added one.
+    Object.defineProperty(G, "__mbunReplUncaughtCapture", {
+      configurable: true, enumerable: false, writable: true,
+      value: (err) => {
       // A REPL that has evaluated something owns the async throws its
       // commands scheduled, even after it closed: node reaches the same
       // answer through the AsyncLocalStorage store captured when the command
@@ -625,7 +629,8 @@ inline constexpr std::string_view kNodeReplJS = R"JS(
       // handleError declined the error must let it reach the process's own
       // 'uncaughtException' listeners (test-repl-user-error-handler).
       return server._handleError(err) !== "unhandled";
-    };
+      },
+    });
   }
   // Every 'uncaughtException' listener is a user's now that the REPL's own
   // router is not one (see setupExceptionCapture). A standalone REPL uses this
