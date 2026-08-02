@@ -1013,6 +1013,18 @@
             }
         }
 
+        // node's module compile cache sits exactly here: around the compilation
+        // of a USER CommonJS module (node's own internals are never cached --
+        // they are already snapshotted). The lookup keys on the module source,
+        // so a changed file invalidates its record; maybe_save then decides
+        // between keeping what was read back and refreshing it, and the
+        // accumulated entries are written out by flushCompileCache()/exit.
+        CompileCacheEntry* ccEntry{nullptr};
+        if (!nodeInternal && CompileCacheHandler::get().enabled()) {
+            ccEntry = CompileCacheHandler::get().get_or_insert(source, path,
+                                                              CachedCodeType::kCommonJS);
+        }
+
         JSValueRef wrapExc{nullptr};
         JSValueRef fnVal{eval_(wrapper, &wrapExc, path)};
         if (wrapExc) {
@@ -1035,6 +1047,13 @@
         JSObjectRef fn{JSValueToObject(ctx, fnVal, exc)};
         if (fn == nullptr) {
             return JSValueMakeUndefined(ctx);
+        }
+        // Compilation succeeded, so whatever was read back for this source is
+        // usable as-is; a miss initializes the entry instead. A module that
+        // failed to compile above returned already and is never cached, which
+        // is what keeps a syntax error out of the cache directory.
+        if (ccEntry != nullptr) {
+            CompileCacheHandler::get().maybe_save(ccEntry, source, /*rejected=*/false);
         }
 
         JSObjectRef moduleObj{JSObjectMake(ctx, nullptr, nullptr)};

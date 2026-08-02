@@ -134,6 +134,11 @@ namespace {
 #include "runtime/hosted_git_info.inc"
 #include "runtime/platform_match.inc"
 #include "runtime/io_bindings.inc"
+// node's module compile cache (NODE_COMPILE_CACHE / module.enableCompileCache):
+// directory layout, cache records and NODE_DEBUG_NATIVE=COMPILE_CACHE traces,
+// ported from compat/node/src/compile_cache.cc. Needs gPermission (common.inc);
+// the CommonJS loader consumes it from module_loading.inc, further down.
+#include "runtime/compile_cache.inc"
 // node:zlib streaming Transform handles (mbun.compress.stream): incremental
 // deflate/inflate/brotli/zstd state machines behind __mbunZlibNative.stream*.
 #include "runtime/zlib_stream.inc"

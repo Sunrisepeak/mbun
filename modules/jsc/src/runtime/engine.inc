@@ -689,6 +689,17 @@ public:
                                       "globalThis.__mbun_uncaught(__mbun_entry_err);"
                                       "else throw __mbun_entry_err;}"
                                       "globalThis.__mbunRunTicks&&globalThis.__mbunRunTicks();"};
+        // The compile cache covers the ENTRY too -- node caches the main module
+        // like any other. mbun's entry does not go through require_impl (it is
+        // evaluated here, in module scope), so the same lookup/save pair the
+        // loader uses is applied around this evaluation. Keyed on the file's own
+        // source, exactly as in module_loading.inc, so entry and require() agree
+        // on the record for a given file.
+        CompileCacheEntry* entryCacheRecord{nullptr};
+        if (CompileCacheHandler::get().enabled()) {
+            entryCacheRecord = CompileCacheHandler::get().get_or_insert(
+                source, absPath, CachedCodeType::kCommonJS);
+        }
         // A top-level-await entry (flagged by the transpiler) goes straight to the
         // async wrapper: in script mode `await (expr)` would otherwise PARSE as a
         // call to an `await` identifier and fail at run time, after side effects.
@@ -734,6 +745,12 @@ public:
             if (auto r2{eval_void(wrapped, absPath)}; !r2) {
                 return fail_run_(r.error());  // report the original parse error
             }
+            // Same point as the synchronous branch below: the entry compiled
+            // (as an async wrapper), so its record can be kept or initialized.
+            if (entryCacheRecord != nullptr) {
+                CompileCacheHandler::get().maybe_save(entryCacheRecord, source,
+                                                      /*rejected=*/false);
+            }
             const bool settled{pump_event_loop("globalThis.__mbun_run_done")};
             if (auto err{eval_to_string(
                     "globalThis.__mbun_run_err===undefined?'':String(globalThis.__mbun_run_err)")};
@@ -772,6 +789,14 @@ public:
             // invocation both bun files use, so dialect dispatch alone does
             // NOT separate them.
         } else {
+            // The entry compiled, so its compile-cache record is usable (or gets
+            // initialized). An entry that failed to parse returned above and is
+            // never recorded, which is what keeps a broken file out of the cache
+            // directory.
+            if (entryCacheRecord != nullptr) {
+                CompileCacheHandler::get().maybe_save(entryCacheRecord, source,
+                                                      /*rejected=*/false);
+            }
             // Top level ran synchronously to completion. Node/bun keep the process
             // alive until the event loop drains: pending setTimeout/setInterval
             // callbacks, in-flight network ops (fetch/sockets), and live child
