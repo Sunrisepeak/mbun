@@ -264,6 +264,15 @@ export struct Summary {
     // bun surfaces the same event as a verbose "Skip installing {} - os mismatch"
     // line (lockfile/Tree.rs:576-594); we count it so the filter is observable.
     std::size_t skippedForPlatform{0};
+    // Non-fatal fetch failures, in the order they settled. An optional
+    // dependency whose manifest or tarball GET fails is not an install failure,
+    // but bun does not swallow it either: the same message the required case
+    // logs as an error is logged as a WARNING instead
+    // (PackageManager/runTasks.rs:489-503 for the manifest branch and
+    // :835-852 for the tarball branch — `if is_required { add_error_pretty }
+    // else { add_warning_pretty }` over one shared "GET {} - {}" format).
+    // Carried out rather than printed here so the module stays I/O-free.
+    std::vector<std::string> warnings;
 };
 
 export using Result = std::expected<Summary, Error>;
@@ -557,6 +566,21 @@ private:
         set_error_(code, std::move(message));
     }
 
+    // The fetch-failure spelling of `fail_dep_`. bun splits exactly here and
+    // nowhere else: a manifest or tarball GET that settles unsuccessfully is an
+    // ERROR when the edge is required and a WARNING when it is not, with the
+    // identical "GET {url} - {status}" body (runTasks.rs:485-503 / :835-852).
+    // Every other optional failure — os/cpu mismatch, no matching version, an
+    // unsafe name — stays silent, which is why this is a separate seam rather
+    // than a flag on `fail_dep_`.
+    void fail_fetch_(const PendingDep& dep, ErrorCode code, std::string message) {
+        if (dep.optional) {
+            summary_.warnings.push_back(std::move(message));
+            return;
+        }
+        set_error_(code, std::move(message));
+    }
+
     ah::ConnectionOptions conn_options_() const {
         ah::ConnectionOptions out{};
         out.idleTimeout = options_.idleTimeout;
@@ -780,7 +804,7 @@ private:
     void manifest_failed_(const std::string& packageName, Error error) {
         manifestInFlight_.erase(packageName);
         for (const PendingDep& dep : take_waiters_(packageName)) {
-            fail_dep_(dep, error.code, error.message);
+            fail_fetch_(dep, error.code, error.message);
         }
     }
 
@@ -927,7 +951,7 @@ private:
         auto request{nt::for_tarball(url, dep.packageName, scope,
                                      nt::Authorization::AllowAuthorization)};
         if (!request) {
-            fail_dep_(dep, ErrorCode::TarballFetchFailed, request.error().message);
+            fail_fetch_(dep, ErrorCode::TarballFetchFailed, request.error().message);
             return;
         }
         engine_.fetch(*request, conn_options_(),
@@ -953,8 +977,8 @@ private:
             return;
         }
         if (verdict.verdict != nt::ResponseVerdict::Success) {
-            fail_dep_(dep, ErrorCode::TarballFetchFailed,
-                      detail::fetch_error(result, url, ErrorCode::TarballFetchFailed).message);
+            fail_fetch_(dep, ErrorCode::TarballFetchFailed,
+                        detail::fetch_error(result, url, ErrorCode::TarballFetchFailed).message);
             return;
         }
         auto installed{pv != nullptr
