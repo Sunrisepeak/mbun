@@ -337,9 +337,21 @@ inline constexpr std::string_view kNodeTimersJS = R"JS(
       return fn.apply(undefined, call);
     };
 
+    // node lib/internal/timers.js Timeout: a delay that does not fit a 32-bit
+    // signed integer is ENROLLED AS 1ms -- which is exactly what the warning
+    // _checkCountdown just emitted promises ("Timeout duration was set to 1.").
+    // The host scheduler is handed the raw value, so without this a
+    // setTimeout(fn, 2147483648) or setTimeout(fn, Infinity) simply never fires
+    // and pins the loop open. Only the overflow half of node's clamp is applied
+    // here: sub-1ms delays already schedule correctly on this scheduler and
+    // rounding them up to 1 would move timers that other corpus files order
+    // against.
+    const __clampDelay = (ms) => (typeof ms === "number" && ms > TIMEOUT_MAX ? 1 : ms);
+
     const mySetTimeout = function setTimeout(cb, ms, ...args) {
       if (typeof cb !== "function") throw __invalidCb(cb);
       _checkCountdown(ms);
+      ms = __clampDelay(ms);
       cb = __sched(cb);
       const state = { gen: 0, ms, args, cb };
       state.run = function (...a) {
@@ -357,6 +369,7 @@ inline constexpr std::string_view kNodeTimersJS = R"JS(
     const mySetInterval = function setInterval(cb, ms, ...args) {
       if (typeof cb !== "function") throw __invalidCb(cb);
       _checkCountdown(ms);
+      ms = __clampDelay(ms);
       cb = __sched(cb);
       const state = { gen: 0, ms, args, cb };
       state.run = function (...a) {
