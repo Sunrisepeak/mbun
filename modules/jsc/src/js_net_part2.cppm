@@ -46,6 +46,7 @@ export constexpr std::string_view kNetJS_part2 = R"JS(
   // and sent with Content-Length.
   function writeHttpResponse(sock, res, reqMethod, keepAlive, onFinished) {
     if (!res || typeof res !== "object") res = new G.Response("", { status: 500 });
+    ensureFileLastModifiedHeader(res);
     const status = res.status || 200;
     // RFC 9112 §9.6: a server that sends "Connection: close" MUST close the
     // connection after that response. `Connection` is hop-by-hop, so the header

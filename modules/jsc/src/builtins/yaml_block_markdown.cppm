@@ -397,6 +397,7 @@ inline constexpr std::string_view kYamlBlockMarkdownJS = R"JS(  // ---- block mo
           catch (e) { fsPath = slash < 0 ? "/" + rest : rest.slice(slash); }
         }
         let size = 0;
+        let lastModified = 0;
         let ioerr;
         let isFifo = false;
         // A fd-backed BunFile derives its byte length from fstat(2) — bun's
@@ -411,13 +412,20 @@ inline constexpr std::string_view kYamlBlockMarkdownJS = R"JS(  // ---- block mo
         if (isFd) {
           try {
             const st = fsm.fstatSync(fdArg);
-            if (st.isFile()) fdSize = Number(st.size) || 0;
+            if (st.isFile()) {
+              fdSize = Number(st.size) || 0;
+              lastModified = Number(st.mtimeMs) || 0;
+            }
           } catch (e) {}
         } else {
           try {
             const st = fsm.statSync(fsPath);
             if (st.isDirectory()) ioerr = "EISDIR";
-            else { size = Number(st.size) || 0; if (st.isFIFO && st.isFIFO()) isFifo = true; }
+            else {
+              size = Number(st.size) || 0;
+              lastModified = Number(st.mtimeMs) || 0;
+              if (st.isFIFO && st.isFIFO()) isFifo = true;
+            }
           } catch (e) { ioerr = "ENOENT"; }
         }
         const ext = p.slice(p.lastIndexOf(".") + 1).toLowerCase();
@@ -429,7 +437,7 @@ inline constexpr std::string_view kYamlBlockMarkdownJS = R"JS(  // ---- block mo
         slot("__size", size);
         slot("__name", p);
         slot("__mbunPath", isFd ? "" : fsPath);
-        slot("__lastModified", 0);
+        slot("__lastModified", lastModified);
         if (!ioerr && (!isFd || fdSize >= 0)) {
           const protoU8 = Object.getOwnPropertyDescriptor(G.Blob.prototype, "_u8");
           let loaded = false;   // has the file's content been pulled into __parts?

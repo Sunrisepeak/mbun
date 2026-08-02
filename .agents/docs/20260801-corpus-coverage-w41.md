@@ -7033,6 +7033,22 @@ surface on Linux:
   混修；下一轮必须从 fresh bounded measurement 选单一 owner。W55 无构建、无全量
   corpus，资源策略继续保持 3–5 jobs，并在 swap/disk 低水位时只做小型 probe。
 
+### W420 Bun.file Last-Modified metadata source fix
+
+- W420 先用 issue [#75](https://github.com/Sunrisepeak/mbun/issues/75) 固定了一个
+  单一 owner：现有文件的 `Bun.file` 在构造时读取了 `size`，但没有保存
+  `stat/fstat` 的 `mtimeMs`，HTTP response serializer 也没有把该 metadata 变成
+  `Last-Modified`。显式提供的同名 response header 必须保持不变。
+- 修复位于 `yaml_block_markdown.cppm`、`js_net.cppm` 和
+  `js_net_part2.cppm`：path-backed 和 regular-fd BunFile 保存 mtime；所有
+  `Bun.serve` response serializer 入口只在没有显式 header 时补 RFC-compatible
+  日期，未触碰 `If-Modified-Since` 条件请求逻辑。
+- 串行 release build 通过，耗时 **60.09s**。五个独立 Linux focused runtime
+  probe 为 **4/5 pass、1/5 fail、0 timeout**：自动 Last-Modified、显式 header
+  保留、HEAD、Content-Length 全部通过；`serves text file` 已不再失败于日期，
+  现在只剩独立的 `connection: keep-alive` snapshot owner。未修改 upstream
+  fixture、未跑全量 corpus、未把本地绝对路径或环境信息写入 issue/PR。
+
 ## Next route
 
 1. Keep the native-syntax compatibility gate limited to the two measured

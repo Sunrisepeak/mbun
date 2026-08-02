@@ -3945,7 +3945,17 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
 
   // Build the response head lines (minus framing) shared by the buffered and
   // streaming paths. framing = { chunked } or { contentLength }.
+  const ensureFileLastModifiedHeader = (res) => {
+    const b = res && res._b;
+    if (!b || !b.__isBunFile || !res.headers || typeof res.headers.has !== "function" || typeof res.headers.set !== "function") return;
+    try {
+      if (res.headers.has("last-modified")) return;
+      const ms = Number(b.__lastModified);
+      if (Number.isFinite(ms) && ms > 0) res.headers.set("last-modified", new Date(ms).toUTCString());
+    } catch (e) {}
+  };
   const responseHeadLines = (res, status, framing, keepAlive) => {
+    ensureFileLastModifiedHeader(res);
     const lines = ["HTTP/1.1 " + status + " " + reasonPhrase(res, status)];
     let haveCT = false, haveDate = false;
     if (res.headers && typeof res.headers.forEach === "function") {
