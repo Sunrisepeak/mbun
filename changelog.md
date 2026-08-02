@@ -5,6 +5,12 @@
 
 ## 2026-08-02
 
+- W421 Fetch ordinary-response Connection header boundary fix：普通 Fetch response
+  不再暴露 wire-level hop-by-hop `Connection` header，101 WebSocket upgrade 仍保留
+  `Connection: Upgrade`，Node HTTP response 行为不变；issue #76。fresh selector
+  **3/5 pass、2/5 fail**，post 五个独立 probe 全通过，serial release build **60.23s**。
+  清理测试生成物，未修改 upstream fixture、未跑全量 corpus。
+
 - W420 Bun.file Last-Modified metadata source fix：`Bun.file` 现在保存 path-backed
   与 regular-fd 文件的 mtime，`Bun.serve` 在没有显式同名 header 时自动发出有效的
   `Last-Modified`；issue #75。串行 release build **60.09s**，五个独立 focused

@@ -7033,6 +7033,22 @@ surface on Linux:
   混修；下一轮必须从 fresh bounded measurement 选单一 owner。W55 无构建、无全量
   corpus，资源策略继续保持 3–5 jobs，并在 swap/disk 低水位时只做小型 probe。
 
+### W421 Fetch ordinary-response Connection header boundary fix
+
+- W421 先用 fresh 五个窄 probe 复核 W420 留下的 header-shape owner：普通文本和
+  空文件 snapshot 都把失败稳定收敛到 Fetch `Response.headers` 暴露了
+  `connection: keep-alive`；custom status、HEAD proper headers、custom headers
+  通过，初始为 **3/5 pass、2/5 fail、0 timeout**。issue
+  [#76](https://github.com/Sunrisepeak/mbun/issues/76) 固定了边界。
+- 修复位于 `js_net_part2.cppm` 的 Fetch response `onHead`：普通 response 不把
+  hop-by-hop `Connection` 复制到 Fetch headers；HTTP 101 upgrade 仍保留
+  `Connection: Upgrade`，Node `http` parser/response header 逻辑不变。
+- 串行 release build 通过，耗时 **60.23s**。post 回归五个独立 probe 全部通过：
+  Bun text file、empty file、custom headers，Node automatic-headers direct guard
+  exit 0，以及 101 upgrade smoke（status **101**、connection **Upgrade**、upgrade
+  **websocket**）。共享 vendored checkout 的测试生成物已逐项清理；未修改 upstream
+  fixture、未跑全量 corpus、未把本地绝对路径或环境信息写入 issue/PR。
+
 ### W420 Bun.file Last-Modified metadata source fix
 
 - W420 先用 issue [#75](https://github.com/Sunrisepeak/mbun/issues/75) 固定了一个

@@ -2582,7 +2582,15 @@ export constexpr std::string_view kNetJS_part2 = R"JS(
         }
         headResolved = true;
         const h = new G.Headers();
-        for (let i = 0; i < parser.rawHeaders.length; i += 2) h.append(parser.rawHeaders[i], parser.rawHeaders[i + 1]);
+        // Fetch exposes representation headers, not the HTTP/1.1 connection
+        // management header. Keep `Connection: Upgrade` on a 101 response for
+        // the WebSocket/upgrade hand-off; ordinary responses must not leak the
+        // hop-by-hop field into Response.headers (bun-serve-file snapshots).
+        const preserveConnectionHeader = parser.status === 101;
+        for (let i = 0; i < parser.rawHeaders.length; i += 2) {
+          if (!preserveConnectionHeader && String(parser.rawHeaders[i]).toLowerCase() === "connection") continue;
+          h.append(parser.rawHeaders[i], parser.rawHeaders[i + 1]);
+        }
         // bun strips content-encoding/content-length after decoding the body.
         const ceHdr = String(parser.headers["content-encoding"] || "").trim().toLowerCase();
         if (ceHdr && ceHdr !== "identity" && (!init || init.decompress !== false)) { h.delete("content-encoding"); h.delete("content-length"); }
