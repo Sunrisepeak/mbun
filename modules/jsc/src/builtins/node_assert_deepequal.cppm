@@ -580,6 +580,63 @@ inline constexpr std::string_view kNodeAssertDeepEqualJS = R"JS(
       if (Object.is(actual, expected))
         throw assertionError(message, actual, expected, "notStrictEqual", notStrictEqualMessage(actual));
     };
+
+    // Node exposes `Assert` alongside the singleton module.  Its methods are
+    // deliberately unbound: destructuring one must fall back to the default
+    // options, while an instance call retains that instance's diff/strict mode.
+    const kAssertOptions = Symbol("node.assert.options");
+    const strictAliases = {
+      equal: "strictEqual",
+      deepEqual: "deepStrictEqual",
+      notEqual: "notStrictEqual",
+      notDeepEqual: "notDeepStrictEqual",
+    };
+    const instanceMethodNames = [
+      "fail", "ok", "equal", "notEqual", "deepEqual", "notDeepEqual",
+      "strictEqual", "notStrictEqual", "deepStrictEqual", "notDeepStrictEqual",
+      "throws", "rejects", "doesNotThrow", "doesNotReject", "ifError",
+      "match", "doesNotMatch",
+    ];
+
+    function Assert(options) {
+      if (!new.target) {
+        const error = new TypeError("Class constructor Assert cannot be invoked without 'new'");
+        error.code = "ERR_CONSTRUCT_CALL_REQUIRED";
+        throw error;
+      }
+      options = options || {};
+      if (options.diff !== undefined && options.diff !== "simple" && options.diff !== "full") {
+        const error = new TypeError("The property 'options.diff' must be one of: 'simple', 'full'. Received '" + options.diff + "'");
+        error.code = "ERR_INVALID_ARG_VALUE";
+        throw error;
+      }
+      // Only retain options this bridge implements. In particular, do not
+      // advertise skipPrototype until the comparator can honor it end to end.
+      const assertOptions = { strict: options.strict !== false, diff: options.diff };
+      Object.defineProperty(this, kAssertOptions, { value: assertOptions });
+      this.AssertionError = AssertionError;
+      if (assertOptions.strict) {
+        this.equal = this.strictEqual;
+        this.deepEqual = this.deepStrictEqual;
+        this.notEqual = this.notStrictEqual;
+        this.notDeepEqual = this.notDeepStrictEqual;
+      }
+    }
+    for (const name of instanceMethodNames) {
+      Assert.prototype[name] = function (...args) {
+        const options = this && this[kAssertOptions];
+        const targetName = options && options.strict && strictAliases[name] ? strictAliases[name] : name;
+        const target = assertMod[targetName];
+        try {
+          return target.apply(this, args);
+        } catch (error) {
+          if (error instanceof AssertionError)
+            error.diff = options && options.diff !== undefined ? options.diff : "simple";
+          throw error;
+        }
+      };
+    }
+    assertMod.Assert = Assert;
     for (const target of [assertMod.strict, M["assert/strict"], M["node:assert/strict"]]) {
       if (!target || target === assertMod) continue;
       if (typeof target !== "object" && typeof target !== "function") continue;
@@ -587,6 +644,7 @@ inline constexpr std::string_view kNodeAssertDeepEqualJS = R"JS(
       target.notEqual = assertMod.notStrictEqual;
       target.strictEqual = assertMod.strictEqual;
       target.notStrictEqual = assertMod.notStrictEqual;
+      target.Assert = Assert;
     }
 
     const util = M["util"] || M["node:util"];
