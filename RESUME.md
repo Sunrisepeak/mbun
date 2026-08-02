@@ -5,6 +5,72 @@ session that is interrupted (usage limit, crash, restart) can pick up from the
 file rather than from memory. **If you are a fresh session reading this, start
 here.**
 
+## 2026-08-03 — W45: the module-identity block is GONE. Next bottleneck: `internalBinding('modules')`
+
+The W44 entry below says porting node's `lib/internal/**` is blocked. **That is now out of
+date** — read it for the mechanism, then read this.
+
+**234 of 297 vendored `internal/*` modules now load and evaluate from an entry outside
+`compat/node`, up from zero.** Measured by `require()`-ing all 297 from `/tmp`. Newly
+reachable, i.e. portable by a future lane: all of `internal/streams/*` and
+`internal/webstreams/*`, all 33 of `internal/crypto/*`, `internal/fs/*`, `internal/url`,
+`internal/http`, `internal/http2/{core,compat,util}`, `internal/dns/*`, `internal/readline/*`,
+`internal/worker/*`, `internal/util{,/inspect,/comparisons,/parse_args}`, `internal/errors`,
+`internal/assert/*`, and `internal/test_runner/{mock/*,assert,coverage,snapshot,utils,tag_filter}`
+plus its reporters.
+
+**What the fix actually was, because the obvious design was wrong.** The proposed
+per-module-id allow-list ("the vendored fallback may answer only for ids mbun has no builtin
+for") would have changed *nothing*: `require_impl` already calls `builtin_module()` before the
+resolver (`module_loading.inc:412`), so a builtin was never shadowable, and the three ids that
+actually broke are not builtins. The real cause was self-inflicted — a startup bridge
+(`__mbunPatchNodeEventTarget`, called unconditionally from `engine.inc:269`) required node's
+`internal/event_target` and `internal/abort_controller` and **republished node's
+`AbortController`/`AbortSignal` as the process globals**. All 28 baseline internal-module
+fallbacks were its transitive graph; widening the resolver merely made it fire in bun tests
+and workers too. Separately, `internal/bootstrap/realm.js` reassigns `process.binding` and
+`Error.prepareStackTrace` **merely by being evaluated**, so making the tree reachable was
+enough to take `process.binding` away.
+
+The shape that works: a **per-id owner table consulted by every path** — including the
+requesting-file walk, so an id resolves identically inside and outside `compat/node`; that
+path-independence is exactly what W44's reverted commit lacked. Plus an mbun-owned
+`internal/bootstrap/realm` shim that mutates nothing, and the event-target bridge rewritten as
+a *reaction* to that module loading rather than a load of it. Fallbacks: 28 → 0.
+
+**It cost one file, correctly.** `test-abortsignal-any.mjs` was passing only because node's
+second `AbortSignal` had replaced mbun's platform one wholesale — the surrender the work
+exists to end. Residual gap: composite-signal abort ordering (`01234` vs mbun's `41230`),
+which needs node's dependant-signal registry in mbun's platform `AbortSignal`. Its own lane.
+
+### The next bottleneck, measured rather than guessed
+
+The remaining 63 are **not resolution failures**:
+
+- **`internalBinding('modules')` — 23 modules**, gating the entire live test runner
+  (`internal/test_runner/{harness,runner,test,reporter/spec}`), `internal/modules/esm/*`,
+  `internal/modules/helpers`, `internal/main/*`. Highest-leverage next lane by a wide margin.
+- `diagnostics_channel` (5), `blob` (3), `webstorage`/`sea`/`block_list` (2 each), `v8`,
+  `report`, `watchdog`, `locks`, `ffi`, `internal_only_v8`; `fs.legacyMainResolve` (2);
+  `ContextifyScript.prototype` (3 — `internal/vm`, `internal/vm/module`,
+  `internal/modules/cjs/loader`).
+- **`internal/deps/acorn/**` is not vendored at all** — 6 modules, including
+  `internal/repl/completion`. The W43 REPL lane's hand-written reverse scanner cannot be
+  replaced by a port until acorn is vendored.
+- `internal/bootstrap/**` is deliberately mbun-owned; only `realm`'s `BuiltinModule` surface
+  is provided, so a consumer needing more must extend the shim.
+
+### Two measurement rules this wave paid for
+
+- **Attribute against a pre-wave baseline, never against the composed head.** Diffing a
+  single-lane binary against a round of the composed head reports every *other* lane's gains
+  as that lane's regressions. It produced 8 confident false alarms in one report.
+- **Any change to a surface bun also implements** (`console`, `util.inspect`, `Bun.*`) **needs
+  a bun gate, not just the node subsystem group.** A lane ran three node gates, all clean, and
+  still regressed a green bun file; the node/bun split is invisible from inside the node corpus.
+- `NODE_PATH=<repo>/compat/node/lib` reproduces a widened internal-resolution reach **on an
+  already-built binary**, turning a build-cycle experiment into a 90-second one.
+
 ## 2026-08-03 — W44: porting node's `lib/internal/**` is blocked by MODULE IDENTITY
 
 The single most important thing this wave learned, because it caps the campaign's
