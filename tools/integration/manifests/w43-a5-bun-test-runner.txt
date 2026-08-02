@@ -1,0 +1,8 @@
+compat/bun/test/cli/test/test-filter-lifecycle-snapshot.test.ts
+compat/bun/test/js/bun/test/done-async.test.ts
+compat/bun/test/js/bun/test/expect-extend-preload.test.ts
+compat/bun/test/js/bun/test/fake-timers/sinonjs/fake-timers.test.ts
+compat/bun/test/js/bun/test/mock/6874/A.test.ts
+compat/bun/test/js/bun/test/mock/6874/B.test.ts
+compat/bun/test/js/bun/test/only-failures.test.ts
+compat/bun/test/js/bun/test/test-error-code-done-callback.test.ts

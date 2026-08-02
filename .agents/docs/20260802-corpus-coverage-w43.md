@@ -125,6 +125,26 @@ expects.
 | A4 | Bun N-API | +3 to +5 | — | — | — | not started |
 | A5 | Bun test runner | +3 to +5 | — | — | — | not started |
 
+All 49 literal paths were found in the fresh baseline and were non-green. A1,
+A2, and A3 contain respectively 5, 8, and 10 Node `fail` rows. A4 contains 18
+Bun `test-failure` rows and A5 contains 8; every Bun row has exactly one failed
+test at baseline. The five manifests are path-disjoint.
+
+Retired-approach gate:
+
+- A1 zlib/Buffer and A3 permission have no matching struck record.
+- A2's broad `assert` query returns existing records in unrelated process,
+  crypto, HTTP/2, and TLS areas; no listed A2 path or proposed assert-deep-equal
+  mechanism is named as retired.
+- A4 must not repeat the old claim that all N-API addons are blocked, nor repeat
+  the already-landed dynamic-symbol/global fix. That verdict is overturned;
+  the remaining files require real per-entry-point N-API diagnosis, while five
+  shared-libstdc++ addon cases remain outside a runtime-only quick fix.
+- A5 must not blindly re-land the previously reverted global bunfig preload
+  behavior: it can delete the runner's private TMPDIR and has whole-corpus blast
+  radius. Any preload-related result must preserve sandbox environment state and
+  remains blocked on the final full Bun gate.
+
 Worker probes, focused results, integration deltas, serial confirmations, and
 remaining reds are appended here only after coordinator review. Full-corpus
 numbers are updated only at the next same-binary full checkpoint.

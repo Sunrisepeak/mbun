@@ -57,7 +57,7 @@
 - Consumes: commit `08a4de9f7d84710cc7d22f7998accfad403bd626` on branch `agent/corpus-coverage-w43`.
 - Produces: a clean coordinator worktree whose only diff from `163cb6d` is the design and plan commits.
 
-- [ ] **Step 1: Confirm branch, ancestry, and clean scope**
+- [x] **Step 1: Confirm branch, ancestry, and clean scope**
 
 ```bash
 git status --short --branch
@@ -67,7 +67,7 @@ git diff --name-status 163cb6d...HEAD
 
 Expected: branch `agent/corpus-coverage-w43`; ancestry command exits 0; diff contains only the two `.agents/docs` files before baseline recording.
 
-- [ ] **Step 2: Prove corpus gitlinks and paths**
+- [x] **Step 2: Prove corpus gitlinks and paths**
 
 ```bash
 tools/integration/check_submodule_gitlinks.sh
@@ -78,7 +78,7 @@ git ls-files -s compat/bun compat/node
 
 Expected: checker prints `clean`; both paths exist; both index entries remain mode `160000`.
 
-- [ ] **Step 3: Confirm Bun dependency provisioning**
+- [x] **Step 3: Confirm Bun dependency provisioning**
 
 ```bash
 test -d compat/bun/node_modules
@@ -99,7 +99,7 @@ Expected: both commands exit 0. If either fails, run the repository-documented f
 - Consumes: clean Task 1 tree at `08a4de9`.
 - Produces: `W43_BIN`, its SHA-256, full `summary.json`/`results.tsv` for both corpora, exact current runnable gap, and a committed baseline record.
 
-- [ ] **Step 1: Build through the global lock and capture the binary**
+- [x] **Step 1: Build through the global lock and capture the binary**
 
 ```bash
 W43_BIN=$(bash tools/integration/build_or_die.sh)
@@ -114,7 +114,7 @@ tools/integration/safe-test.sh 10 "$W43_BIN" --version
 
 Expected: build exits 0; version reports mbun 2026.07.18.0, Bun 1.3.14 compatibility, and Node v26.3.0 compatibility. The shared frozen copy under the Git common directory has the same SHA-256 and is readable from every lane worktree. Record the coordinator-relative binary path and `W43_BIN_SHA` in the W43 ledger.
 
-- [ ] **Step 2: Run the full Node baseline**
+- [x] **Step 2: Run the full Node baseline**
 
 ```bash
 W43_COMMON_DIR=$(cd "$(git rev-parse --git-common-dir)" && pwd)
@@ -129,7 +129,7 @@ python3 tools/integration/node_corpus_runner.py \
 
 Expected: `summary.json` exists and category sum equals 4,433.
 
-- [ ] **Step 3: Validate the Node denominator**
+- [x] **Step 3: Validate the Node denominator**
 
 ```bash
 jq -e '.files == 4433 and ([.categories[]] | add) == 4433' \
@@ -138,7 +138,7 @@ jq -e '.files == 4433 and ([.categories[]] | add) == 4433' \
 
 Expected: `true`, exit 0.
 
-- [ ] **Step 4: Run the full Bun baseline on the same binary**
+- [x] **Step 4: Run the full Bun baseline on the same binary**
 
 ```bash
 W43_COMMON_DIR=$(cd "$(git rev-parse --git-common-dir)" && pwd)
@@ -156,7 +156,7 @@ python3 tools/integration/bun_corpus_runner.py \
 
 Expected: `summary.json` exists and category sum equals 1,902.
 
-- [ ] **Step 5: Validate the Bun denominator and resource profile**
+- [x] **Step 5: Validate the Bun denominator and resource profile**
 
 ```bash
 jq -e '.files == 1902 and ([.categories[]] | add) == 1902 and .resource_profile.memory_max == "4G" and .resource_profile.tasks_max == 512' \
@@ -165,11 +165,11 @@ jq -e '.files == 1902 and ([.categories[]] | add) == 1902 and .resource_profile.
 
 Expected: `true`, exit 0.
 
-- [ ] **Step 6: Write the baseline ledger and committed data record**
+- [x] **Step 6: Write the baseline ledger and committed data record**
 
 Create `.agents/docs/20260802-corpus-coverage-w43.md` with: base/head, binary relative path and SHA-256, exact commands, Node/Bun categories, raw rates, current excluded categories, audited runnable floor, elapsed time, and the statement that no source implementation has started. Update `compat/data/mbun-corpus-runs.json` so the new same-binary Node and Bun rows are contemporaneous and the stale note no longer describes the latest rows.
 
-- [ ] **Step 7: Verify and commit the baseline**
+- [x] **Step 7: Verify and commit the baseline**
 
 ```bash
 jq empty compat/data/mbun-corpus-runs.json
@@ -194,7 +194,7 @@ git commit --author='Sunrisepeak <speakshen@163.com>' \
 - Consumes: committed design, plan, and Task 2 baseline.
 - Produces: Draft PR linked to #80 and checkpoint-0 comment containing only full baseline data.
 
-- [ ] **Step 1: Verify the already-published plan checkpoint**
+- [x] **Step 1: Verify the already-published plan checkpoint**
 
 ```bash
 git log --format=full -1 -- .agents/docs/20260802-corpus-coverage-w43-plan.md
@@ -203,7 +203,7 @@ git diff --check origin/agent/corpus-coverage-w43...HEAD
 
 Expected: the plan commit contains #80, builder sign-off, and the Codex co-author trailer; diff check exits 0.
 
-- [ ] **Step 2: Push normally and create a Draft PR**
+- [x] **Step 2: Push normally and create a Draft PR**
 
 ```bash
 git push -u origin agent/corpus-coverage-w43
@@ -211,7 +211,7 @@ git push -u origin agent/corpus-coverage-w43
 
 Create a Draft PR titled `compat: W43 five-hour Node/Bun corpus sprint`, base `rewrite_bun_in_mcpp`, head `agent/corpus-coverage-w43`. Its body links #80, names the raw/runnable denominators, distinguishes five logical lanes from three physical workers, includes the full baseline commands and counts, states +30 to +45 as the sprint target, and states that final 100% remains open.
 
-- [ ] **Step 3: Publish checkpoint 0**
+- [x] **Step 3: Publish checkpoint 0**
 
 Post one PR comment containing: base `163cb6d`, current head, binary SHA-256, full Node/Bun category tables, exact runnable gap, baseline elapsed time, Wave A targets, and current CI state as pending/not-started. Do not post worker probes as separate comments.
 
@@ -228,7 +228,7 @@ Post one PR comment containing: base `163cb6d`, current head, binary SHA-256, fu
 - Consumes: Task 2 `results.tsv` files.
 - Produces: five disjoint, baseline-confirmed non-green lists and five lane briefs with fixed targets.
 
-- [ ] **Step 1: Write A1 with the known zlib/Buffer validation frontier**
+- [x] **Step 1: Write A1 with the known zlib/Buffer validation frontier**
 
 ```text
 compat/node/test/parallel/test-buffer-constants.js
@@ -240,7 +240,7 @@ compat/node/test/parallel/test-zlib-zstd-kmaxlength-rangeerror.js
 
 Target: +3 to +5. Source boundary: `node_buffer_extra.cppm`, `node_zlib_iter.cppm`, `zlib_stream.cppm`, `runtime/zlib_stream.inc`.
 
-- [ ] **Step 2: Write A2 with the exact assert frontier**
+- [x] **Step 2: Write A2 with the exact assert frontier**
 
 ```text
 compat/node/test/parallel/test-assert-async.js
@@ -255,7 +255,7 @@ compat/node/test/parallel/test-assert-typedarray-deepequal.js
 
 Target: +2 to +4. Source boundary: `node_assert_deepequal.cppm` plus the existing assert registration seam only.
 
-- [ ] **Step 3: Write A3 with the exact permission frontier**
+- [x] **Step 3: Write A3 with the exact permission frontier**
 
 ```text
 compat/node/test/parallel/test-permission-child-process-cli.js
@@ -272,7 +272,7 @@ compat/node/test/parallel/test-permission-sqlite-load-extension.js
 
 Target: +2 to +4. Source boundary: `node_permission.cppm` and existing native permission gates. If Stage 1 proves more than one root cause, implement only the largest source-coherent group and leave the rest named in the lane result.
 
-- [ ] **Step 4: Write A4 with the N-API one-failure frontier**
+- [x] **Step 4: Write A4 with the N-API one-failure frontier**
 
 ```text
 compat/bun/test/napi/napi-finalizer-delete-ref.test.ts
@@ -297,7 +297,7 @@ compat/bun/test/napi/uv_stub.test.ts
 
 Target: +3 to +5. Source boundary: `runtime/napi_core.inc`, `runtime/napi_objects.inc`, and `runtime/napi/*.h`; only one N-API worker exists in the wave.
 
-- [ ] **Step 5: Write A5 with the Bun test-runner one-failure frontier**
+- [x] **Step 5: Write A5 with the Bun test-runner one-failure frontier**
 
 ```text
 compat/bun/test/cli/test/test-filter-lifecycle-snapshot.test.ts
@@ -312,11 +312,11 @@ compat/bun/test/js/bun/test/test-error-code-done-callback.test.ts
 
 Target: +3 to +5. Source boundary: `src/test_runner.cppm`, `builtins/node_test_run.cppm`, `builtins/node_test_runner.cppm`, and `tests/test_test_runner.cpp`.
 
-- [ ] **Step 6: Intersect every manifest with the fresh baseline**
+- [x] **Step 6: Intersect every manifest with the fresh baseline**
 
 For Node manifests, every retained row must have classification `fail`, `timeout`, or `oom-kill` in `w43-node-baseline/results.tsv`. For Bun manifests, every retained row must be `test-failure`, `timeout`, `crash`, `load-error`, or `oom-kill` in `w43-bun-baseline/results.tsv`. Remove already-green or legitimately excluded paths before dispatch and record each removal in the W43 ledger.
 
-- [ ] **Step 7: Check retired approaches and overlap**
+- [x] **Step 7: Check retired approaches and overlap**
 
 ```bash
 python3 tools/integration/check_struck.py --area node zlib buffer
@@ -328,7 +328,7 @@ python3 tools/integration/check_struck.py --area bun test runner
 
 Expected: each output is copied into its lane brief. A struck result forbids repeating the named approach but does not hide the still-red file.
 
-- [ ] **Step 8: Commit the frozen Wave A worklists**
+- [x] **Step 8: Commit the frozen Wave A worklists**
 
 ```bash
 git diff --check

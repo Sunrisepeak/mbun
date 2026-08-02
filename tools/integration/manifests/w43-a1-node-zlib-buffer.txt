@@ -1,0 +1,5 @@
+compat/node/test/parallel/test-buffer-constants.js
+compat/node/test/parallel/test-buffer-constructor-deprecation-error.js
+compat/node/test/parallel/test-zlib-brotli-kmaxlength-rangeerror.js
+compat/node/test/parallel/test-zlib-kmaxlength-rangeerror.js
+compat/node/test/parallel/test-zlib-zstd-kmaxlength-rangeerror.js
