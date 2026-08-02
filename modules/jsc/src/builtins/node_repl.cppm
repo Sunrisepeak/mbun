@@ -1216,6 +1216,32 @@ inline constexpr std::string_view kNodeReplJS = R"JS(
       setupExceptionCapture();
 
       const savedRegExMatches = ["", "", "", "", "", "", "", "", "", ""];
+      const regExMatchSeparator = "\u0000\u0000\u0000";
+      const regExMatcher = new RegExp(
+        `^${regExMatchSeparator}(.*)${regExMatchSeparator}(.*)` +
+        `${regExMatchSeparator}(.*)${regExMatchSeparator}(.*)` +
+        `${regExMatchSeparator}(.*)${regExMatchSeparator}(.*)` +
+        `${regExMatchSeparator}(.*)${regExMatchSeparator}(.*)` +
+        `${regExMatchSeparator}(.*)$`);
+
+      function saveRegExpMatches() {
+        try {
+          for (let idx = 1; idx < savedRegExMatches.length; idx += 1) {
+            savedRegExMatches[idx] = RegExp[`$${idx}`];
+          }
+        } catch (captureError) {
+          // JSC currently exposes the legacy static captures through accessors
+          // whose receiver check rejects its own RegExp constructor (issue #65).
+          // That runtime defect must not replace an otherwise successful REPL
+          // evaluation with an unrelated TypeError. Keep the normal node path
+          // active for runtimes where the accessors are readable.
+          if (!(captureError instanceof TypeError) ||
+              captureError.message !==
+                "RegExp.$N getters require RegExp constructor as |this|") {
+            throw captureError;
+          }
+        }
+      }
 
       eval_ = eval_ || defaultEval;
 
@@ -1310,13 +1336,15 @@ inline constexpr std::string_view kNodeReplJS = R"JS(
           }
         }
 
+        // Restore the captures hidden by REPL bookkeeping before user code runs,
+        // matching node's default evaluator protocol.
+        regExMatcher.exec(savedRegExMatches.join(regExMatchSeparator));
+
         let finished = false;
         function finishExecution(e, r) {
           if (finished) return;
           finished = true;
-          for (let idx = 1; idx < savedRegExMatches.length; idx += 1) {
-            savedRegExMatches[idx] = RegExp[`$${idx}`];
-          }
+          saveRegExpMatches();
           cb(e, r);
         }
 

@@ -27,6 +27,12 @@ int main() {
         "globalThis.__mbunDialect === 'node' ? 1 : 0",
         1, "node compatibility probes run in the Node dialect");
     expect_number(
+        "(()=>{try{const repl=require('node:repl');const stream=require('node:stream');"
+        "const io=new stream.PassThrough();const server=repl.start({input:io,output:io,terminal:false,prompt:''});"
+        "let result=-1;server.eval('1+1\\n',server.context,'REPL1',(err,value)=>{result=err?0:value===2?1:0});"
+        "server.close();return result}catch{return -1}})()",
+        1, "node REPL default evaluation completes despite unavailable legacy RegExp captures");
+    expect_number(
         "(()=>{try{const fs=require('node:fs');"
         "const p=require('node:util').promisify(fs.exists);"
         "return p.name==='exists'?1:0}catch{return -1}})()",
