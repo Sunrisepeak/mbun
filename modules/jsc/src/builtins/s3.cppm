@@ -359,7 +359,19 @@ inline constexpr std::string_view kS3JS = R"JS(
       const cr = await request(sign(cred, "POST", key, { searchParams: "?uploads=" }), "POST", null, signedHeaders(cred, true));
       if (cr.status < 200 || cr.status >= 300) throw parseS3Error(cr.body.toString("utf-8"), false);
       const uploadId = tagVal(cr.body.toString("utf-8"), "UploadId");
-      if (!uploadId) throw makeS3Error("UnknownError", "CreateMultipartUpload returned no UploadId");
+      // The id is endpoint-supplied and is echoed into the request line of every
+      // later part ("?partNumber=N&uploadId=..."), so it is validated before the
+      // first reuse rather than trusted. PORT-SOURCE: bun
+      // src/runtime/webcore/s3/multipart.rs:697-715
+      // (on_start_multi_part_request_result) — empty, longer than
+      // MAX_UPLOAD_ID_LEN (multipart.rs:179), or any byte that is `!is_ascii() ||
+      // is_ascii_control()` fails the upload with UnknownError / "Failed to
+      // initiate multipart upload". `[^\x20-\x7e]` is exactly that byte set.
+      // encodeURIComponent below already neutralises a CR/LF for the wire, but
+      // that only downgrades an injection to a silently-succeeding upload against
+      // an id the service never issued; bun aborts instead.
+      if (!uploadId || uploadId.length > 2000 || /[^\x20-\x7e]/.test(uploadId))
+        throw makeS3Error("UnknownError", "Failed to initiate multipart upload");
       const encId = encodeURIComponent(uploadId);
       try {
         // 2. UploadPart for each partSize slice, in order.
