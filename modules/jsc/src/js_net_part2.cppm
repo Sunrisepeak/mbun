@@ -44,6 +44,50 @@ export constexpr std::string_view kNetJS_part2 = R"JS(
   // Serialize a Response onto a socket. `type: "direct"` ReadableStream bodies
   // stream chunked (writeDirectStreamResponse); other streams are drained first
   // and sent with Content-Length.
+  const applyFileRangeResponse = (req, res) => {
+    if (!req || !res || typeof res !== "object" || res.status !== 200) return res;
+    const method = String(req.method || "").toUpperCase();
+    if (method !== "GET" && method !== "HEAD") return res;
+    const b = res._b;
+    if (!b || !b.__isBunFile || !res.headers || typeof res.headers.get !== "function") return res;
+    ensureFileLastModifiedHeader(res);
+    const range = req.headers && typeof req.headers.get === "function" ? req.headers.get("range") : null;
+    if (!range || res.headers.has("content-range") || String(range).indexOf(",") !== -1) return res;
+    const m = /^bytes\s*=\s*(\d*)\s*-\s*(\d*)\s*$/i.exec(String(range));
+    if (!m || (m[1] === "" && m[2] === "")) return res;
+    const size = Number(b.size);
+    if (!Number.isSafeInteger(size) || size < 0) return res;
+    let start = 0;
+    let end = size - 1;
+    if (m[1] === "") {
+      const suffix = Number(m[2]);
+      if (!Number.isSafeInteger(suffix) || suffix <= 0) return res;
+      start = Math.max(size - suffix, 0);
+    } else {
+      start = Number(m[1]);
+      if (!Number.isSafeInteger(start) || start < 0) return res;
+      if (m[2] !== "") {
+        end = Number(m[2]);
+        if (!Number.isSafeInteger(end) || end < 0) return res;
+      }
+      end = Math.min(end, size - 1);
+    }
+    const headers = new G.Headers(res.headers);
+    headers.set("accept-ranges", "bytes");
+    if (start >= size || end < start || size === 0) {
+      headers.delete("content-length");
+      headers.set("content-range", "bytes */" + size);
+      return new G.Response(null, { status: 416, statusText: "Range Not Satisfiable", headers });
+    }
+    try {
+      const body = b.slice(start, end + 1);
+      headers.set("content-range", "bytes " + start + "-" + end + "/" + size);
+      headers.set("content-length", String(end - start + 1));
+      return new G.Response(body, { status: 206, statusText: "Partial Content", headers });
+    } catch (e) {
+      return res;
+    }
+  };
   function writeHttpResponse(sock, res, reqMethod, keepAlive, onFinished) {
     if (!res || typeof res !== "object") res = new G.Response("", { status: 500 });
     ensureFileLastModifiedHeader(res);
@@ -648,7 +692,8 @@ export constexpr std::string_view kNetJS_part2 = R"JS(
             for (const c of _cd.value.toSetCookieHeaders()) res.headers.append("Set-Cookie", c);
           }
         } catch (e) {}
-        writeHttpResponse(sock, res, ev.method, keepAlive && !sock.destroyed, () => {
+        const ranged = applyFileRangeResponse(req, res);
+        writeHttpResponse(sock, ranged, ev.method, keepAlive && !sock.destroyed, () => {
           serverObj.pendingRequests--;
           conns.delete(ev.id);
           // Responded before the body finished: the native side closes the
@@ -933,7 +978,8 @@ export constexpr std::string_view kNetJS_part2 = R"JS(
               out = new G.Response("", { status: 404 });   // routes-only server, no match
             }
             const finish = (res) => {
-              writeHttpResponse(sock, res, parser.method, keepAlive && !sock.destroyed, () => {
+              const ranged = applyFileRangeResponse(req, res);
+              writeHttpResponse(sock, ranged, parser.method, keepAlive && !sock.destroyed, () => {
                 serverObj.pendingRequests--;
                 sock._httpBusy = false;
                 if (keepAlive && !sock.destroyed) { startParser(); pump(); }

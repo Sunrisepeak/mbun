@@ -7033,6 +7033,26 @@ surface on Linux:
   混修；下一轮必须从 fresh bounded measurement 选单一 owner。W55 无构建、无全量
   corpus，资源策略继续保持 3–5 jobs，并在 swap/disk 低水位时只做小型 probe。
 
+### W422 Bun.file single-range response source fix
+
+- W422 先用 fresh active probes 复核 Range owner：固定区间、开放区间、后缀区间、
+  超长末端截断、大小写/空格写法全部在 FileRoute 与 fetch handler 返回
+  **200 而非 206**；multi-range 与 non-GET/HEAD guard 已有正确行为。issue
+  [#77](https://github.com/Sunrisepeak/mbun/issues/77) 固定了单一 response-transform
+  边界；两个 `describe.todo` 候选没有被误计入 verdict。
+- 修复位于 `js_net.cppm` 与 `js_net_part2.cppm`：在 native/fallback Bun.serve
+  响应写出前，对 200 状态的 BunFile 处理单一 GET/HEAD byte range，生成 206、
+  `Content-Range`、`Accept-Ranges` 和正确 body；越界生成 416。多区间、显式
+  `Content-Range`、普通 Blob 和非 GET/HEAD 仍走原路径，并补齐 416 reason phrase。
+- 初版串行 release build 通过，耗时 **62.05s**；补齐 Range response 的
+  Last-Modified 继承后，最终串行 build 仍通过，耗时 **60.84s**。post 五个独立 lane 全通过，合计
+  **13 active checks、0 failed、0 timeout**：固定/后缀/大小写区间各 2/2，416
+  FileRoute+fetch handler 2/2，multi-range/non-GET/custom-header guard 5/5。
+  W420/W421 的 Last-Modified、普通 text file、HEAD、custom headers 五个回归
+  lane 也全部通过。`If-Modified-Since` 仍是独立的 conditional-order owner；本次
+  修复后该 case 已从 200 变为 206，但仍未达到期望的 304，未混入本次。
+  未修改 upstream fixture、未跑全量 corpus。
+
 ### W421 Fetch ordinary-response Connection header boundary fix
 
 - W421 先用 fresh 五个窄 probe 复核 W420 留下的 header-shape owner：普通文本和

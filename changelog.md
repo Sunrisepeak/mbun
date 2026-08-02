@@ -5,6 +5,13 @@
 
 ## 2026-08-02
 
+- W422 Bun.file single-range response source fix：Bun.serve 现在对 BunFile 的单一
+  GET/HEAD byte range 返回 206 与 Content-Range，越界返回 416，同时保留多区间、
+  显式 Content-Range、普通 Blob 和非 GET/HEAD 的原有边界；issue #77。serial
+  release build **62.05s**（最终补丁复核 build **60.84s**），post 五个独立 lane
+  **13 active checks、0 failed、0 timeout**，
+  W420/W421 五个 regression lane 全部通过。未修改 upstream fixture、未跑全量 corpus。
+
 - W421 Fetch ordinary-response Connection header boundary fix：普通 Fetch response
   不再暴露 wire-level hop-by-hop `Connection` header，101 WebSocket upgrade 仍保留
   `Connection: Upgrade`，Node HTTP response 行为不变；issue #76。fresh selector
