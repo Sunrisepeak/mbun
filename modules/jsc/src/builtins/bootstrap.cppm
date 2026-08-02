@@ -8584,7 +8584,16 @@ inline constexpr char kBootstrapJS_[] = R"JS(
         // node kIoMaxLength: a file larger than 2**31-1 cannot be read into one
         // buffer (ERR_FS_FILE_TOO_LARGE, a RangeError).
         try {
-          const size = fsMod.fstatSync(fd).size;
+          // node's readFileHandle resolves the live binding row on every
+          // operation. Internal tests replace fstat to model files whose stat
+          // size is zero while reads still produce bytes, so bypassing this
+          // seam through fsMod.fstatSync loses both the hook and that contract.
+          const binding = typeof G.__mbunInternalBinding === "function"
+            ? G.__mbunInternalBinding("fs") : null;
+          const statFields = binding && typeof binding.fstat === "function"
+            ? await binding.fstat(fd, false, binding.kUsePromises) : null;
+          const size = statFields === null
+            ? fsMod.fstatSync(fd).size : Number(statFields[8]);
           if (size > 2147483647) {
             const e = new RangeError("File size (" + size + ") is greater than 2 GiB");
             e.code = "ERR_FS_FILE_TOO_LARGE";
