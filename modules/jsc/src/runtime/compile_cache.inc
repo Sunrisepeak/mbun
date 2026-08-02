@@ -77,9 +77,13 @@ inline constexpr const char* kCompileCacheRuntimeVersion{"24.3.0"};
 
 // node checks the permission model before creating the cache directory, and
 // reports a FAILED status (not a throw) when either side is denied. gPermission
-// is the process-wide model from common.inc; with --permission off it grants
-// everything, so this is a no-op for ordinary runs.
+// is the process-wide model from common.inc, and it only answers meaningfully
+// once --permission has turned it on: with the model off every fs scope reads
+// as ungranted (nothing was ever allowed), which is the opposite of what an
+// ordinary run means. node asks its own permission object only under the
+// Permission Model too, so the gate goes here.
 inline bool compile_cache_permission_granted_(const std::string& path, bool write) {
+    if (!gPermission.enabled()) return true;
     return gPermission.is_granted(
         write ? mbun::permission::Scope::FileSystemWrite : mbun::permission::Scope::FileSystemRead,
         path);
