@@ -112,6 +112,53 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
     Object.defineProperty(G, "__mbunAdoptNodeEventTarget", {
       value: function adoptNodeEventTarget(internal) {
         if (G.__mbunNodeEventTargetPatched) return;
+        // node's `kEvents` is the private Symbol its EventTarget keys its
+        // listener map on, and `--expose-internals` tests read it directly to
+        // assert a listener was REMOVED (test-events-on-async-iterator's
+        // abortListenerRemovedAfterComplete: `signal[kEvents].get('abort').size`).
+        // Those tests used to see it for the wrong reason -- the startup bridge
+        // had replaced the global AbortSignal with node's, so they were
+        // inspecting node's second implementation. With one AbortSignal per
+        // process the symbol has to be answerable on mbun's own.
+        //
+        // It is a lazy PROJECTION, not bookkeeping: mbun's EventTarget already
+        // keeps its listeners in `kListeners` (a Map of type -> records) and
+        // mbun's AbortSignal in `_l`, so the map node's shape describes can be
+        // built on read from state that already exists. Nothing is wrapped and
+        // nothing is recorded, so add/removeEventListener stay untouched on
+        // every path -- the accessor costs exactly one property definition, and
+        // only in a process that actually loaded node's internal/event_target.
+        //
+        // node deletes a type key once its last listener goes, and the tests
+        // rely on that: they accept either `get(type)` being absent or its
+        // `.size` being 0. Empty types are therefore omitted rather than
+        // reported as empty.
+        try {
+          const kEvents = internal && internal.kEvents;
+          if (typeof kEvents === "symbol") {
+            const asMap = (pairs) => {
+              const m = new Map();
+              for (const p of pairs) if (p[1] > 0) m.set(p[0], { size: p[1] });
+              return m;
+            };
+            const define = (proto, read) => {
+              if (!proto || Object.getOwnPropertyDescriptor(proto, kEvents)) return;
+              Object.defineProperty(proto, kEvents, {
+                get() { return asMap(read(this)); },
+                configurable: true, enumerable: false,
+              });
+            };
+            define(G.AbortSignal && G.AbortSignal.prototype, (s) =>
+              s && Array.isArray(s._l) ? [["abort", s._l.length]] : []);
+            define(G.EventTarget && G.EventTarget.prototype, (t) => {
+              const listeners = t && t[kListeners];
+              if (!listeners || typeof listeners.forEach !== "function") return [];
+              const out = [];
+              listeners.forEach((list, type) => { out.push([type, list ? list.length : 0]); });
+              return out;
+            });
+          }
+        } catch (e) {}
         const NativeEvent = G.Event;
         const InternalEvent = internal && internal.Event;
         const NodeEventTarget = internal && internal.NodeEventTarget;
