@@ -311,6 +311,17 @@ inline constexpr std::string_view kNodeTestRunnerJS = R"JS(
           throw rangeError("options.concurrency", ">= 1 && <= 4294967295", concurrency);
         }
       }
+      // node parseExpectFailure() rejects `{}` where the Test is constructed —
+      // an empty configuration cannot mean anything, and treating it as a bare
+      // matcher would silently accept every failure.
+      const expectFailure = opts.expectFailure;
+      if (expectFailure !== null && typeof expectFailure === "object" &&
+          !(expectFailure instanceof RegExp) && Object.keys(expectFailure).length === 0) {
+        const e = new TypeError("The argument 'options.expectFailure' must not be an empty object." +
+                                " Received {}");
+        e.code = "ERR_INVALID_ARG_VALUE";
+        throw e;
+      }
     };
     const testAssert = {
       register(name, fn) {
@@ -618,6 +629,60 @@ inline constexpr std::string_view kNodeTestRunnerJS = R"JS(
       emit("test:dequeue", e);
       emit("test:start", baseEvent(node));
     };
+    // PORT-SOURCE: node lib/internal/test_runner/test.js parseExpectFailure().
+    // `expectFailure` is not just a flag: a string is a LABEL printed after the
+    // directive, a function/RegExp is a MATCHER the failure has to satisfy, and
+    // an object is read as {label, match} when those are its only keys and as a
+    // bare matcher otherwise. mbun understood only the flag and the string, so
+    // `{ label: 'reason object' }` printed no label and every `match` form was
+    // ignored — a test that failed for the WRONG reason still passed
+    // (test-runner-xfail: 17 of its 36 assertions).
+    const parseExpectFailure = (expectFailure) => {
+      if (expectFailure === undefined || expectFailure === false) return false;
+      if (typeof expectFailure === "string") return { label: expectFailure, match: undefined };
+      if (typeof expectFailure === "function" || expectFailure instanceof RegExp) {
+        return { label: undefined, match: expectFailure };
+      }
+      if (typeof expectFailure !== "object" || expectFailure === null) {
+        return { label: undefined, match: undefined };
+      }
+      const keys = Object.keys(expectFailure);
+      // An empty object is rejected where the test is CONSTRUCTED (see the
+      // option validation), so by here it can only be a real configuration.
+      if (keys.length !== 0 && keys.every((k) => k === "match" || k === "label")) {
+        return { label: expectFailure.label, match: expectFailure.match };
+      }
+      return { label: undefined, match: expectFailure };
+    };
+    // node test.js: `parseExpectFailure(own) || this.parent?.expectFailure` —
+    // a suite's expectation is inherited by every subtest that does not set its
+    // own.
+    const expectFailureOf = (node) => {
+      for (let n = node; n; n = n.parent) {
+        const parsed = parseExpectFailure(n.opts && n.opts.expectFailure);
+        if (parsed !== false) return parsed;
+      }
+      return false;
+    };
+    // node Test#fail(): with a matcher, the thrown error is re-thrown through
+    // assert.throws(…, validation) — so every shape assert.throws accepts (a
+    // RegExp, a constructor, a predicate, an object of expected properties)
+    // works here for free, which is exactly why node routes it that way.
+    const expectFailureMismatch = (match, error) => {
+      if (match === undefined) return null;
+      const assert = assertMod();
+      if (!assert || typeof assert.throws !== "function") return null;
+      const target = (error && error.code === "ERR_TEST_FAILURE" &&
+                      error.failureType === "testCodeFailure" && error.cause !== undefined)
+        ? error.cause : error;
+      try {
+        assert.throws(() => { throw target; }, match);
+        return null;
+      } catch (mismatch) {
+        return mismatch;
+      }
+    };
+
     // `expectFailure` inverts the verdict: node reports a test that was expected
     // to fail AND failed as a pass carrying the directive (test-runner-xfail).
     const emitResult = (node, error, ctx, startedAt) => {
@@ -628,18 +693,30 @@ inline constexpr std::string_view kNodeTestRunnerJS = R"JS(
       const directive = directiveOf(node, ctx);
       if (directive.skip !== undefined) e.skip = directive.skip;
       if (directive.todo !== undefined) e.todo = directive.todo;
-      const expectation = node.opts.expectFailure;
-      const expected = expectation !== undefined && expectation !== false;
+      const expectation = expectFailureOf(node);
+      const expected = expectation !== false;
       let passed = error === undefined;
       let reported = error;
       if (expected) {
-        if (!passed) { passed = true; reported = undefined; e.expectFailure = expectation === true ? true : expectation; }
-        else {
+        // node getReportDetails(): the directive carries the LABEL, never the
+        // configuration object (getXFail(message) -> `expectFailure: message ??
+        // true`).
+        e.expectFailure = expectation.label === undefined ? true : expectation.label;
+        if (!passed) {
+          const mismatch = expectFailureMismatch(expectation.match, error);
+          if (mismatch === null) { passed = true; reported = undefined; }
+          else {
+            reported = new Error("The test failed, but the error did not match the expected validation");
+            reported.code = "ERR_TEST_FAILURE";
+            reported.failureType = "testCodeFailure";
+            reported.cause = mismatch;
+            passed = false;
+          }
+        } else {
           reported = new Error("test was expected to fail but passed");
           reported.code = "ERR_TEST_FAILURE";
           reported.failureType = "expectedFailure";
           passed = false;
-          e.expectFailure = expectation === true ? true : expectation;
         }
       }
       e.details = {
