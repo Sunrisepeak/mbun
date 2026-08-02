@@ -1417,13 +1417,8 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
           if (id !== undefined && id !== null) event.id = "0x" + Number(id).toString(16);
           record(event);
         };
-        // Category names that were enabled at least once, so a category that is
-        // disabled again before exit still contributes its one-shot events.
-        const everEnabled = new Set(initial);
         const CAT_ASYNC = "node,node.async_hooks";
         const CAT_CONSOLE = "node,node.console";
-        const CAT_ENV = "node,node.environment";
-        const CAT_BOOTSTRAP = "node,node.bootstrap";
         const CAT_TP_ASYNC = "node,node.threadpoolwork,node.threadpoolwork.async";
         const CAT_TP_SYNC = "node,node.threadpoolwork,node.threadpoolwork.sync";
         let timersInstrumented = false, consoleInstrumented = false, poolInstrumented = false;
@@ -1698,7 +1693,7 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
             const count = (dynamic.get(category) || 0) + delta;
             if (count > 0) dynamic.set(category, count); else dynamic.delete(category);
           }
-          if (delta > 0) { writesTrace = true; for (const c of categories) everEnabled.add(c); }
+          if (delta > 0) writesTrace = true;
           updateBuffers();
           if (delta > 0) installInstrumentation();
         };
@@ -1777,26 +1772,6 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
         const flush = () => {
           if (flushed || !writesTrace) return;
           flushed = true;
-          // Milestones the engine has no native hook for. node emits these
-          // over the process lifetime from its event-loop phases; without those
-          // hooks the full set is emitted here, right before the file is
-          // written. The tests assert presence (and that no foreign name shows
-          // up), not ordering.
-          if (groupEnabled(CAT_ENV)) {
-            for (const name of ["Environment", "RunAndClearNativeImmediates", "CheckImmediate",
-                                "RunTimers", "BeforeExit", "RunCleanup", "AtExit"]) {
-              emit("b", CAT_ENV, name); emit("e", CAT_ENV, name);
-            }
-          }
-          if (groupEnabled(CAT_BOOTSTRAP)) {
-            for (const name of ["nodeStart", "v8Start", "environment", "loopStart", "loopExit",
-                                "bootstrapComplete"]) {
-              emit("b", CAT_BOOTSTRAP, name); emit("e", CAT_BOOTSTRAP, name);
-            }
-          }
-          // The engine is JavaScriptCore, which has no V8 tracing backend at
-          // all; this is a stand-in so the "v8" category is not silently empty.
-          if (everEnabled.has("v8")) emit("I", "v8", "V8.GCScavenger");
           const file = String(pattern || "node_trace.${rotation}.log")
             .replace(/\$\{pid\}/g, String(proc.pid || 0))
             .replace(/\$\{rotation\}/g, "1");
