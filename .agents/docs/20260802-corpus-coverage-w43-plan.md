@@ -358,11 +358,11 @@ git commit --author='Sunrisepeak <speakshen@163.com>' \
 - Consumes: frozen Task 2 binary and exact Task 4 manifests.
 - Produces: three issue-linked worker branches, each with Red evidence, upstream source mapping, Green evidence, Refactor proof, and one reviewable commit.
 
-- [ ] **Step 1: Create three isolated worktrees from the same coordinator checkpoint**
+- [x] **Step 1: Create three isolated worktrees from the same coordinator checkpoint**
 
 Use `tools/integration/worktree_setup.sh` only on three new paths/branches: `w43/a1-zlib-buffer`, `w43/a2-assert`, and `w43/a3-permission`. Copy the exact manifest into each prompt; do not share a build target.
 
-- [ ] **Step 2: Dispatch three workers simultaneously**
+- [x] **Step 2: Dispatch three workers simultaneously**
 
 Each worker first derives the same frozen binary path:
 
@@ -386,7 +386,7 @@ python3 tools/integration/node_corpus_runner.py \
 
 Worker A2 runs the same command with manifest `w43-a2-node-assert.txt` and output `target/integration/w43-a2-before`. Worker A3 uses `w43-a3-node-permission.txt` and `target/integration/w43-a3-before`. Each worker reads the relevant pinned `compat/node/lib/` or `compat/node/src/` implementation before editing, creates or links the exact defect issue, implements one source-coherent cause, builds through `build_or_die.sh`, repeats the same manifest against the new binary, serially re-runs new greens, runs the relevant JSC member test, and commits with builder/co-author trailers.
 
-- [ ] **Step 3: Reject black-box or unproven results**
+- [x] **Step 3: Reject black-box or unproven results**
 
 Reject a worker branch if its report lacks the upstream source location, a stable before failure, exact changed paths, after categories, serial new-green proof, or remaining red files. Do not accept a branch solely because its build passed.
 
@@ -399,7 +399,7 @@ Reject a worker branch if its report lacks the upstream source location, a stabl
 - Consumes: three reviewed worker commits from Task 5.
 - Produces: one composed coordinator tree with zero focused regressions and measured batch-1 delta.
 
-- [ ] **Step 1: Review each branch before integration**
+- [x] **Step 1: Review each branch before integration**
 
 ```bash
 git diff --stat HEAD...w43/a1-zlib-buffer
@@ -412,7 +412,7 @@ git log --format=full -1 w43/a3-permission
 
 Confirm no worker modified `compat/`, shared metrics, protected surfaces, or another lane's source boundary.
 
-- [ ] **Step 2: Merge accepted branches normally with attributed merge commits**
+- [x] **Step 2: Merge accepted branches normally with attributed merge commits**
 
 ```bash
 GIT_AUTHOR_NAME=Sunrisepeak GIT_AUTHOR_EMAIL=speakshen@163.com \
@@ -439,7 +439,7 @@ git merge --no-ff w43/a3-permission \
 
 Do not squash, cherry-pick, amend, or rebase; a rejected lane is omitted and reported.
 
-- [ ] **Step 3: Build the composed tree and derive impact lists**
+- [x] **Step 3: Build the composed tree and derive impact lists**
 
 ```bash
 W43_A_BIN=$(bash tools/integration/build_or_die.sh)
@@ -455,7 +455,7 @@ python3 tools/integration/impact_gate.py \
   --explain
 ```
 
-- [ ] **Step 4: Run composed batch-1 focused and member gates**
+- [x] **Step 4: Run composed batch-1 focused and member gates**
 
 Run A1, A2, and A3 separately against `"$W43_WAVE_A_BIN"` with the Node runner, their committed manifest, `--jobs 3`, `--timeout 30`, and distinct `target/integration/w43-a*-composed` output directories. Then repeat every newly green file with `--jobs 1`. Run:
 
@@ -478,11 +478,11 @@ Any stable green→non-green result blocks batch 2.
 - Consumes: Task 6 composed checkpoint and A4/A5 manifests.
 - Produces: two issue-linked, source-driven branches with combined target +6 to +10.
 
-- [ ] **Step 1: Create two new worktrees on the Task 6 checkpoint**
+- [x] **Step 1: Create two new worktrees on the Task 6 checkpoint**
 
 Branches: `w43/a4-bun-napi` and `w43/a5-bun-test-runner`.
 
-- [ ] **Step 2: Dispatch both workers simultaneously**
+- [x] **Step 2: Dispatch both workers simultaneously**
 
 Each worker derives the shared pre-edit binary and A4 runs:
 

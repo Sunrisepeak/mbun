@@ -10,10 +10,11 @@ Campaign branch: `agent/corpus-coverage-w43`
 
 ## Current status
 
-Checkpoint 0 is the pre-implementation baseline. No W43 product source change
-has started. The first five-hour sprint target remains net +30 to +45 fully
-green files; the final campaign target remains the complete audited runnable
-denominator.
+Wave A batch 1 is integrated at `7e84e13`: its three Node lanes produced seven
+focused new-green files with no focused or impact-list regression. A1 reached
++4, A2 was deliberately narrowed to a safe +1 below its +2 floor, and A3
+reached +2. This is not a post-Wave-A full-corpus result; checkpoint 0 remains
+the authoritative full baseline until the next same-binary full run.
 
 Five logical lanes will be executed in rolling batches because this session has
 three physical worker slots. The coordinator alone owns builds, full corpus
@@ -119,11 +120,11 @@ expects.
 
 | Lane | Corpus/owner | Fixed target | Actual | Issue | Commit | State |
 | --- | --- | ---: | ---: | --- | --- | --- |
-| A1 | Node zlib/Buffer | +3 to +5 | — | — | — | not started |
-| A2 | Node assert | +2 to +4 | — | — | — | not started |
-| A3 | Node permission | +2 to +4 | — | — | — | not started |
-| A4 | Bun N-API | +3 to +5 | — | — | — | not started |
-| A5 | Bun test runner | +3 to +5 | — | — | — | not started |
+| A1 | Node zlib/Buffer | +3 to +5 | +4 | #83 | `71b2c2b..bacd246` | accepted and composed |
+| A2 | Node assert | +2 to +4 | +1 | #82 | `e7b8d99..0a102f6` | accepted safe partial; target missed |
+| A3 | Node permission | +2 to +4 | +2 | #84 | `c48839f..bef02c6` | accepted and composed |
+| A4 | Bun N-API | +3 to +5 | diagnosing +3 finalizer set | pending | — | implementation active |
+| A5 | Bun test runner | +3 to +5 | diagnosing +1 +2 | pending | — | two explicit mechanisms active |
 
 All 49 literal paths were found in the fresh baseline and were non-green. A1,
 A2, and A3 contain respectively 5, 8, and 10 Node `fail` rows. A4 contains 18
@@ -148,3 +149,33 @@ Retired-approach gate:
 Worker probes, focused results, integration deltas, serial confirmations, and
 remaining reds are appended here only after coordinator review. Full-corpus
 numbers are updated only at the next same-binary full checkpoint.
+
+## Wave A batch 1 composed checkpoint
+
+| Evidence | Result |
+| --- | --- |
+| Coordinator head | `7e84e13efc1da8599aacd31daf28eb8603597c0f` |
+| Frozen composed binary | Git common directory `w43/wave-a/mbun` |
+| Binary SHA-256 | `4efb3448ebd7b2e34f0eda1e15dff74201aaae25ed7ce9a01ca607f21ca4b0b6` |
+| Fresh build | `build_or_die.sh --no-cache`: pass |
+| JSC member suite | 29 passed, 0 failed |
+| Permission member suite | 1 passed, 0 failed; 150 checks, 0 failures |
+| A1 manifest | 0/5 -> 4/5; four serial repeats passed |
+| A2 manifest | 0/8 -> 1/8; one serial repeat passed |
+| A3 manifest | 0/10 -> 2/10; two serial repeats passed from the pinned Node cwd |
+| Focused total | 0/23 -> 7/23; no green-to-non-green move |
+| Node impact run | 653 files; 421 pass, 149 fail, 73 skipped, 9 timeout, 1 OOM; diff gate found no regression |
+| Bun impact run | 180 files; 100 green, 59 test-failure, 8 all-skipped, 7 timeout, 3 ahead-of-reference, 2 blocked-external, 1 OOM; diff gate found no regression |
+
+The first full JSC run exposed `test_async_hooks` intermittently missing only
+the `timeout:value` observation. Ten-run isolation measured the pre-existing
+one-millisecond deadline race across A1, A2, A3, and the composed tree. Issue
+#85 replaced the one-shot due-only drain with the runtime's bounded event-loop
+pump; the exact test then passed 10/10 and the full JSC suite passed 29/29. No
+runtime assertion or product behavior was weakened.
+
+A1's only remaining manifest red is the independent `DEP0005` warning-delivery
+case. A2 retains seven reds because review removed an incomplete handwritten
+partial-deep comparator and did not expose unsupported `skipPrototype`
+semantics. A3 retains eight separately diagnosed permission surfaces. These
+remaining rows are not counted as gains or waived.
