@@ -595,7 +595,7 @@ Sort each owner's non-green rows by failed-assertion ratio and stable duration, 
 
 Assign +2 to +5 per Node lane and +2 to +4 per Bun lane, totaling +12 to +22. Targets are written to the ledger and PR checkpoint comment before implementation; they are not changed after results arrive.
 
-- [ ] **Step 5: Commit the literal Wave B manifests before dispatch**
+- [x] **Step 5: Commit the literal Wave B manifests before dispatch**
 
 ```bash
 git diff --check
