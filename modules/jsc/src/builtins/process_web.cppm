@@ -1664,7 +1664,8 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
   const kColorMode = Symbol("kColorMode");
   const kInspectOptions = Symbol("kInspectOptions");
   const kCounts = Symbol("counts");
-  const kTimes = Symbol("times");
+  // node keeps the console time map on the PUBLIC `_times` property
+  // (lib/internal/console/constructor.js kBindProperties), not a symbol.
   const kWriteToConsole = Symbol("kWriteToConsole");
   const kGetInspectOptions = Symbol("kGetInspectOptions");
   const kUseStdout = Symbol("stdout");
@@ -1690,9 +1691,9 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     log(...args) { this[kWriteToConsole](kUseStdout, util.formatWithOptions(this[kGetInspectOptions](this._stdout), ...args)); },
     warn(...args) { this[kWriteToConsole](kUseStderr, util.formatWithOptions(this[kGetInspectOptions](this._stderr), ...args)); },
     dir(object, options) { this[kWriteToConsole](kUseStdout, util.inspect(object, Object.assign({ customInspect: false }, this[kGetInspectOptions](this._stdout), options))); },
-    time(label = "default") { label = `${label}`; if (this[kTimes].has(label)) return; this[kTimes].set(label, conNowNs()); },
-    timeEnd(label = "default") { label = `${label}`; const t = this[kTimes].get(label); if (t === undefined) return; this[kWriteToConsole](kUseStdout, label + ": " + conFormatDur(conNowNs() - t)); this[kTimes].delete(label); },
-    timeLog(label = "default", ...data) { label = `${label}`; const t = this[kTimes].get(label); if (t === undefined) return; this.log(label + ": " + conFormatDur(conNowNs() - t), ...data); },
+    time(label = "default") { label = `${label}`; if (this._times.has(label)) return; this._times.set(label, conNowNs()); },
+    timeEnd(label = "default") { label = `${label}`; const t = this._times.get(label); if (t === undefined) return; this[kWriteToConsole](kUseStdout, label + ": " + conFormatDur(conNowNs() - t)); this._times.delete(label); },
+    timeLog(label = "default", ...data) { label = `${label}`; const t = this._times.get(label); if (t === undefined) return; this.log(label + ": " + conFormatDur(conNowNs() - t), ...data); },
     trace(...args) { this[kWriteToConsole](kUseStderr, "Trace: " + util.formatWithOptions(this[kGetInspectOptions](this._stderr), ...args)); },
     assert(expression, ...args) { if (!expression) { args[0] = "Assertion failed" + (args.length === 0 ? "" : ": " + args[0]); this.warn(...args); } },
     clear() { const s = this._stdout; if (s && s.isTTY && typeof s.write === "function") { s.write("[1;1H"); s.write("[0J"); } },
@@ -1732,7 +1733,7 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
       "_stdout": na(stdout), "_stderr": na(stderr), "_ignoreErrors": na(Boolean(ignoreErrors)),
       [kColorMode]: na(colorMode),
       [kInspectOptions]: na((typeof inspectOptions === "object" && inspectOptions !== null) ? inspectOptions : undefined),
-      [kCounts]: na(new Map()), [kTimes]: na(new Map()),
+      [kCounts]: na(new Map()), "_times": na(new Map()),
       [kGroupIndent]: na(""), [kGroupIndentWidth]: na(groupIndentation === undefined ? 2 : groupIndentation),
     });
     const keys = Object.keys(Console.prototype);
@@ -1837,7 +1838,7 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
       [kColorMode]: naGlobal("auto"),
       [kInspectOptions]: naGlobal(undefined),
       [kCounts]: naGlobal(new Map()),
-      [kTimes]: naGlobal(new Map()),
+      "_times": naGlobal(new Map()),
       [kGroupIndent]: naGlobal(""),
       [kGroupIndentWidth]: naGlobal(2),
     });
