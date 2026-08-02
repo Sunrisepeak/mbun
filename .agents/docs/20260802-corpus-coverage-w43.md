@@ -10,11 +10,13 @@ Campaign branch: `agent/corpus-coverage-w43`
 
 ## Current status
 
-Wave A batch 1 is integrated at `7e84e13`: its three Node lanes produced seven
-focused new-green files with no focused or impact-list regression. A1 reached
-+4, A2 was deliberately narrowed to a safe +1 below its +2 floor, and A3
-reached +2. This is not a post-Wave-A full-corpus result; checkpoint 0 remains
-the authoritative full baseline until the next same-binary full run.
+Wave A is integrated at `d62163c`: its five logical lanes produced 13 focused
+new-green files with no focused or impact-list classification regression. Node
+contributed +7 and Bun +6. A1 reached +4, A2 was deliberately narrowed to a
+safe +1 below its +2 floor, A3 reached +2, A4 reached +3 after two additive
+independent-review fixes, and A5 reached +3 through two separately attributed
+mechanisms. This is not a post-Wave-A full-corpus result; checkpoint 0 remains
+the authoritative full baseline until the final same-binary full run.
 
 Five logical lanes will be executed in rolling batches because this session has
 three physical worker slots. The coordinator alone owns builds, full corpus
@@ -123,8 +125,8 @@ expects.
 | A1 | Node zlib/Buffer | +3 to +5 | +4 | #83 | `71b2c2b..bacd246` | accepted and composed |
 | A2 | Node assert | +2 to +4 | +1 | #82 | `e7b8d99..0a102f6` | accepted safe partial; target missed |
 | A3 | Node permission | +2 to +4 | +2 | #84 | `c48839f..bef02c6` | accepted and composed |
-| A4 | Bun N-API | +3 to +5 | diagnosing +3 finalizer set | pending | — | implementation active |
-| A5 | Bun test runner | +3 to +5 | diagnosing +1 +2 | pending | — | two explicit mechanisms active |
+| A4 | Bun N-API | +3 to +5 | +3 | #86 | `29e12e3..e9207a3` | accepted and composed after two additive review fixes |
+| A5 | Bun test runner | +3 to +5 | +3 | #87, #88 | `d222075..444e495` | accepted and composed |
 
 All 49 literal paths were found in the fresh baseline and were non-green. A1,
 A2, and A3 contain respectively 5, 8, and 10 Node `fail` rows. A4 contains 18
@@ -179,3 +181,58 @@ case. A2 retains seven reds because review removed an incomplete handwritten
 partial-deep comparator and did not expose unsupported `skipPrototype`
 semantics. A3 retains eight separately diagnosed permission surfaces. These
 remaining rows are not counted as gains or waived.
+
+## Wave A final composed checkpoint
+
+| Evidence | Result |
+| --- | --- |
+| Coordinator product head | `d62163c92df55dc6126caf31f564dd2ebad1d5e5` |
+| Frozen composed binary | Git common directory `w43/wave-b-base/mbun` |
+| Binary SHA-256 | `445b40f7eae331c05fc5fbbd92f8cb816b37979c7b3339545b02a1525663bb0a` |
+| Fresh coordinator build | `build_or_die.sh`: pass, key `5c54b97c0110b62e` |
+| Version probe | mbun `2026.07.18.0`; Bun `1.3.14`; Node `v26.3.0` |
+| Full JSC member gate | 29 passed, 0 failed |
+| Five-manifest focused gate | 0/49 -> 13/49; Node +7, Bun +6 |
+| Serial deciding gate | all five manifests repeated at jobs 1 with the same 13 greens |
+| Node impact gate | 415 files; 273 pass, 87 fail, 44 skipped, 11 timeout before and after; no regression |
+| Bun impact gate | 34 files; 14 green, 16 test-failure, 1 all-skipped, 1 blocked-external, 1 load-error, 1 timeout before and after; no regression |
+
+Wave A's fixed target was +12 to +20, so the measured +13 meets the wave target.
+The original five-hour sprint target remains +30 to +45 and is not met by Wave
+A alone. No timeout, OOM, crash, or exclusion classification moved in the 49
+focused rows.
+
+The composed before-to-after lane results are exact and same-binary:
+
+- A1: 0/5 -> 4/5, leaving the independent `DEP0005` warning-delivery row red.
+- A2: 0/8 -> 1/8, retaining seven deliberately unwaived assert rows.
+- A3: 0/10 -> 2/10, retaining eight separately diagnosed permission rows.
+- A4: 0/18 -> 3/18, leaving 15 N-API/libuv rows as `test-failure`.
+- A5: 0/8 -> 3/8, leaving five reporter/preload/parser rows as
+  `test-failure` and outside the accepted mechanisms.
+
+A4's first independent review found that a missing or throwing configurable
+`__mbun_uncaught` dispatcher could consume a finalizer exception silently.
+Additive commit `d9fdc85` arms the shared fatal channel directly: missing or
+non-callable dispatch preserves the original error/status 1, while lookup or
+handler failure preserves the nested error/status 7. Scoped rereview then found
+that the standard dispatcher's false fatal result was ignored. Additive commit
+`e9207a3` consumes that result and stops the remaining finalizer batch. Real
+probes exit 1 and 7 respectively; a two-finalizer behavioral member test proves
+the second callback does not run after fatal. Final rereview reported no
+Critical or Important findings.
+
+A5 commit `d222075` keeps callback and returned-Promise completion independent,
+so synchronous `done()` cannot hide a later rejection (+1). Commit `444e495`
+bridges a lexical symlink path to the already-loaded canonical module-cache key
+without evaluating an unloaded module, then uses the existing subscription
+fan-out (+2). Both independent reviews reported no Critical or Important
+findings. The canonical retry is proved on POSIX; Windows drive-letter/junction
+identity remains unproved and is not claimed.
+
+The name-derived impact gate is intentionally not a full regression proof. It
+cannot infer behavior-only reachability such as GC ordering or settlement
+timing; the fixed manifests, serial repeats, native behavior tests, and final
+full corpus run cover those boundaries. On the Bun impact list, classifications
+were unchanged while `js/node/fs/fs.test.ts` improved by 11 passed tests; this
+is a test-level move, not an additional green-file credit.

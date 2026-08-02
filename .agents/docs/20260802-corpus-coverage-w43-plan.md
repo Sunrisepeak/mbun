@@ -501,7 +501,7 @@ python3 tools/integration/bun_corpus_runner.py \
 
 A5 runs the same command with list `w43-a5-bun-test-runner.txt` and output `target/integration/w43-a5-before`. Each worker reads the relevant Bun/Node N-API or Bun test-runner upstream source before editing, creates/links the defect issue, implements one coherent cause, builds, repeats its list, serially proves new greens, runs the relevant JSC member test, and commits.
 
-- [ ] **Step 3: Apply the same evidence rejection gate as Task 5**
+- [x] **Step 3: Apply the same evidence rejection gate as Task 5**
 
 No upstream mechanism, no stable red, no serial proof, or any `compat/` edit means rejection.
 
@@ -515,7 +515,7 @@ No upstream mechanism, no stable red, no serial proof, or any `compat/` edit mea
 - Consumes: accepted A4/A5 commits plus Task 6 tree.
 - Produces: full Wave A focused evidence, actual +N versus target +12 to +20, zero-regression verdict, and one PR comment.
 
-- [ ] **Step 1: Review and merge A4 then A5 normally**
+- [x] **Step 1: Review and merge A4 then A5 normally**
 
 Run branch diff/trailer checks and ensure source boundaries are disjoint, then:
 
@@ -535,7 +535,7 @@ git merge --no-ff w43/a5-bun-test-runner \
   -m 'Co-authored-by: Codex (GPT-5) <>'
 ```
 
-- [ ] **Step 2: Build and run the five-manifest union**
+- [x] **Step 2: Build and run the five-manifest union**
 
 ```bash
 W43_WAVE_A_FINAL_BIN=$(bash tools/integration/build_or_die.sh)
@@ -547,7 +547,7 @@ sha256sum "$W43_WAVE_B_BASE_BIN"
 
 Run A1–A3 with the Node runner and A4–A5 with the Bun runner, at `--jobs 3`; serially repeat every claimed new green. Run `tools/integration/build_lock.sh mcpp test -p jsc` and the diff-derived impact lists.
 
-- [ ] **Step 3: Record target versus actual**
+- [x] **Step 3: Record target versus actual**
 
 Append lane target, actual green delta, remaining classifications, issue, commit, member-test result, serial proof count, and elapsed time to the W43 ledger. State `Wave A target missed` if net delta is below 12; do not lower the target after observing results.
 
