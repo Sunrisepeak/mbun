@@ -1719,6 +1719,14 @@ inline constexpr char kBootstrapJS_[] = R"JS(
         const c = fn[kCustom];
         if (typeof c !== "function") { const e = new TypeError('The "util.promisify.custom" property must be of type function. Received ' + typeof c); e.code = "ERR_INVALID_ARG_TYPE"; throw e; }
         Object.defineProperty(c, kCustom, { value: c, enumerable: false, writable: false, configurable: true });
+        // Several native wrappers expose a deliberately anonymous custom
+        // function (or one inferred as `value`). Preserve an intentional
+        // custom name such as stream.finished, and fill only those placeholders
+        // from the callback API name.
+        try {
+          if (c.name === "" || c.name === "value")
+            Object.defineProperty(c, "name", { value: fn.name, configurable: true });
+        } catch (e) {}
         return c;
       }
       // The vendored internal/util module is loaded separately from this

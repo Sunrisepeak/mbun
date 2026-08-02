@@ -383,6 +383,53 @@ inline constexpr std::string_view kNodeInternalBindingJS = R"JS(
     },
   });
 
+  // ----------------------------------------------------------- inspector ----
+  // The binary deliberately reports config.hasInspector=false, so the public
+  // inspector module is unavailable. Node's bootstrap still probes this
+  // binding from the process-binding allowlist, however; leave a shape-only
+  // namespace so that probe is observable without pretending the inspector
+  // backend exists. The call-through for module wrapping is enough for the
+  // non-inspector bootstrap path, while the remaining hooks stay inert until
+  // a real inspector backend is implemented.
+  factories["inspector"] = () => {
+    const unavailable = () => undefined;
+    return {
+      Connection: class Connection {},
+      MainThreadConnection: class MainThreadConnection {},
+      open: unavailable,
+      url: () => undefined,
+      isEnabled: () => false,
+      waitForDebugger: unavailable,
+      console: G.console,
+      consoleCall: unavailable,
+      emitProtocolEvent: unavailable,
+      registerAsyncHook: unavailable,
+      setupNetworkTracking: unavailable,
+      callAndPauseOnStart(fn, thisArg, args) {
+        return Reflect.apply(fn, thisArg, args);
+      },
+      putNetworkResource: unavailable,
+      setConsoleExtensionInstaller: unavailable,
+      asyncTaskScheduled: unavailable,
+      asyncTaskStarted: unavailable,
+      asyncTaskFinished: unavailable,
+      asyncTaskCanceled: unavailable,
+    };
+  };
+
+  // --------------------------------------------------------------- zlib ----
+  // Keep the allowlisted namespace visible even though this build does not
+  // expose node's native zlib handle. A non-empty, failing shape prevents a
+  // missing-binding error from masking the capability boundary; compression
+  // callers still receive an explicit unsupported-binding error.
+  factories["zlib"] = () => {
+    const unavailable = () => { throw new Error("zlib native binding is unavailable"); };
+    class Zlib {
+      constructor() { unavailable(); }
+    }
+    return { Zlib, crc32: unavailable };
+  };
+
   // ------------------------------------------------------------- symbols ----
   // node src/node_symbols.cc — per-isolate well-known private symbols. Same
   // reasoning as util.privateSymbols: minted on demand, stable per process.

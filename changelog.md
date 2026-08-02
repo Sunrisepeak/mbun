@@ -5,6 +5,16 @@
 
 ## 2026-08-02
 
+- W42 Linux Node coverage checkpoint：补齐 branded WebCrypto CryptoKey 到
+  `node:crypto` HMAC 的 hidden-slot bridge，修正 custom promisify 的空名/value
+  名覆盖规则，并为 process binding allowlist 提供显式 inspector/zlib shape-only
+  namespace；新增 focused JSC seam tests。四个 bounded Linux screen lane 共派发
+  216 个文件；候选 binary 串行 gate **2/3 files green、0 timeout**，其中
+  `test-util-promisify-custom-names.mjs` 与
+  `test-process-binding-internalbinding-allowlist.js` 全绿。WebCrypto hidden-slots
+  文件已越过 HMAC bridge 断言，剩余为既有 EC `node:crypto` signing backend owner，
+  未计入 green；未跑全量 corpus，等待 Linux GCC/LLVM CI。
+
 - W424 GCC workspace gate timer-order test correction：修正 `test_runtime_dns` 在
   `setTimeout(..., 0)` 已按整数毫秒语义归一到最小 1ms 后仍只立即 drain 一次的
   测试竞态；现在在 delayed DNS backend 保持阻塞时 pump 到 timer 真正到期，再验证
