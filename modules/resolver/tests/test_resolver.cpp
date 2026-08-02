@@ -154,6 +154,7 @@ MemoryFs build_fixture() {
     fs.add_file("/proj/js/bun/resolve/baz.js");                 // foo/bar, @faasjs/baz
     fs.add_file("/proj/js/bun/resolve/bar/src/index.js");       // @faasjs/bar
     fs.add_file("/proj/js/bun/resolve/bar/larger-index.js");    // @faasjs/larger/bar
+    fs.add_file("/proj/src/utils/helpers.ts");                  // #/* tsconfig alias
 
     // --- package.json "exports" subpath map (package-json-exports) ---
     fs.add_file("/proj/node_modules/package-json-exports/foo/bar.js");
@@ -289,6 +290,12 @@ int main() {
                       "tsconfig * second target");
         check_resolve(r, "@faasjs/larger/bar", DIR, "/proj/js/bun/resolve/bar/larger-index.js",
                       "tsconfig longest-prefix wins");
+
+        TsconfigPaths hashAlias{ts};
+        hashAlias.entries.emplace_back("#/*", std::vector<std::string>{"./src/*"});
+        auto hashResolver{make_resolver(fs, &hashAlias, ResolveKind::Import)};
+        check_resolve(hashResolver, "#/utils/helpers", DIR, "/proj/src/utils/helpers.ts",
+                      "tsconfig hash alias precedes package imports");
     }
 
     // ============ package.json "exports" subpath map ============

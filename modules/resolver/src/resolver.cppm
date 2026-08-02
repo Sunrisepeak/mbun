@@ -455,6 +455,13 @@ public:
 
         // package.json "imports" — internal "#" specifiers.
         if (specifier.front() == '#') {
+            // TypeScript path aliases may deliberately use the same prefix
+            // (for example "#/*"). Bun applies a matching tsconfig path before
+            // falling back to package.json imports; an unmatched alias still
+            // retains the package-imports error and resolution contract below.
+            if (opts_.tsconfig != nullptr) {
+                if (auto r{resolve_tsconfig_paths(specifier)}) return ok(*r);
+            }
             return resolve_imports(specifier, fromDir);
         }
 

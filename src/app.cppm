@@ -2350,6 +2350,17 @@ void apply_cwd_flag(std::string_view dir) {
     }
 }
 
+// Resolve --tsconfig-override at the CLI parsing boundary. The runtime must
+// receive one stable absolute config path; resolving later from an importing
+// module would incorrectly make the option depend on that modules directory.
+void apply_tsconfig_override(std::string value) {
+    std::error_code ec{};
+    std::filesystem::path config{value};
+    if (!config.is_absolute()) config = std::filesystem::absolute(config, ec);
+    if (!ec) value = config.lexically_normal().string();
+    mbun::jsc::runtime::set_tsconfig_override(std::move(value));
+}
+
 // `--loader .ext:name` / `-l .ext:name`: install a process-wide extension→loader
 // override for the RUNTIME module loader.
 //

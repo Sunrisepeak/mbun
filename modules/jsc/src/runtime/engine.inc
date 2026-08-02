@@ -1129,45 +1129,61 @@ public:
         return out;
     }
 
-    const mbun::resolver::TsconfigPaths* find_tsconfig_(const std::string& fromDir) {
-        std::error_code ec;
-        std::filesystem::path d{fromDir};
-        for (int depth = 0; depth < 64; ++depth) {
-            const std::string cfg{(d / "tsconfig.json").string()};
-            if (auto it{tsconfigCache_.find(cfg)}; it != tsconfigCache_.end()) {
-                return it->second ? &*it->second : nullptr;
-            }
-            if (std::filesystem::is_regular_file(d / "tsconfig.json", ec)) {
-                std::optional<mbun::resolver::TsconfigPaths> parsed;
-                if (auto content{read_file(cfg)}) {
-                    parsed = mbun::resolver::parse_tsconfig(*content, d.string());
-                    // Follow `extends`: when this config declares no paths of its own
-                    // but extends another, inherit the parent's baseDir + entries
-                    // (a nested config that only `extends` a parent otherwise loses
-                    // the parent's path aliases like "harness"). Bounded chain walk.
-                    std::filesystem::path base{d};
-                    for (int hop = 0; parsed && parsed->entries.empty() &&
-                                      !parsed->extends_from.empty() && hop < 16; ++hop) {
-                        std::string ext{parsed->extends_from};
-                        if (!ext.ends_with(".json")) ext += "/tsconfig.json";
-                        std::filesystem::path parentCfg{(base / ext).lexically_normal()};
-                        std::error_code pec;
-                        if (!std::filesystem::is_regular_file(parentCfg, pec)) break;
-                        auto pcontent{read_file(parentCfg.string())};
-                        if (!pcontent) break;
-                        base = parentCfg.parent_path();
-                        parsed = mbun::resolver::parse_tsconfig(*pcontent, base.string());
-                    }
+    const mbun::resolver::TsconfigPaths* load_tsconfig_(const std::filesystem::path& config) {
+        const std::string cfg{config.lexically_normal().string()};
+        if (auto it{tsconfigCache_.find(cfg)}; it != tsconfigCache_.end()) {
+            return it->second ? &*it->second : nullptr;
+        }
+
+        std::optional<mbun::resolver::TsconfigPaths> parsed;
+        std::error_code ec{};
+        if (std::filesystem::is_regular_file(config, ec)) {
+            if (auto content{read_file(cfg)}) {
+                const std::filesystem::path configDir{config.parent_path()};
+                parsed = mbun::resolver::parse_tsconfig(*content, configDir.string());
+                // Follow `extends`: when this config declares no paths of its own
+                // but extends another, inherit the parent's baseDir + entries
+                // (a nested config that only `extends` a parent otherwise loses
+                // the parent's path aliases like "harness"). Bounded chain walk.
+                std::filesystem::path base{configDir};
+                for (int hop{0}; parsed && parsed->entries.empty() &&
+                                    !parsed->extends_from.empty() && hop < 16; ++hop) {
+                    std::string ext{parsed->extends_from};
+                    if (!ext.ends_with(".json")) ext += "/tsconfig.json";
+                    std::filesystem::path parentCfg{(base / ext).lexically_normal()};
+                    std::error_code parentEc{};
+                    if (!std::filesystem::is_regular_file(parentCfg, parentEc)) break;
+                    auto parentContent{read_file(parentCfg.string())};
+                    if (!parentContent) break;
+                    base = parentCfg.parent_path();
+                    parsed = mbun::resolver::parse_tsconfig(*parentContent, base.string());
                 }
-                auto& slot{tsconfigCache_[cfg]};
-                slot = std::move(parsed);
-                return slot ? &*slot : nullptr;
             }
-            std::filesystem::path parent{d.parent_path()};
-            if (parent == d || parent.empty()) {
-                break;
-            }
-            d = std::move(parent);
+        }
+        auto& slot{tsconfigCache_[cfg]};
+        slot = std::move(parsed);
+        return slot ? &*slot : nullptr;
+    }
+
+    const mbun::resolver::TsconfigPaths* find_tsconfig_(const std::string& fromDir) {
+        // An explicit CLI config is process resolution context: it wins for
+        // every importing directory and uses its own absolute path as the cache
+        // key. With no override, retain the existing nearest-config walk.
+        if (!gTsconfigOverride.empty()) {
+            return load_tsconfig_(std::filesystem::path{gTsconfigOverride});
+        }
+
+        std::error_code ec{};
+        std::filesystem::path dir{fromDir};
+        for (int depth{0}; depth < 64; ++depth) {
+            const std::filesystem::path config{dir / "tsconfig.json"};
+            const std::string cacheKey{config.lexically_normal().string()};
+            if (tsconfigCache_.contains(cacheKey)) return load_tsconfig_(config);
+            ec.clear();
+            if (std::filesystem::is_regular_file(config, ec)) return load_tsconfig_(config);
+            std::filesystem::path parent{dir.parent_path()};
+            if (parent == dir || parent.empty()) break;
+            dir = std::move(parent);
         }
         return nullptr;
     }
