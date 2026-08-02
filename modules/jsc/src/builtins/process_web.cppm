@@ -1539,18 +1539,34 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     const getIndexArray = (length) => Array.from({ length }, (_, i) => _inspect(i));
     const iterKey = "(iteration index)", keyKey = "Key", valuesKey = "Values", indexKey = "(index)";
     const mapIter = T.isMapIterator(tabularData);
-    // NOTE: bun leaves node's `previewEntries(mapIter, true)` commented out
-    // (ConsoleObject.ts:747-751), so a Map ITERATOR is never split into
-    // Key/Values columns — it falls through to the set-like branch below and
-    // each entry renders as a whole `[ k, v ]` array. Only a live Map takes the
-    // three-column form.
     if (T.isMap(tabularData)) {
       const keys = [], values = [];
       let length = 0;
       for (const entry of tabularData) { keys.push(_inspect(entry[0])); values.push(_inspect(entry[1])); length++; }
       return final([iterKey, keyKey, valuesKey], [getIndexArray(length), keys, values]);
     }
-    if (T.isSetIterator(tabularData) || mapIter || T.isSet(tabularData)) {
+    if (mapIter) {
+      // node splits a Map ITERATOR into Key/Values only when it yields PAIRS:
+      // `previewEntries(tabularData, true)[1]` (isKeyValue) is true for
+      // Map#entries, false for Map#keys/#values. previewEntries is a V8
+      // debug-API intrinsic with no JS equivalent (bun leaves the branch
+      // commented out, ConsoleObject.ts:747-751), so recover the distinction
+      // from what the iterator yields: entries yields two-element arrays.
+      const items = [];
+      for (const v of tabularData) items.push(v);
+      const isKeyValue = items.length > 0 &&
+        items.every((v) => Array.isArray(v) && v.length === 2);
+      if (isKeyValue) {
+        return final([iterKey, keyKey, valuesKey], [
+          getIndexArray(items.length),
+          items.map((e) => _inspect(e[0])),
+          items.map((e) => _inspect(e[1])),
+        ]);
+      }
+      return final([iterKey, valuesKey],
+                   [getIndexArray(items.length), items.map((v) => _inspect(v))]);
+    }
+    if (T.isSetIterator(tabularData) || T.isSet(tabularData)) {
       const values = [];
       let length = 0;
       for (const v of tabularData) { values.push(_inspect(v)); length++; }
