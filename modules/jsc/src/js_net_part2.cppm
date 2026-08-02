@@ -2457,34 +2457,51 @@ export constexpr std::string_view kNetJS_part2 = R"JS(
     return new Promise((resolve, reject) => {
       let session;
       let stream;
-      let responseHeaders = null;
-      let settled = false;
-      const responseChunks = [];
+      let headResolved = false;
+      let redirecting = false;
+      let bodyController = null;
+      let bodyDone = false;
       let onAbort;
-      const cleanup = () => {
+      const release = () => {
         if (signal && onAbort) {
           try { signal.removeEventListener("abort", onAbort); } catch (e) {}
+          onAbort = null;
         }
         try { if (session && !session.destroyed) session.close(); } catch (e) {}
       };
+      const cancelTransport = () => {
+        try {
+          if (stream && !stream.destroyed) {
+            if (typeof stream.close === "function") stream.close(h2.constants.NGHTTP2_CANCEL);
+            else stream.destroy();
+          }
+        } catch (e) { try { if (stream && !stream.destroyed) stream.destroy(); } catch (e2) {} }
+        release();
+      };
+      const failBody = (error) => {
+        if (bodyDone) return;
+        bodyDone = true;
+        try { if (bodyController) bodyController.error(error); } catch (e) {}
+        cancelTransport();
+      };
       const fail = (error) => {
-        if (settled) return;
-        settled = true;
-        cleanup();
-        try { if (stream && !stream.destroyed) stream.destroy(); } catch (e) {}
-        reject(error);
+        if (redirecting) return;
+        if (!headResolved) {
+          headResolved = true;
+          cancelTransport();
+          reject(error);
+        } else {
+          failBody(error);
+        }
       };
       try {
         session = h2.connect(parsed.origin, connectOptions);
         session.once("error", fail);
         stream = session.request(requestHeaders, { endStream: false });
         stream.once("error", fail);
-        stream.once("response", (headers) => { responseHeaders = headers; });
-        stream.on("data", (chunk) => responseChunks.push(u8(chunk).slice()));
-        stream.once("end", () => {
-          if (settled) return;
-          settled = true;
-          cleanup();
+        stream.once("aborted", () => fail(mkErr("HTTP/2 response stream was aborted", "ECONNRESET")));
+        stream.once("response", (responseHeaders) => {
+          if (headResolved || redirecting) return;
           const status = Number(responseHeaders && responseHeaders[":status"]) || 200;
           const headers = new G.Headers();
           if (responseHeaders) {
@@ -2495,14 +2512,20 @@ export constexpr std::string_view kNetJS_part2 = R"JS(
               else if (value !== undefined) headers.append(name, String(value));
             }
           }
-          const bytes = concatU8(responseChunks);
           const location = headers.get("location");
           if (location && (status === 301 || status === 302 || status === 303 ||
                            status === 307 || status === 308)) {
             const mode = (init && init.redirect) || "follow";
-            if (mode === "error") { reject(new TypeError("fetch redirect is not allowed")); return; }
+            if (mode === "error") {
+              headResolved = true;
+              cancelTransport();
+              reject(new TypeError("fetch redirect is not allowed"));
+              return;
+            }
             if (mode === "follow") {
               if (bodyIsStream && status !== 303) {
+                headResolved = true;
+                cancelTransport();
                 reject(new TypeError("Cannot follow redirect with a streaming request body"));
                 return;
               }
@@ -2525,6 +2548,10 @@ export constexpr std::string_view kNetJS_part2 = R"JS(
                 nextHeaders.delete("content-type");
               }
               nextInit.headers = nextHeaders;
+              // WHATWG redirect fetch acts on response metadata. Do not drain an
+              // attacker-controlled or long-lived redirect body before following.
+              redirecting = true;
+              cancelTransport();
               doFetchH2(next, nextInit, depth + 1).then((res) => {
                 res.redirected = true;
                 resolve(res);
@@ -2532,9 +2559,53 @@ export constexpr std::string_view kNetJS_part2 = R"JS(
               return;
             }
           }
-          const response = new G.Response(bytes, { status, statusText: "", headers });
+
+          const rawBody = new G.ReadableStream({
+            start(controller) {
+              bodyController = controller;
+              stream.on("data", (chunk) => {
+                if (bodyDone) return;
+                try {
+                  controller.enqueue(u8(chunk).slice());
+                  if (controller.desiredSize !== null && controller.desiredSize <= 0 &&
+                      typeof stream.pause === "function") stream.pause();
+                } catch (error) { failBody(error); }
+              });
+              stream.once("end", () => {
+                if (bodyDone) return;
+                bodyDone = true;
+                try { controller.close(); } catch (e) {}
+                release();
+              });
+              stream.once("close", () => {
+                if (!bodyDone) failBody(mkErr("HTTP/2 response stream closed before END_STREAM", "ECONNRESET"));
+              });
+            },
+            pull() {
+              if (!bodyDone && stream && typeof stream.resume === "function") stream.resume();
+            },
+            cancel() {
+              if (!bodyDone) bodyDone = true;
+              cancelTransport();
+            },
+          });
+          let responseBody = rawBody;
+          const encoding = String(headers.get("content-encoding") || "").trim().toLowerCase();
+          if (encoding && encoding !== "identity" && (!init || init.decompress !== false)) {
+            const format = encoding === "x-gzip" ? "gzip" : encoding;
+            if (format === "gzip" || format === "deflate" || format === "br" || format === "zstd") {
+              try { responseBody = rawBody.pipeThrough(new G.DecompressionStream(format)); }
+              catch (error) { fail(error); return; }
+              headers.delete("content-encoding");
+              headers.delete("content-length");
+            }
+          }
+          let response;
+          try { response = new G.Response(responseBody, { status, statusText: "", headers }); }
+          catch (error) { fail(error); return; }
           response.url = parsed.href;
           response.redirected = depth > 0;
+          headResolved = true;
           resolve(response);
         });
         if (signal && typeof signal.addEventListener === "function") {

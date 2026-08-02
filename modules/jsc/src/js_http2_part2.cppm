@@ -1357,6 +1357,7 @@ export constexpr std::string_view kHttp2JS_part2 = R"JS(
           if (!self._state.didRead && !(self._readableState && self._readableState.resumeScheduled)) self.resume();
         }
         stream._proxySocket = null;
+        stream._compatRequest = undefined;
         self.emit("close");
       });
       stream.on("timeout", () => self.emit("timeout"));

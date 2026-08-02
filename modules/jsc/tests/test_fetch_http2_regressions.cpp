@@ -142,6 +142,149 @@ int main() {
         expect(result.has_value() && *result == "strip|identity|mtls-ok",
                "HTTP2 redirect and TLS policies are enforced (got '" + result.value_or("<eval failed>") + "')");
     }
+
+    auto streamingSetup { eval(R"MJS(
+      globalThis.__h2StreamingDone = 0;
+      globalThis.__h2StreamingResult = "";
+      globalThis.__h2StreamingError = "";
+      (async () => {
+        try {
+          const http2 = require("node:http2");
+          const fs = require("node:fs");
+          const zlib = require("node:zlib");
+          const harnessPath = fs.realpathSync(process.cwd() + "/compat/bun/test/harness.ts");
+          const harness = fs.readFileSync(harnessPath, "utf8");
+          const tlsBlock = harness.slice(harness.indexOf("export const tls"), harness.indexOf("export const invalidTls"));
+          const tls = {
+            cert: JSON.parse(/cert: ("[^"]+")/.exec(tlsBlock)[1]),
+            key: JSON.parse(/key: ("[^"]+")/.exec(tlsBlock)[1]),
+          };
+          const listen = (server) => new Promise((resolve, reject) => {
+            server.once("error", reject);
+            server.listen(0, "127.0.0.1", resolve);
+          });
+          const close = (server) => new Promise((resolve) => server.close(resolve));
+          const origin = (server) => `https://localhost:${server.address().port}`;
+          const delay = (ms, value) => new Promise((resolve) => setTimeout(resolve, ms, value));
+          const fetchH2 = (url, init) => fetch(url, {
+            ...(init || {}), protocol: "h2", tls: { rejectUnauthorized: false },
+          });
+          const out = [];
+
+          const delayed = http2.createSecureServer({ key: tls.key, cert: tls.cert });
+          delayed.on("stream", (stream) => {
+            stream.respond({ ":status": 200, "content-type": "text/event-stream" });
+            stream.write("a");
+            setTimeout(() => stream.end("b"), 350);
+          });
+          await listen(delayed);
+          const delayedFetch = fetchH2(origin(delayed));
+          const headWinner = await Promise.race([
+            delayedFetch.then(() => "head"),
+            delay(150, "late"),
+          ]);
+          const delayedResponse = await delayedFetch;
+          const delayedText = await delayedResponse.text();
+          out.push(headWinner, delayedText);
+          await close(delayed);
+
+          const redirectDestination = http2.createSecureServer({ key: tls.key, cert: tls.cert });
+          redirectDestination.on("stream", (stream) => {
+            stream.respond({ ":status": 200 });
+            stream.end("redirect-ok");
+          });
+          await listen(redirectDestination);
+          const redirectSource = http2.createSecureServer({ key: tls.key, cert: tls.cert });
+          let hangingRedirectStream;
+          redirectSource.on("stream", (stream) => {
+            hangingRedirectStream = stream;
+            stream.on("error", () => {});
+            stream.respond({ ":status": 302, location: origin(redirectDestination) });
+            stream.write("body-that-never-ends");
+          });
+          await listen(redirectSource);
+          const followed = fetchH2(origin(redirectSource)).then((response) => response.text(), () => "redirect-error");
+          const redirectWinner = await Promise.race([followed, delay(250, "redirect-timeout")]);
+          out.push(redirectWinner);
+          if (hangingRedirectStream && !hangingRedirectStream.destroyed) hangingRedirectStream.close(http2.constants.NGHTTP2_CANCEL);
+          await close(redirectSource);
+          await close(redirectDestination);
+
+          const gzip = http2.createSecureServer({ key: tls.key, cert: tls.cert });
+          gzip.on("stream", (stream) => {
+            const body = zlib.gzipSync("hello-h2");
+            stream.respond({
+              ":status": 200,
+              "content-encoding": "gzip",
+              "content-length": String(body.length),
+            });
+            stream.end(body);
+          });
+          await listen(gzip);
+          const gzipResponse = await fetchH2(origin(gzip));
+          const gzipText = await gzipResponse.text();
+          out.push(gzipText === "hello-h2" &&
+            gzipResponse.headers.get("content-encoding") === null &&
+            gzipResponse.headers.get("content-length") === null ? "gzip" : "raw-gzip");
+          await close(gzip);
+
+          const cancelServer = http2.createSecureServer({ key: tls.key, cert: tls.cert });
+          let cancelObserved = Promise.withResolvers();
+          let cancelStream;
+          cancelServer.on("stream", (stream) => {
+            cancelStream = stream;
+            stream.on("error", () => {});
+            stream.on("close", () => cancelObserved.resolve("cancel"));
+            stream.respond({ ":status": 200 });
+            stream.write("event");
+          });
+          await listen(cancelServer);
+          const cancelResponse = await Promise.race([fetchH2(origin(cancelServer)), delay(250, null)]);
+          if (cancelResponse) {
+            await cancelResponse.body.cancel("stop");
+            out.push(await Promise.race([cancelObserved.promise, delay(250, "cancel-timeout")]));
+          } else {
+            out.push("cancel-head-timeout");
+            if (cancelStream && !cancelStream.destroyed) cancelStream.close(http2.constants.NGHTTP2_CANCEL);
+          }
+          await close(cancelServer);
+
+          const errorServer = http2.createSecureServer({ key: tls.key, cert: tls.cert });
+          errorServer.on("stream", (stream) => {
+            stream.on("error", () => {});
+            stream.respond({ ":status": 200 });
+            stream.write("partial");
+            setTimeout(() => stream.close(http2.constants.NGHTTP2_INTERNAL_ERROR), 20);
+          });
+          await listen(errorServer);
+          let bodyError = "body-resolved";
+          try {
+            const errorResponse = await fetchH2(origin(errorServer));
+            try { await errorResponse.text(); }
+            catch (error) { bodyError = "body-error"; }
+          } catch (error) {
+            bodyError = "fetch-error";
+          }
+          out.push(bodyError);
+          await close(errorServer);
+
+          globalThis.__h2StreamingResult = out.join("|");
+        } catch (error) {
+          globalThis.__h2StreamingError = String((error && error.stack) || error);
+        }
+        globalThis.__h2StreamingDone = 1;
+      })();
+    )MJS") };
+    expect(streamingSetup.has_value(), "HTTP2 streaming regression script evaluates");
+    if (streamingSetup.has_value()) {
+        pump_event_loop("globalThis.__h2StreamingDone");
+        const auto error { eval_to_string("globalThis.__h2StreamingError") };
+        expect(error.has_value() && error->empty(),
+               "HTTP2 streaming regression ran without harness errors: " + error.value_or("<eval failed>"));
+        const auto result { eval_to_string("globalThis.__h2StreamingResult") };
+        expect(result.has_value() && *result == "head|ab|redirect-ok|gzip|cancel|body-error",
+               "HTTP2 fetch resolves on headers and streams decoded bodies (got '" + result.value_or("<eval failed>") + "')");
+    }
 #endif
 
     if (gFailed != 0) {
