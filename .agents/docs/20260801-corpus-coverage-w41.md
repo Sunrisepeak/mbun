@@ -354,6 +354,7 @@ the observed Linux limits; the coordinator owns the only root build.
 | W406 | Node HTTP/2 NGHTTP2 error-code mapping revalidation | 5 | first five-job wave 5/5 pass; sixth confirmation 1/1 pass; 0 timeout; no build | inventory cause is stale on the current Linux build; no source owner and no speculative change |
 | W407 | Node HTTP/2 server trailer max-block error source fix | 5 | baseline focused target timeout; direct frame-error lifecycle primitive passed; after fix focused target 1/1 pass; W404 regression 5/5 pass; W403 regression 5/5 pass; serial release builds 59.72s + 59.49s | reject server trailer blocks above default/explicit `maxSendHeaderBlockLength` before CONTINUATION splitting, emit `frameError`, reset with `NGHTTP2_FRAME_SIZE_ERROR`, and gracefully close the session |
 | W408 | Node HTTP/2 socket proxy and Timer/TimersList shape source fix | 5 | baseline owner selector 4/5 pass + 1 fail at timer inspect; focused target 1/1 pass; final proxy/socket regression 5/5 pass; independent timer guards 5/5 pass; `test-timers-refresh.js` remains an independent internal-timer-pump failure; final serial release build 59.51s | expose Node-shaped `TimersList` links and inspect output, preserve timer ref state across refresh, expose handle `hasRef()`, ignore user-mutated public socket writable/readable flags when framing, and return `undefined` from `session.socket` after teardown |
+| W409 | Node WebCrypto internal/global constructor identity source fix | 5 | fresh W329 probe 3/5 pass + 2 fail; focused target 1/1 pass; W409 five-file regression 5/5 pass; post W329 selector 4/5 pass with only console warning-order owner; serial release build 58.97s | publish the runtime-owned `Crypto`, `CryptoKey`, `SubtleCrypto`, and `crypto` objects from `internal/crypto/webcrypto`; keep global-console warning ordering as a separate owner |
 
 ## W305 Bun/Deno Event/Performance/URL/crypto leaf probe
 
@@ -1992,6 +1993,26 @@ no-op, which leaves compat `setUnrefTimeout()` outside the runtime pump; that
 is a separate internal-timer integration owner. The final serial release build
 took **59.51s**. No upstream fixture changed and no full corpus/workspace-wide
 test ran.
+
+## W409 Node WebCrypto internal/global constructor identity source fix
+
+The fresh W329 five-file probe measured **3/5 passes, 2 failures, and 0
+timeouts**. The HTTP invalid-path, HTTPS Agent constructor, and MessageEvent
+brand checks passed. The two failures were separate: the internal WebCrypto
+module exported constructors different from the global runtime constructors,
+and the global-console test observed the warning write in the wrong order.
+
+`module_loading.inc` now keeps the vendored `internal/crypto/webcrypto`
+implementation but republishes its public `Crypto`, `CryptoKey`,
+`SubtleCrypto`, and `crypto` exports from the runtime-owned global objects.
+This closes the identity boundary without changing the vendored fixture or
+the WebCrypto algorithm implementation. The focused identity file moved to
+**1/1 pass**. A five-file regression wave containing the target plus two W408
+HTTP/2 guards and two W408 timer guards was **5/5 pass, 0 fail, 0 timeout**.
+The original W329 selector then measured **4/5 pass, 1 fail, 0 timeout**; only
+`test-global-console-exists.js` remains red on its independent warning-order
+owner. The serial release build took **58.97s**. No upstream fixture changed
+and no full corpus/workspace-wide test ran.
 
 ## W401 Node fs flush revalidation
 

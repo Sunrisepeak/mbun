@@ -5,6 +5,13 @@
 
 ## 2026-08-02
 
+- W409 Node WebCrypto internal/global constructor identity source fix：loader 保留 vendored
+  `internal/crypto/webcrypto` 的实现，但把 `Crypto`、`CryptoKey`、`SubtleCrypto` 与 `crypto`
+  的公开导出统一到 runtime-owned global 对象。fresh W329 probe 从 **3/5 pass、2 fail** 到
+  post selector **4/5 pass、1 fail、0 timeout**，剩余仅为独立的 global-console warning-order owner；
+  focused WebCrypto **1/1 pass**，W409 五文件回归 **5/5 pass、0 fail、0 timeout**，serial release
+  build **58.97s**。未修改 upstream fixture、未跑全量 corpus。
+
 - W408 Node HTTP/2 socket proxy and Timer/TimersList shape source fix：修复 Node `Timeout` 的
   `TimersList` 链接/inspect 形状、refresh 后 ref 状态与 interval 同延迟重排；补齐 TCP/server handle
   `hasRef()`，让 HTTP/2 framing 使用内部 shutdown 状态而不是可被用户改写的 public `writable/readable`，并在
