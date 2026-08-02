@@ -515,9 +515,16 @@ inline constexpr std::string_view kNodeTestRunJS = R"JS(
       // `given` is what the caller wrote (node names the file test with it);
       // `files` is what gets executed.
       const files = given.map((f) => (path.isAbsolute(f) ? f : path.resolve(cwd, f)));
-      // node lib/internal/test_runner/tag_filter.js: an include filter keeps a
-      // test whose flattened tag set matches any filter (`db:*` is a prefix
-      // wildcard); everything untagged is dropped.
+      // PORT-SOURCE: node lib/internal/test_runner/tag_filter.js
+      // evaluateTagFilters(). Filters are LITERAL lowercased tag names and
+      // compose by AND -- `--experimental-test-tag-filter=db
+      // --experimental-test-tag-filter=integration` keeps only a test carrying
+      // both. mbun ORed them and additionally honoured a `db:*` prefix
+      // wildcard; neither exists upstream, so `db:postgres` was treated as a
+      // `db` match and repeated flags widened the selection instead of
+      // narrowing it (test-runner-tag-filter-cli's "repeated ... ANDs
+      // together"). An untagged test has an empty tag set and so fails any
+      // non-empty filter, which is what drops it.
       const tagFilters = options.testTagFilters === undefined ? null
         : (Array.isArray(options.testTagFilters) ? options.testTagFilters : [options.testTagFilters])
             .map((t) => String(t).toLowerCase());
@@ -525,12 +532,9 @@ inline constexpr std::string_view kNodeTestRunJS = R"JS(
         if (tagFilters === null) return true;
         if (!Array.isArray(tags)) return false;
         for (const filter of tagFilters) {
-          for (const tag of tags) {
-            if (tag === filter) return true;
-            if (filter.endsWith(":*") && tag.startsWith(filter.slice(0, -1))) return true;
-          }
+          if (!tags.includes(filter)) return false;
         }
-        return false;
+        return true;
       };
       const namePatterns = options.testNamePatterns === undefined ? null
         : (Array.isArray(options.testNamePatterns) ? options.testNamePatterns : [options.testNamePatterns]).map(toRegExp);
@@ -558,12 +562,25 @@ inline constexpr std::string_view kNodeTestRunJS = R"JS(
             namePatterns !== null && !namePatterns.some((re) => re.test(data.name))) {
           return;
         }
-        if ((type === "test:pass" || type === "test:fail") && skipPatterns !== null &&
-            skipPatterns.some((re) => re.test(data.name))) {
+        // Same invisibility rule as the tag filter below: a skip-patterned test
+        // that still emitted test:start left its `# Subtest: <name>` line in
+        // the TAP output, so `--test-skip-pattern=/flaky/` produced a correct
+        // `# pass 2` over output that still contained "db flaky".
+        if ((type === "test:pass" || type === "test:fail" || type === "test:start" ||
+             type === "test:enqueue" || type === "test:dequeue") &&
+            skipPatterns !== null && skipPatterns.some((re) => re.test(data.name))) {
           return;
         }
+        // A tag-filtered test must be INVISIBLE, not merely unreported: node
+        // never starts it, so it produces no lifecycle event at all. Dropping
+        // only the terminal events still let the TAP reporter print the
+        // `# Subtest: <name>` line it writes on test:start, so a run filtered
+        // to `db` still named `unit only` and `untagged` in its output and the
+        // corpus' `assert.doesNotMatch` checks failed on a run whose PASS COUNT
+        // was already correct.
         if (tagFilters !== null &&
-            (type === "test:pass" || type === "test:fail" || type === "test:complete") &&
+            (type === "test:pass" || type === "test:fail" || type === "test:complete" ||
+             type === "test:start" || type === "test:enqueue" || type === "test:dequeue") &&
             !matchesTags(data.tags)) {
           return;
         }
@@ -860,7 +877,21 @@ inline constexpr std::string_view kNodeTestRunJS = R"JS(
         const patterns = [];
         const skipPatterns = [];
         const tagFilters = [];
-        const take = (i, inline) => (inline !== undefined ? inline : flags[i + 1]);
+        // node's C++ option parser (src/node_options.cc) rejects an option
+        // declared as taking a string when the `=` form supplies nothing:
+        // `--experimental-test-tag-filter=` exits non-zero with
+        // "<flag> requires an argument" on stderr rather than running with an
+        // empty filter. mbun pushed the empty string into the filter list, so
+        // the run succeeded and filtered nothing.
+        const take = (i, inline) => {
+            if (inline === "") {
+                const exe = (G.process.argv && G.process.argv[0]) || "mbun";
+                G.process.stderr.write(exe + ": " + flags[i].slice(0, flags[i].indexOf("=")) +
+                                       " requires an argument\n");
+                G.process.exit(9);
+            }
+            return inline !== undefined ? inline : flags[i + 1];
+        };
         for (let i = 0; i < flags.length; i++) {
             const raw = flags[i];
             const eq = raw.indexOf("=");
