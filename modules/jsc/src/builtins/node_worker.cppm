@@ -1274,6 +1274,84 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
     return (semi === -1 ? meta : meta.slice(0, semi)).trim();
   };
 
+  // ---- which options a worker thread may carry ----------------------------
+  // node's per-isolate + per-environment option table (src/node_options.cc), i.e.
+  // exactly the options whose effect is scoped to one thread. PROCESS-wide
+  // options (--title, --v8-options, --perf-*) and V8 flags (--expose-gc,
+  // --stack-size, --max-old-space-size, --jitless) are deliberately absent:
+  // node refuses them in a worker's execArgv, and "absent from the list" is how
+  // that refusal is spelled here. Underscores are normalised to dashes first,
+  // so `--pending_deprecation` and `--pending-deprecation` are one entry.
+  const WORKER_EXEC_OPTIONS = new Set((
+      "abort-on-uncaught-exception allow-addons allow-child-process allow-fs-read " +
+      "allow-fs-write allow-net allow-wasi allow-worker conditions cpu-prof " +
+      "cpu-prof-dir cpu-prof-interval cpu-prof-name disable-proto disable-sigusr1 " +
+      "disable-warning dns-result-order enable-network-family-autoselection " +
+      "enable-source-maps entry-url env-file env-file-if-exists experimental-abortcontroller " +
+      "experimental-addon-modules experimental-config-file experimental-default-config-file " +
+      "experimental-detect-module experimental-eventsource experimental-import-meta-resolve " +
+      "experimental-json-modules experimental-loader experimental-modules " +
+      "experimental-network-imports experimental-permission experimental-print-required-tla " +
+      "experimental-quic experimental-repl-await experimental-require-module " +
+      "experimental-shadow-realm experimental-specifier-resolution experimental-sqlite " +
+      "experimental-strip-types experimental-test-coverage experimental-test-isolation " +
+      "experimental-test-module-mocks experimental-test-snapshots experimental-transform-types " +
+      "experimental-vm-modules experimental-wasi-unstable-preview1 experimental-wasm-modules " +
+      "experimental-webstorage expose-internals force-context-aware " +
+      "force-node-api-uncaught-exceptions-policy frozen-intrinsics " +
+      "heap-prof heap-prof-dir heap-prof-interval heap-prof-name " +
+      "heapsnapshot-near-heap-limit heapsnapshot-signal http-parser " +
+      "icu-data-dir import input-type insecure-http-parser inspect inspect-brk " +
+      "inspect-brk-node inspect-port inspect-publish-uid inspect-wait " +
+      "localstorage-file max-http-header-size napi-modules network-family-autoselection-attempt-timeout " +
+      "no-addons no-async-context-frame no-deprecation no-experimental-detect-module " +
+      "no-experimental-fetch no-experimental-global-customevent " +
+      "no-experimental-global-navigator no-experimental-global-webcrypto " +
+      "no-experimental-repl-await no-experimental-require-module no-experimental-websocket " +
+      "no-experimental-print-required-tla no-extra-info-on-fatal-exception " +
+      "no-force-async-hooks-checks no-global-search-paths no-network-family-autoselection " +
+      "no-use-system-ca no-warnings openssl-config openssl-legacy-provider " +
+      "openssl-shared-config pending-deprecation policy-integrity preserve-symlinks " +
+      "preserve-symlinks-main prof-process redirect-warnings report-compact report-dir " +
+      "report-directory report-exclude-env report-exclude-network report-filename " +
+      "report-on-fatalerror report-on-signal report-signal report-uncaught-exception " +
+      "require secure-heap secure-heap-min snapshot-blob test test-concurrency " +
+      "test-coverage-branches test-coverage-exclude test-coverage-functions " +
+      "test-coverage-include test-coverage-lines test-force-exit test-name-pattern " +
+      "test-only test-reporter test-reporter-destination test-shard test-skip-pattern " +
+      "test-timeout test-udp-no-try-send throw-deprecation tls-cipher-list tls-keylog " +
+      "tls-max-v1.2 tls-max-v1.3 tls-min-v1.0 tls-min-v1.1 tls-min-v1.2 tls-min-v1.3 " +
+      "trace-atomics-wait trace-deprecation trace-env trace-env-js-stack " +
+      "trace-env-native-stack trace-event-categories trace-event-file-pattern " +
+      "trace-events-enabled trace-exit trace-promises trace-require-module trace-sigint " +
+      "trace-sync-io trace-tls trace-uncaught trace-warnings track-heap-objects " +
+      "unhandled-rejections use-bundled-ca use-largepages use-openssl-ca use-system-ca " +
+      "watch watch-path watch-preserve-output zero-fill-buffers " +
+      // Short spellings node's parser accepts, plus the bun-side per-thread
+      // flags mbun answers to (worker_threads is a surface bun implements too).
+      "r C smol user-agent").split(" "));
+  // Options that are meaningless without an argument; node's parser reports
+  // `<option> requires an argument` and the Worker constructor turns that into
+  // ERR_WORKER_INVALID_EXEC_ARGV (test-worker-execargv-invalid's
+  // `--redirect-warnings`).
+  const WORKER_EXEC_OPTIONS_WITH_VALUE = new Set((
+      "conditions cpu-prof-dir cpu-prof-interval cpu-prof-name disable-warning " +
+      "dns-result-order entry-url env-file env-file-if-exists experimental-loader " +
+      "experimental-specifier-resolution heap-prof-dir heap-prof-interval heap-prof-name " +
+      "heapsnapshot-near-heap-limit heapsnapshot-signal icu-data-dir import input-type " +
+      "localstorage-file max-http-header-size network-family-autoselection-attempt-timeout " +
+      "openssl-config policy-integrity redirect-warnings report-dir report-directory " +
+      "report-filename report-signal require secure-heap secure-heap-min snapshot-blob " +
+      "test-concurrency test-coverage-exclude test-coverage-include test-name-pattern " +
+      "test-reporter test-reporter-destination test-shard test-skip-pattern test-timeout " +
+      "tls-cipher-list tls-keylog trace-event-categories trace-event-file-pattern " +
+      "unhandled-rejections watch-path").split(" "));
+  const invalidExecArgv = (what, tok) => {
+    const e = new Error("Initiated Worker with invalid " + what + ": " + tok);
+    e.code = "ERR_WORKER_INVALID_EXEC_ARGV";
+    return e;
+  };
+
   // node ERR_WORKER_PATH: a bare specifier is not a worker entry point.
   const workerEntryPath = (filename) => {
     let p = filename;
@@ -1534,6 +1612,51 @@ inline constexpr std::string_view kNodeWorkerJS = R"JS(
       if (options.execArgv !== undefined && options.execArgv !== null && !Array.isArray(options.execArgv)) {
         const e = new TypeError('The "options.execArgv" property must be an instance of Array. Received ' + recvType(options.execArgv));
         e.code = "ERR_INVALID_ARG_TYPE"; throw e;
+      }
+      // node runs the execArgv array through its OWN option parser before the
+      // thread exists (src/node_worker.cc Worker::New -> ParsePerIsolateOptions),
+      // and rejects the whole construction with ERR_WORKER_INVALID_EXEC_ARGV if
+      // any token is not an option a thread may carry. Three distinct things are
+      // refused and the corpus asserts all three: an option node does not know
+      // at all (`--foo`), an option that is PROCESS-wide rather than per-thread
+      // (`--title=blah` renames the whole process), and a V8 option (`--expose-gc`
+      // — V8 flags are set on the isolate at creation and a worker inherits the
+      // parent's, so passing one per-worker is meaningless). A fourth case is an
+      // option that is legal but was given without its required value
+      // (`--redirect-warnings` needs a file). mbun spawns the worker as a CHILD
+      // PROCESS, so it used to hand the array straight to spawn() and the bad
+      // flag surfaced — if at all — as a dead child much later, never as the
+      // synchronous throw the constructor's contract promises.
+      // Allow-list rather than deny-list, because that is the shape of the
+      // question: "is this one of the options a thread may carry", not "is this
+      // one of the bad ones". Anything not listed is refused.
+      const validateExecArgvList = (list, what) => {
+        for (let i = 0; i < list.length; i++) {
+          const tok = String(list[i]);
+          // A bare token is the VALUE of the option before it (`--require foo`),
+          // never an option itself.
+          if (tok.charCodeAt(0) !== 45 /* - */) continue;
+          const eq = tok.indexOf("=");
+          let name = (eq === -1 ? tok : tok.slice(0, eq));
+          while (name.charCodeAt(0) === 45) name = name.slice(1);
+          name = name.replace(/_/g, "-");
+          if (!WORKER_EXEC_OPTIONS.has(name)) throw invalidExecArgv(what, tok);
+          // Needs a value and got none, and there is no following token to take
+          // it from.
+          if (eq === -1 && WORKER_EXEC_OPTIONS_WITH_VALUE.has(name) &&
+              (i + 1 >= list.length || String(list[i + 1]).charCodeAt(0) === 45)) {
+            throw invalidExecArgv(what, tok);
+          }
+        }
+      };
+      if (Array.isArray(options.execArgv)) validateExecArgvList(options.execArgv.map(String), "execArgv flags");
+      // NODE_OPTIONS travels in the worker's env, and node parses it with the
+      // same table before the thread starts — an unparseable NODE_OPTIONS is the
+      // same ERR_WORKER_INVALID_EXEC_ARGV. Only an EXPLICIT env is checked: an
+      // inherited one already survived this process's own startup.
+      if (options.env && options.env !== SHARE_ENV && typeof options.env.NODE_OPTIONS === "string") {
+        validateExecArgvList(options.env.NODE_OPTIONS.split(/\s+/).filter((s) => s !== ""),
+                             "NODE_OPTIONS env variable");
       }
       // Serialise BEFORE the structuredClone check: the encoder is what knows
       // about the transfer list, and it owns the "needs transfer but was not
