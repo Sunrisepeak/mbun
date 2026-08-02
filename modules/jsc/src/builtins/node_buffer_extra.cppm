@@ -110,6 +110,32 @@ inline constexpr std::string_view kNodeBufferExtraJS = R"JS(
     // V8-compatible string cap and the existing compatibility buffer value.
     const bunDialect = G.__mbunDialect !== "node";
     const MAX_STRING_LENGTH = bunDialect ? 0x7fffffff : 536870888;
+    // JavaScriptCore accepts strings beyond Node's published V8 cap. Keep the
+    // node:buffer value and the observable String.prototype.repeat() boundary
+    // coherent without changing Bun's native dialect.
+    if (!bunDialect && typeof String.prototype.repeat === "function") {
+      const originalStringRepeat = String.prototype.repeat;
+      Object.defineProperty(String.prototype, "repeat", {
+        value: function repeat(count) {
+          if (this == null) return originalStringRepeat.call(this, count);
+          const text = String(this);
+          // Unary + performs the spec's ToNumber exactly once: objects retain
+          // their coercion side effects, while Symbol and BigInt still throw.
+          // Pass the resulting primitive to JSC so it cannot coerce count again.
+          const number = +count;
+          const repetitions = Number.isNaN(number) ? 0
+            : (number < 0 ? Math.ceil(number) : Math.floor(number));
+          if (repetitions > 0 && text.length > 0 &&
+              repetitions > MAX_STRING_LENGTH / text.length) {
+            throw new RangeError("Invalid string length");
+          }
+          return originalStringRepeat.call(text, repetitions);
+        },
+        writable: true,
+        enumerable: false,
+        configurable: true,
+      });
+    }
     const errStringTooLong = () => {
       const e = new Error("Cannot create a string longer than " + MAX_STRING_LENGTH + " characters");
       e.code = "ERR_STRING_TOO_LONG";

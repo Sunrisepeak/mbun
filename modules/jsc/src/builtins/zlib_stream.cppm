@@ -32,6 +32,37 @@ inline constexpr std::string_view kZlibStreamJS = R"JS(
   const zmod = M["zlib"] || M["node:zlib"];
   const streamMod = M["stream"] || M["node:stream"];
   if (!zmod || !streamMod || !streamMod.Transform) return;
+  // Node captures buffer.kMaxLength when require('zlib') initializes its module.
+  // mbun pre-registers native modules at bootstrap, so retain the same visible
+  // load edge with an accessor that arms the cap whenever zlib is required.
+  let zlibMaxOutputLength = 0x7fffffff;
+  const armZlibMaxOutputLength = () => {
+    const bufferModule = M["buffer"] || M["node:buffer"];
+    const value = bufferModule && bufferModule.kMaxLength;
+    if (typeof value === "number" && Number.isFinite(value) && value > 0)
+      zlibMaxOutputLength = value;
+    return zmod;
+  };
+  const zlibArmFailures = [];
+  for (const name of ["zlib", "node:zlib"]) {
+    try {
+      Object.defineProperty(M, name, {
+        get: armZlibMaxOutputLength,
+        enumerable: true,
+        configurable: true,
+      });
+      if (Object.getOwnPropertyDescriptor(M, name).get !== armZlibMaxOutputLength)
+        throw new Error("accessor was not installed");
+    } catch (error) {
+      zlibArmFailures.push(name + ": " + ((error && error.message) || String(error)));
+    }
+  }
+  // Bootstrap must remain usable if an embedding freezes its registry, but the
+  // missed require edge must never be silent: embedders/tests can inspect this
+  // stable diagnostic and fail deterministically.
+  if (zlibArmFailures.length)
+    G.__mbunZlibArmError = zlibArmFailures.join("; ");
+  G.__mbunZlibArmKMax = armZlibMaxOutputLength;
   const Transform = streamMod.Transform;
   const finished = streamMod.finished;
   const Buffer = G.Buffer;
@@ -715,6 +746,23 @@ inline constexpr std::string_view kZlibStreamJS = R"JS(
     zstdDecompressSync: { kind: K_ZDEC, Engine: ZstdDecompress },
   };
   const asyncOf = { inflateSync: "inflate", inflateRawSync: "inflateRaw", gunzipSync: "gunzip", unzipSync: "unzip", brotliDecompressSync: "brotliDecompress", zstdDecompressSync: "zstdDecompress" };
+  const nativeDecodeOpts = (opts) => {
+    if (opts === undefined || opts === null || typeof opts === "object") {
+      const nativeOpts = opts && typeof opts === "object" ? Object.create(opts) : {};
+      // Resolve an explicit getter once, then shadow it on the derived object;
+      // the native helper cannot trigger a second coercion or mutate the caller.
+      const explicitMax = opts && typeof opts === "object" ? opts.maxOutputLength : undefined;
+      Object.defineProperty(nativeOpts, "maxOutputLength", {
+        value: explicitMax === undefined ? zlibMaxOutputLength : explicitMax,
+        writable: true,
+        enumerable: true,
+        configurable: true,
+      });
+      return nativeOpts;
+    }
+    // Preserve the native type error for invalid primitive options.
+    return opts;
+  };
   for (const name of Object.keys(decoderOneShots)) {
     const cfg = decoderOneShots[name];
     const orig = zmod[name];
@@ -726,7 +774,7 @@ inline constexpr std::string_view kZlibStreamJS = R"JS(
         const buf = decodeThroughHandle(cfg, data, opts, F_SYNC);
         return opts.info ? { buffer: buf, engine: Object.create(cfg.Engine.prototype) } : buf;
       }
-      try { return orig(data, opts); }
+      try { return orig(data, nativeDecodeOpts(opts)); }
       catch (e) {
         // The whole-buffer natives collapse every decode failure into one generic
         // message; node distinguishes truncated input ("unexpected end of file")
