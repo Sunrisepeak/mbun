@@ -1419,6 +1419,7 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
         };
         const CAT_ASYNC = "node,node.async_hooks";
         const CAT_CONSOLE = "node,node.console";
+        const CAT_ENV = "node,node.environment";
         const CAT_TP_ASYNC = "node,node.threadpoolwork,node.threadpoolwork.async";
         const CAT_TP_SYNC = "node,node.threadpoolwork,node.threadpoolwork.sync";
         let timersInstrumented = false, consoleInstrumented = false, poolInstrumented = false;
@@ -1445,15 +1446,24 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
             const wrapped = function (callback, delay) {
               const rest = Array.prototype.slice.call(arguments, 2);
               let span = null;
-              if (typeof callback === "function" && groupEnabled(CAT_ASYNC)) {
-                const asyncId = nextAsyncId++;
-                span = { id: asyncId, open: true };
-                emit("b", CAT_ASYNC, "Timeout", asyncId, { executionAsyncId: 1, triggerAsyncId: 1 });
+              if (typeof callback === "function" && (groupEnabled(CAT_ASYNC) || groupEnabled(CAT_ENV))) {
+                if (groupEnabled(CAT_ASYNC)) {
+                  const asyncId = nextAsyncId++;
+                  span = { id: asyncId, open: true };
+                  emit("b", CAT_ASYNC, "Timeout", asyncId, { executionAsyncId: 1, triggerAsyncId: 1 });
+                }
                 const inner = callback;
                 callback = function () {
+                  // node runs every expired timer callback inside its
+                  // RunTimers phase (src/env.cc RunTimers). This call IS that
+                  // phase for this runtime, so the span is sited on it rather
+                  // than asserted after the fact.
+                  const envTrace = groupEnabled(CAT_ENV);
+                  if (envTrace) emit("b", CAT_ENV, "RunTimers");
                   try { return inner.apply(this, arguments); }
                   finally {
-                    if (!isInterval && span.open) { span.open = false; emit("e", CAT_ASYNC, "Timeout", span.id); }
+                    if (envTrace) emit("e", CAT_ENV, "RunTimers");
+                    if (span && !isInterval && span.open) { span.open = false; emit("e", CAT_ASYNC, "Timeout", span.id); }
                   }
                 };
               }
@@ -1565,6 +1575,55 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
           if (cryptoMod && typeof cryptoMod.hkdf === "function") {
             try { cryptoMod.hkdf = wrap(cryptoMod.hkdf, "crypto"); } catch (e) {}
           }
+        };
+
+        // node.environment: node emits one span per event-loop phase from
+        // src/env.cc. Only the phases this runtime can actually SITE are
+        // emitted -- each one below is attached to the real moment it happens,
+        // never asserted at exit. node's RunAndClearNativeImmediates and
+        // RunCleanup have no counterpart here (no native-immediate queue, no
+        // cleanup-hook phase), so they are simply absent: the category reports
+        // less than node's, but everything it does report occurred.
+        let envInstrumented = false;
+        const installEnvironment = () => {
+          if (envInstrumented) return;
+          envInstrumented = true;
+          // The environment is up and about to run user code; the matching 'e'
+          // goes out at flush, when it is genuinely being torn down.
+          emit("b", CAT_ENV, "Environment");
+          const wrapImmediate = (original) => {
+            if (typeof original !== "function") return original;
+            const wrapped = function (callback) {
+              if (typeof callback !== "function") return original.apply(this, arguments);
+              const rest = Array.prototype.slice.call(arguments, 1);
+              const inner = callback;
+              const traced = function () {
+                // node runs immediate callbacks inside CheckImmediate.
+                const on = groupEnabled(CAT_ENV);
+                if (on) emit("b", CAT_ENV, "CheckImmediate");
+                try { return inner.apply(this, arguments); }
+                finally { if (on) emit("e", CAT_ENV, "CheckImmediate"); }
+              };
+              return original.apply(this, [traced].concat(rest));
+            };
+            for (const key of Reflect.ownKeys(original)) {
+              if (key === "prototype") continue;
+              const d = Object.getOwnPropertyDescriptor(original, key);
+              if (d) { try { Object.defineProperty(wrapped, key, d); } catch (e) {} }
+            }
+            return wrapped;
+          };
+          try { G.setImmediate = wrapImmediate(G.setImmediate); } catch (e) {}
+          // Fires only when the loop actually drains, which is exactly when
+          // node reaches its BeforeExit phase.
+          try {
+            if (typeof proc.on === "function") proc.on("beforeExit", () => {
+              if (groupEnabled(CAT_ENV)) { emit("b", CAT_ENV, "BeforeExit"); emit("e", CAT_ENV, "BeforeExit"); }
+            });
+          } catch (e) {}
+          // Timers are what carry the RunTimers span, so make sure they are
+          // wrapped even when node.async_hooks was never asked for.
+          installTimers();
         };
 
         // node.fs / node.fs_dir: node traces these at its C++ fs binding, one
@@ -1688,6 +1747,7 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
         const installInstrumentation = () => {
           if (groupEnabled(CAT_ASYNC)) installTimers();
           if (groupEnabled(CAT_CONSOLE)) installConsole();
+          if (groupEnabled(CAT_ENV)) installEnvironment();
           if (groupEnabled(CAT_TP_ASYNC) || groupEnabled(CAT_TP_SYNC)) installThreadpool();
           if (groupEnabled(CAT_FS_SYNC) || groupEnabled(CAT_FS_ASYNC) || groupEnabled(CAT_FS_DIR_ASYNC)) installFs();
         };
@@ -1790,6 +1850,13 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
         const flush = () => {
           if (flushed || !writesTrace) return;
           flushed = true;
+          // flush() runs from the 'exit' listener, i.e. inside the phase node
+          // calls AtExit -- so this span is sited on the real teardown, and it
+          // closes the Environment span opened when the environment came up.
+          if (envInstrumented && groupEnabled(CAT_ENV)) {
+            emit("b", CAT_ENV, "AtExit"); emit("e", CAT_ENV, "AtExit");
+            emit("e", CAT_ENV, "Environment");
+          }
           const file = String(pattern || "node_trace.${rotation}.log")
             .replace(/\$\{pid\}/g, String(proc.pid || 0))
             .replace(/\$\{rotation\}/g, "1");
