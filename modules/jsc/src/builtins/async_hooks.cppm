@@ -192,10 +192,46 @@ inline constexpr std::string_view kAsyncHooksJS = R"JS(
   }
 
   // node aborts the process when a hook throws (fatalError -> process.exit).
+  //
+  // This is lib/internal/async_hooks.js fatalError + inspectExceptionValue,
+  // ported rather than approximated, because the printed FIRST LINE is the
+  // contract test-async-hooks-fatal-error checks for each of the five hook
+  // types. A thrown non-Error carries no `.stack`, so node does not print
+  // `String(e)` -- it builds `{ message: inspect(e) }` and captures a stack onto
+  // that plain object, which renders as `Error: null` / `Error: Symbol(foo)`.
+  // The `inspect` step is load-bearing twice over: `String(Symbol('foo'))` is a
+  // TypeError, and `{ message: null }` renders headerless as bare `Error`
+  // because a falsy message is omitted. Passing the *string* from inspect() is
+  // what puts node's exact text after `Error: `.
+  function inspectExceptionValue(e) {
+    let text;
+    try {
+      const util = G.__mbunNativeModules &&
+        (G.__mbunNativeModules.util || G.__mbunNativeModules['node:util']);
+      text = util && typeof util.inspect === 'function' ? util.inspect(e) : undefined;
+    } catch (err) { text = undefined; }
+    if (typeof text !== 'string') {
+      // inspect() is how node renders it; these are its answers for the values
+      // that actually reach here without one.
+      text = typeof e === 'symbol' ? e.toString() :
+        typeof e === 'string' ? "'" + e + "'" : String(e);
+    }
+    return { message: text };
+  }
   function fatalError(e) {
     const p = G.process;
-    if (p && typeof p._rawDebug === 'function') {
-      p._rawDebug(typeof e?.stack === 'string' ? e.stack : String(e));
+    const write = p && typeof p._rawDebug === 'function' ?
+      (s) => p._rawDebug(s) : undefined;
+    if (write !== undefined) {
+      if (e !== null && e !== undefined && typeof e.stack === 'string') {
+        write(e.stack);
+      } else {
+        const o = inspectExceptionValue(e);
+        if (typeof Error.captureStackTrace === 'function') {
+          Error.captureStackTrace(o, fatalError);
+        }
+        write(typeof o.stack === 'string' ? o.stack : 'Error: ' + o.message);
+      }
     }
     if (p && typeof p.exit === 'function') { p.exit(1); }
     throw e;
