@@ -60,6 +60,28 @@ inline constexpr std::string_view kNodeTestRunnerJS = R"JS(
     // ------------------------------------------------------------- mocking
     const makeMock = () => {
       const tracked = [];
+      // PORT-SOURCE: node lib/internal/test_runner/mock/mock_timers.js, loaded
+      // as-is (see the `timers` accessor below for why).
+      const timersStub = { enable() {}, reset() {}, tick() {}, runAll() {}, setTime() {} };
+      let timersInstance;
+      const getTimers = () => {
+        if (timersInstance !== undefined) return timersInstance;
+        timersInstance = timersStub;
+        try {
+          const req = snapshotRequire();
+          if (typeof req === "function") {
+            const mod = req("internal/test_runner/mock/mock_timers");
+            if (mod && typeof mod.MockTimers === "function") timersInstance = new mod.MockTimers();
+          }
+        } catch (e) {}
+        return timersInstance;
+      };
+      // Never instantiates MockTimers just to tear it down: a test that never
+      // touched t.mock.timers must not pay for, or be perturbed by, the module.
+      const disableTimers = () => {
+        if (timersInstance === undefined || timersInstance === timersStub) return;
+        try { timersInstance.reset(); } catch (e) {}
+      };
       const mockFn = (original, implementation, options) => {
         if (typeof original === "object" && original !== null) { options = original; original = undefined; }
         if (typeof implementation === "object" && implementation !== null) { options = implementation; implementation = undefined; }
@@ -156,9 +178,31 @@ inline constexpr std::string_view kNodeTestRunnerJS = R"JS(
         // (test-fs-write-stream-eagain).
         getter: (object, name, implementation, options) => accessor(object, name, "get", implementation, options),
         setter: (object, name, implementation, options) => accessor(object, name, "set", implementation, options),
-        reset: () => { for (const m of tracked) { try { m.resetCalls(); } catch (e) {} } tracked.length = 0; },
+        reset: () => {
+          for (const m of tracked) { try { m.resetCalls(); } catch (e) {} }
+          tracked.length = 0;
+          // node MockTracker#reset(): "restoring all mocks and clearing timers".
+          disableTimers();
+        },
         restoreAll: () => { for (const m of tracked) { try { m.restore(); } catch (e) {} } },
-        timers: { enable() {}, reset() {}, tick() {}, runAll() {}, setTime() {} },
+        // node's MockTracker builds its MockTimers lazily
+        // (mock.js `get timers() { this.#timers ??= new MockTimers(); }`), and
+        // mbun uses node's OWN lib/internal/test_runner/mock/mock_timers.js
+        // rather than a second implementation: it is a self-contained port of
+        // the timer/Date/scheduler faking that only needs the globals it
+        // patches, and it runs on mbun unmodified. This was a no-op stub
+        // ({enable(){}, tick(){}, …}), so every mock-timers test silently ran
+        // against the REAL clock — `t.mock.timers.enable({apis:['Date']})`
+        // followed by `assert.strictEqual(Date.now(), 0)` could never hold.
+        // If the vendored module cannot be loaded the stub is kept, so a build
+        // without the node tree behaves exactly as it did before.
+        get timers() { return getTimers(); },
+        // Per-test cleanup hook (see runNode): node resets the tracker in
+        // Test#postRun, which is what stops a test that faked Date from leaving
+        // every later test in the file frozen at the epoch. Only the timers are
+        // touched here — mbun does not auto-restore method mocks yet, and
+        // starting to would be a separate behaviour change.
+        __resetTimers: disableTimers,
       };
     };
 
@@ -1004,6 +1048,10 @@ inline constexpr std::string_view kNodeTestRunnerJS = R"JS(
         if (emitResult(node, error, context, startedAt)) ok(node.name);
         else if (directive.todo !== undefined) skipped(node.name);
         else fail(node.name, error, true);
+      } finally {
+        // node Test#postRun -> mock.reset(): faked timers belong to the test
+        // that enabled them, never to the rest of the file.
+        try { context.mock.__resetTimers(); } catch (e) {}
       }
     };
 
