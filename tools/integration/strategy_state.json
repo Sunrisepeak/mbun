@@ -187,8 +187,8 @@
       "rate": 0.22
     }
   },
-  "goal_accuracy": 0.5555555555555556,
-  "last_evaluated_wave": "66",
+  "goal_accuracy": 1.6451612903225807,
+  "last_evaluated_wave": "69",
   "modes": {
     "bun": {
       "fraction": 0.276,
