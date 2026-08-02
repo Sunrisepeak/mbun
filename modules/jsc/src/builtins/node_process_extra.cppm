@@ -740,6 +740,13 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
             throw e;
           }
           if (typeof execPath !== "string") throw errInvalidArgType("execPath", "string", execPath);
+          // execve(2) takes a NUL-terminated path, so an embedded NUL would
+          // silently exec a DIFFERENT (prefix) file. bun rejects it up front
+          // (BunProcess.cpp: execPath.contains(u'\0') -> ERR_INVALID_ARG_VALUE);
+          // node's JS layer omits the check and its C++ half truncates. Reject.
+          if (execPath.indexOf("\u0000") !== -1) {
+            throw argValueError("execPath", execPath, "must be a string without null bytes");
+          }
           if (!Array.isArray(args)) throw errInvalidArgType("args", "Array", args);
           for (let i = 0; i < args.length; i++) {
             const arg = args[i];
