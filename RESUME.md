@@ -5,6 +5,34 @@ session that is interrupted (usage limit, crash, restart) can pick up from the
 file rather than from memory. **If you are a fresh session reading this, start
 here.**
 
+## 2026-08-03 — TWO COORDINATOR FAILURES, both from not consulting the record
+
+Both cost a W48 lane real budget, and both are the same mistake: **asking lanes to consult a
+record I did not consult myself.**
+
+**1. Brief `check_struck.py` BEFORE writing a brief, not after.** W48's C1 brief said
+`cli/install` "has never had a lane". `struck.tsv` records that **wave 65 measured all 73
+`cli/install` files end to end**, landed a ~200-line unified install/add argument parser, gained
+**+0 files**, and wrote the explicit conclusion *"do not re-run this vein expecting files; the
+next blocker is per-file feature work."* The W48 lane reproduced that conclusion exactly, at the
+cost of its whole budget. The struck file exists precisely so a vein is retired once, and the
+coordinator is the one who must read it when choosing targets.
+
+For the record, what that group actually has: the only item with more than one file behind it is
+the **security scanner** (absent entirely — 3 manifest files plus 2 matrix files), and the only
+broad correctness item is **workspace-member dependency collection** — `bun install` at a
+workspace root never reads members' `dependencies`/`devDependencies`, so a monorepo installs
+0 packages. That second one is a real defect worth its own lane, but it is an assertion-level
+lane, not a file-count lane: each dependent file needs a second feature behind it.
+
+**2. Gate lists must live in the lane's own worktree, never bare `/tmp`.** A W48 lane reported
+that "the corpus runner mutates the list file passed to `--list`". It does not — the runner
+writes only inside `--out`, and `read_list()` only reads; I checked before propagating it. The
+real cause is that **five concurrent lanes were putting gate lists in shared `/tmp` paths** and
+overwriting each other, which is how a 36-line list came back as 1301 lines and silently scored
+the wrong set. Correcting this mattered twice over: the hazard is real, and the misdiagnosis
+would have made every future lane pay for defensive copies against a bug that does not exist.
+
 ## 2026-08-03 — MANIFEST RULE: an entry must have `ran > 0` AND `failed > 0`
 
 Sorting candidate files by "fewest failing assertions first" is **degenerate**, and it cost a W48
