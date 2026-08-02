@@ -275,6 +275,52 @@ inline constexpr std::string_view kNodeTestRunJS = R"JS(
       });
     }
 
+    // PORT-SOURCE: node lib/internal/test_runner/test.js:1448 — with
+    // `--test-force-exit` the root test exits the process as soon as every
+    // known test and hook has finished, "regardless of any remaining ref'ed
+    // handles", and runner.js getRunArgs() passes the flag down to each child
+    // so an isolated file behaves the same way.
+    //
+    // Without it a test that schedules work and then throws keeps its process
+    // alive until that work runs: throws_sync_and_async.js's stray
+    // setTimeout(1000) threw a second, uncatchable error long after the results
+    // were in, and the parent forwarded it into the report
+    // (test-runner-force-exit-failure asserts that error CANNOT appear).
+    //
+    // node has an explicit end-of-run signal (root.postRun); mbun's standalone
+    // runner has the sequential chain instead, so quiescence is "the chain
+    // settled, and settling it neither appended more work nor registered
+    // another top-level test". A stray timer is not on the chain, which is
+    // exactly why this terminates before it fires.
+    const forceExitRequested = () => {
+      try {
+        const argv = G.process.execArgv;
+        return Array.isArray(argv) && argv.indexOf("--test-force-exit") !== -1;
+      } catch (e) { return false; }
+    };
+    // Only ever in a child: the `--test` parent reaches force exit through its
+    // own path (once every reporter has drained, below), and arming this there
+    // too would exit the runner before it had spawned anything.
+    if (isChild && forceExitRequested()) {
+      const settle = () => {
+        const chain = internals.drain();
+        const topLevel = internals.topLevelCount();
+        chain.then(() => {
+          // One macrotask of slack, so work the just-finished step queued (the
+          // root after() hooks) is on the chain before it is inspected.
+          G.setTimeout(() => {
+            if (internals.drain() === chain && internals.topLevelCount() === topLevel) {
+              try { G.process.exit(G.process.exitCode === undefined ? 0 : G.process.exitCode); } catch (e) {}
+              return;
+            }
+            settle();
+          }, 0);
+        }, () => {});
+      };
+      // Never before the entry file has had a turn to register its tests.
+      try { G.setTimeout(settle, 0); } catch (e) {}
+    }
+
     // An Error does not survive structured cloning with its own fields, and the
     // corpus reads `details.error.message` / `.code` / `.failureType` on the
     // parent side — so flatten it into a plain object the parent re-inflates.
@@ -724,6 +770,11 @@ inline constexpr std::string_view kNodeTestRunJS = R"JS(
       if (options.only) env.NODE_TEST_ONLY = "1";
       const args = [];
       if (Array.isArray(options.execArgv)) args.push(...options.execArgv);
+      // node runner.js getRunArgs(): forceExit travels to the child, which is
+      // the process that actually has to stop early.
+      if (options.forceExit === true && args.indexOf("--test-force-exit") === -1) {
+        args.push("--test-force-exit");
+      }
       args.push(file);
       if (Array.isArray(options.argv)) args.push(...options.argv);
 

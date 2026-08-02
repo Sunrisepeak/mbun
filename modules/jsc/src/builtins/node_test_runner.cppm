@@ -60,6 +60,28 @@ inline constexpr std::string_view kNodeTestRunnerJS = R"JS(
     // ------------------------------------------------------------- mocking
     const makeMock = () => {
       const tracked = [];
+      // PORT-SOURCE: node lib/internal/test_runner/mock/mock_timers.js, loaded
+      // as-is (see the `timers` accessor below for why).
+      const timersStub = { enable() {}, reset() {}, tick() {}, runAll() {}, setTime() {} };
+      let timersInstance;
+      const getTimers = () => {
+        if (timersInstance !== undefined) return timersInstance;
+        timersInstance = timersStub;
+        try {
+          const req = snapshotRequire();
+          if (typeof req === "function") {
+            const mod = req("internal/test_runner/mock/mock_timers");
+            if (mod && typeof mod.MockTimers === "function") timersInstance = new mod.MockTimers();
+          }
+        } catch (e) {}
+        return timersInstance;
+      };
+      // Never instantiates MockTimers just to tear it down: a test that never
+      // touched t.mock.timers must not pay for, or be perturbed by, the module.
+      const disableTimers = () => {
+        if (timersInstance === undefined || timersInstance === timersStub) return;
+        try { timersInstance.reset(); } catch (e) {}
+      };
       const mockFn = (original, implementation, options) => {
         if (typeof original === "object" && original !== null) { options = original; original = undefined; }
         if (typeof implementation === "object" && implementation !== null) { options = implementation; implementation = undefined; }
@@ -156,9 +178,31 @@ inline constexpr std::string_view kNodeTestRunnerJS = R"JS(
         // (test-fs-write-stream-eagain).
         getter: (object, name, implementation, options) => accessor(object, name, "get", implementation, options),
         setter: (object, name, implementation, options) => accessor(object, name, "set", implementation, options),
-        reset: () => { for (const m of tracked) { try { m.resetCalls(); } catch (e) {} } tracked.length = 0; },
+        reset: () => {
+          for (const m of tracked) { try { m.resetCalls(); } catch (e) {} }
+          tracked.length = 0;
+          // node MockTracker#reset(): "restoring all mocks and clearing timers".
+          disableTimers();
+        },
         restoreAll: () => { for (const m of tracked) { try { m.restore(); } catch (e) {} } },
-        timers: { enable() {}, reset() {}, tick() {}, runAll() {}, setTime() {} },
+        // node's MockTracker builds its MockTimers lazily
+        // (mock.js `get timers() { this.#timers ??= new MockTimers(); }`), and
+        // mbun uses node's OWN lib/internal/test_runner/mock/mock_timers.js
+        // rather than a second implementation: it is a self-contained port of
+        // the timer/Date/scheduler faking that only needs the globals it
+        // patches, and it runs on mbun unmodified. This was a no-op stub
+        // ({enable(){}, tick(){}, …}), so every mock-timers test silently ran
+        // against the REAL clock — `t.mock.timers.enable({apis:['Date']})`
+        // followed by `assert.strictEqual(Date.now(), 0)` could never hold.
+        // If the vendored module cannot be loaded the stub is kept, so a build
+        // without the node tree behaves exactly as it did before.
+        get timers() { return getTimers(); },
+        // Per-test cleanup hook (see runNode): node resets the tracker in
+        // Test#postRun, which is what stops a test that faked Date from leaving
+        // every later test in the file frozen at the epoch. Only the timers are
+        // touched here — mbun does not auto-restore method mocks yet, and
+        // starting to would be a separate behaviour change.
+        __resetTimers: disableTimers,
       };
     };
 
@@ -266,6 +310,17 @@ inline constexpr std::string_view kNodeTestRunnerJS = R"JS(
         if (concurrency < 1 || concurrency > 4294967295) {
           throw rangeError("options.concurrency", ">= 1 && <= 4294967295", concurrency);
         }
+      }
+      // node parseExpectFailure() rejects `{}` where the Test is constructed —
+      // an empty configuration cannot mean anything, and treating it as a bare
+      // matcher would silently accept every failure.
+      const expectFailure = opts.expectFailure;
+      if (expectFailure !== null && typeof expectFailure === "object" &&
+          !(expectFailure instanceof RegExp) && Object.keys(expectFailure).length === 0) {
+        const e = new TypeError("The argument 'options.expectFailure' must not be an empty object." +
+                                " Received {}");
+        e.code = "ERR_INVALID_ARG_VALUE";
+        throw e;
       }
     };
     const testAssert = {
@@ -574,6 +629,60 @@ inline constexpr std::string_view kNodeTestRunnerJS = R"JS(
       emit("test:dequeue", e);
       emit("test:start", baseEvent(node));
     };
+    // PORT-SOURCE: node lib/internal/test_runner/test.js parseExpectFailure().
+    // `expectFailure` is not just a flag: a string is a LABEL printed after the
+    // directive, a function/RegExp is a MATCHER the failure has to satisfy, and
+    // an object is read as {label, match} when those are its only keys and as a
+    // bare matcher otherwise. mbun understood only the flag and the string, so
+    // `{ label: 'reason object' }` printed no label and every `match` form was
+    // ignored — a test that failed for the WRONG reason still passed
+    // (test-runner-xfail: 17 of its 36 assertions).
+    const parseExpectFailure = (expectFailure) => {
+      if (expectFailure === undefined || expectFailure === false) return false;
+      if (typeof expectFailure === "string") return { label: expectFailure, match: undefined };
+      if (typeof expectFailure === "function" || expectFailure instanceof RegExp) {
+        return { label: undefined, match: expectFailure };
+      }
+      if (typeof expectFailure !== "object" || expectFailure === null) {
+        return { label: undefined, match: undefined };
+      }
+      const keys = Object.keys(expectFailure);
+      // An empty object is rejected where the test is CONSTRUCTED (see the
+      // option validation), so by here it can only be a real configuration.
+      if (keys.length !== 0 && keys.every((k) => k === "match" || k === "label")) {
+        return { label: expectFailure.label, match: expectFailure.match };
+      }
+      return { label: undefined, match: expectFailure };
+    };
+    // node test.js: `parseExpectFailure(own) || this.parent?.expectFailure` —
+    // a suite's expectation is inherited by every subtest that does not set its
+    // own.
+    const expectFailureOf = (node) => {
+      for (let n = node; n; n = n.parent) {
+        const parsed = parseExpectFailure(n.opts && n.opts.expectFailure);
+        if (parsed !== false) return parsed;
+      }
+      return false;
+    };
+    // node Test#fail(): with a matcher, the thrown error is re-thrown through
+    // assert.throws(…, validation) — so every shape assert.throws accepts (a
+    // RegExp, a constructor, a predicate, an object of expected properties)
+    // works here for free, which is exactly why node routes it that way.
+    const expectFailureMismatch = (match, error) => {
+      if (match === undefined) return null;
+      const assert = assertMod();
+      if (!assert || typeof assert.throws !== "function") return null;
+      const target = (error && error.code === "ERR_TEST_FAILURE" &&
+                      error.failureType === "testCodeFailure" && error.cause !== undefined)
+        ? error.cause : error;
+      try {
+        assert.throws(() => { throw target; }, match);
+        return null;
+      } catch (mismatch) {
+        return mismatch;
+      }
+    };
+
     // `expectFailure` inverts the verdict: node reports a test that was expected
     // to fail AND failed as a pass carrying the directive (test-runner-xfail).
     const emitResult = (node, error, ctx, startedAt) => {
@@ -584,18 +693,30 @@ inline constexpr std::string_view kNodeTestRunnerJS = R"JS(
       const directive = directiveOf(node, ctx);
       if (directive.skip !== undefined) e.skip = directive.skip;
       if (directive.todo !== undefined) e.todo = directive.todo;
-      const expectation = node.opts.expectFailure;
-      const expected = expectation !== undefined && expectation !== false;
+      const expectation = expectFailureOf(node);
+      const expected = expectation !== false;
       let passed = error === undefined;
       let reported = error;
       if (expected) {
-        if (!passed) { passed = true; reported = undefined; e.expectFailure = expectation === true ? true : expectation; }
-        else {
+        // node getReportDetails(): the directive carries the LABEL, never the
+        // configuration object (getXFail(message) -> `expectFailure: message ??
+        // true`).
+        e.expectFailure = expectation.label === undefined ? true : expectation.label;
+        if (!passed) {
+          const mismatch = expectFailureMismatch(expectation.match, error);
+          if (mismatch === null) { passed = true; reported = undefined; }
+          else {
+            reported = new Error("The test failed, but the error did not match the expected validation");
+            reported.code = "ERR_TEST_FAILURE";
+            reported.failureType = "testCodeFailure";
+            reported.cause = mismatch;
+            passed = false;
+          }
+        } else {
           reported = new Error("test was expected to fail but passed");
           reported.code = "ERR_TEST_FAILURE";
           reported.failureType = "expectedFailure";
           passed = false;
-          e.expectFailure = expectation === true ? true : expectation;
         }
       }
       e.details = {
@@ -858,7 +979,13 @@ inline constexpr std::string_view kNodeTestRunnerJS = R"JS(
           if (typeof value !== "function") continue;
           bound[key] = counted(function (...a) { return value.apply(assert, a); });
         }
-        bound.ok = counted(function (...a) { return assert.ok.apply(assert, a); });
+        bound.ok = counted(function (...a) {
+          try {
+            return assert.ok.apply(assert, a);
+          } catch (error) {
+            throw describeFalsyOk(error);
+          }
+        });
       }
       const snapshot = getSnapshotRuntime();
       if (snapshot) {
@@ -998,6 +1125,10 @@ inline constexpr std::string_view kNodeTestRunnerJS = R"JS(
         if (emitResult(node, error, context, startedAt)) ok(node.name);
         else if (directive.todo !== undefined) skipped(node.name);
         else fail(node.name, error, true);
+      } finally {
+        // node Test#postRun -> mock.reset(): faked timers belong to the test
+        // that enabled them, never to the rest of the file.
+        try { context.mock.__resetTimers(); } catch (e) {}
       }
     };
 
@@ -1080,9 +1211,95 @@ inline constexpr std::string_view kNodeTestRunnerJS = R"JS(
     // startSubtestAfterBootstrap(). So under isolation:'none' the whole tree is
     // COLLECTED first and only then run — file two's suites are registered before
     // file one's tests execute. state.barrier is that deferred.
+    // PORT-SOURCE: node lib/internal/assert/utils.js getErrMessage() — when
+    // `assert.ok(expr)` fails with no explicit message, node reads the source of
+    // the call site back off the stack and puts the ORIGINAL EXPRESSION in the
+    // message ("The expression evaluated to a falsy value:\n\n  t.assert.ok(1 ===
+    // 2)\n"). mbun's native assert only produces the first line, so
+    // test-runner-assert's "t.assert.ok correctly parses the stacktrace" (which
+    // matches /t\.assert\.ok\(1 === 2\)/ against the thrown error) never saw the
+    // expression. node parses the call with acorn; here the call site is always a
+    // direct call of this wrapper, so a balanced-paren scan of the one source
+    // line the frame names is enough — and every failure path falls back to the
+    // untouched error.
+    const describeFalsyOk = (error) => {
+      try {
+        const prefix = "The expression evaluated to a falsy value";
+        if (!error || typeof error.message !== "string") return error;
+        if (error.message.indexOf(prefix) !== 0) return error;
+        // Already expanded (or a user-supplied message): leave it alone.
+        if (error.message.indexOf("\n") !== -1) return error;
+        let site = null;
+        for (const frame of String(error.stack || "").split("\n")) {
+          const m = /(\/[^\s()]*):(\d+):(\d+)\)?\s*$/.exec(frame);
+          if (m === null) continue;
+          site = { file: m[1], line: +m[2], column: +m[3] };
+          break;
+        }
+        if (site === null) return error;
+        const fs = M["fs"] || M["node:fs"];
+        if (!fs || typeof fs.readFileSync !== "function") return error;
+        const lines = String(fs.readFileSync(site.file, "utf8")).split("\n");
+        const text = lines[site.line - 1];
+        if (typeof text !== "string") return error;
+        // Every `ok(` on the line is a candidate; the one the frame points at is
+        // the one whose parenthesis sits nearest the reported column.
+        const re = /\bok\s*\(/g;
+        let best = -1;
+        let bestDistance = Infinity;
+        let match;
+        while ((match = re.exec(text)) !== null) {
+          const open = match.index + match[0].length - 1;
+          const distance = Math.abs(open - (site.column - 1));
+          if (distance < bestDistance) { bestDistance = distance; best = match.index; }
+        }
+        if (best === -1) return error;
+        let start = best;
+        while (start > 0 && /[A-Za-z0-9_$.\]['"]/.test(text[start - 1])) start--;
+        let depth = 0;
+        let end = -1;
+        for (let i = best; i < text.length; i++) {
+          const ch = text[i];
+          if (ch === "(") depth++;
+          else if (ch === ")") { depth--; if (depth === 0) { end = i + 1; break; } }
+        }
+        if (end === -1) return error;
+        error.message = prefix + ":\n\n  " + text.slice(start, end) + "\n";
+        return error;
+      } catch (e) { return error; }
+    };
+
+    // PORT-SOURCE: node lib/internal/util.js setupCoverageHooks() — the branch
+    // taken when `--experimental-test-coverage` is on but the build has no
+    // inspector. node's harness calls setupCoverage() as the root test starts,
+    // and with no inspector it collects nothing and says so on stderr instead of
+    // failing. mbun has no inspector at all, so this is the only branch that can
+    // ever be taken; it was missing entirely, which left the flag completely
+    // silent (test-runner-coverage's "handles the inspector not being
+    // available" asserts the warning is on stderr, that no report is printed and
+    // that the exit status is still 0).
+    let coverageWarned = false;
+    const warnCoverageUnavailable = () => {
+      if (coverageWarned) return;
+      coverageWarned = true;
+      try {
+        const p = G.process;
+        if (!p) return;
+        if (p.features && p.features.inspector) return;
+        const wanted = (list) => Array.isArray(list) && list.some(
+          (a) => typeof a === "string" &&
+                 (a === "--experimental-test-coverage" || a === "--test-coverage"));
+        if (!wanted(p.execArgv) && !wanted(p.argv)) return;
+        if (typeof p.emitWarning === "function") {
+          p.emitWarning("The inspector is disabled, coverage could not be collected", "Warning");
+        }
+      } catch (e) {}
+    };
+
     const ensureRootStarted = () => {
       if (state.rootStarted) return;
       state.rootStarted = true;
+      warnCoverageUnavailable();
       const ctx = root.__ctx || (root.__ctx = makeSuiteContext(root));
       state.chain = state.chain
         .then(() => state.barrier)
