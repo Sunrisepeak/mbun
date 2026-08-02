@@ -1,0 +1,10 @@
+compat/bun/test/cli/run/run-quote.test.ts
+compat/bun/test/cli/run/as-node.test.ts
+compat/bun/test/cli/run/transpiler-cache.test.ts
+compat/bun/test/cli/run/run-eval.test.ts
+compat/bun/test/cli/run/filter-workspace.test.ts
+compat/bun/test/cli/run/esm-defineProperty.test.ts
+compat/bun/test/cli/run/run-crash-handler.test.ts
+compat/bun/test/cli/run/tsconfig-override.test.ts
+compat/bun/test/cli/run/run-shell.test.ts
+compat/bun/test/cli/run/multi-run.test.ts

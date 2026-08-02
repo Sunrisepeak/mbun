@@ -236,3 +236,137 @@ timing; the fixed manifests, serial repeats, native behavior tests, and final
 full corpus run cover those boundaries. On the Bun impact list, classifications
 were unchanged while `js/node/fs/fs.test.ts` improved by 11 passed tests; this
 is a test-level move, not an additional green-file credit.
+
+Checkpoint 1 was published at PR comment `5157473592`. At comment time, GCC 16
+and LLVM 22 were running and macOS was queued on final head `78262d9`; no
+current-head CI success was claimed.
+
+## Wave B locked worklists
+
+The post-Wave-A binary `445b40f7...63bb0a` reproduced every one of the 52
+literal candidates as non-green at jobs 1. No path was removed as an inherited
+Wave A gain. The fixed targets are B1 +3, B2 +4, B3 +2, B4 +2, and B5 +3:
+combined +14, split Node +10 and Bun +4. This is inside the plan's +12 to +22
+Wave B range. It is deliberately evidence-based rather than inflated to make
+the sprint-level +30 floor appear reachable; Wave A actual plus the Wave B
+target is +27, so the +30 to +45 sprint target requires Wave B to exceed its
+fixed target by at least three files.
+
+The ranked planner returned Node REPL, Bun third-party, Node crypto, Node
+webcrypto, and Node VM. The spec combines crypto+webcrypto under one owner and
+uses the next required Bun CLI/run and Node fs owners. Node result rows contain
+no assertion counters, so their literal order uses duration only as an honest
+tie-breaker; Bun uses failed/ran ratio, then duration. A single baseline
+duration is not a stability claim; the deciding jobs-1 screen above is.
+
+### B1 — Node REPL, target +3
+
+Source owner: `node_repl.cppm` and directly relevant member tests only. The
+struck SIGINT termination and inspector preview/reverse-search approaches are
+excluded.
+
+```text
+compat/node/test/parallel/test-repl-autolibs.js
+compat/node/test/parallel/test-repl-uncaught-exception.js
+compat/node/test/parallel/test-repl-pretty-custom-stack.js
+compat/node/test/parallel/test-repl-tab-complete-computed-props.js
+compat/node/test/parallel/test-repl-tab-complete-new-expression.js
+compat/node/test/parallel/test-repl-user-error-handler.js
+compat/node/test/parallel/test-repl-empty.js
+compat/node/test/parallel/test-repl-multiline.js
+compat/node/test/parallel/test-repl-colors.js
+compat/node/test/parallel/test-repl-eval-error-after-close.js
+compat/node/test/parallel/test-repl-completion-on-getters-disabled.js
+compat/node/test/parallel/test-repl-tab-complete-nosideeffects.js
+```
+
+Jobs-1 Red: 12 `fail`, 0 pass.
+
+### B2 — Node crypto plus webcrypto, target +4
+
+One owner covers only narrow validation/state/bridge gaps in the existing
+crypto and webcrypto partitions. The exact key-object same-binary conflicts,
+the reverted `getCurves()` expansion, and absent-algorithm/OpenSSL-capability
+work are excluded.
+
+```text
+compat/node/test/parallel/test-crypto-keygen.js
+compat/node/test/parallel/test-crypto-authenticated.js
+compat/node/test/parallel/test-crypto-key-objects-raw.js
+compat/node/test/parallel/test-crypto-no-algorithm.js
+compat/node/test/parallel/test-webcrypto-cryptokey-hidden-slots.js
+compat/node/test/parallel/test-webcrypto-export-import-ec.js
+compat/node/test/parallel/test-crypto-random.js
+compat/node/test/parallel/test-crypto-secure-heap.js
+compat/node/test/parallel/test-webcrypto-crypto-job-mode.js
+compat/node/test/parallel/test-webcrypto-promise-prototype-pollution.mjs
+compat/node/test/parallel/test-crypto-x509.js
+compat/node/test/parallel/test-webcrypto-webidl.js
+```
+
+Jobs-1 Red: 12 `fail`, 0 pass.
+
+### B3 — Bun `js/third_party`, target +2
+
+Source owner is the HTTP/network/stream boundary only; package installation,
+bundler, N-API, and CLI are excluded. The already-landed DeferredWorkTimer and
+live-binding approaches are not repeated.
+
+```text
+compat/bun/test/js/third_party/express/express.json.test.ts
+compat/bun/test/js/third_party/grpc-js/test-server.test.ts
+compat/bun/test/js/third_party/express/res.sendFile.test.ts
+compat/bun/test/js/third_party/grpc-js/test-resolver.test.ts
+compat/bun/test/js/third_party/grpc-js/test-outlier-detection.test.ts
+compat/bun/test/js/third_party/wpt-h2/run.test.ts
+compat/bun/test/js/third_party/undici-h2/run.test.ts
+compat/bun/test/js/third_party/hono/hello-world-fixture.test.ts
+```
+
+Jobs-1 Red: 8 `test-failure`; 169 passed, 40 failed, 249 ran, 1 expect.
+
+### B4 — Bun `cli/run`, target +2
+
+Source owner is run/eval/quoting/workspace dispatch only. Install/autoinstall,
+FUSE, inspector/profiler, and broad `bun pm` work are excluded.
+
+```text
+compat/bun/test/cli/run/run-quote.test.ts
+compat/bun/test/cli/run/as-node.test.ts
+compat/bun/test/cli/run/transpiler-cache.test.ts
+compat/bun/test/cli/run/run-eval.test.ts
+compat/bun/test/cli/run/filter-workspace.test.ts
+compat/bun/test/cli/run/esm-defineProperty.test.ts
+compat/bun/test/cli/run/run-crash-handler.test.ts
+compat/bun/test/cli/run/tsconfig-override.test.ts
+compat/bun/test/cli/run/run-shell.test.ts
+compat/bun/test/cli/run/multi-run.test.ts
+```
+
+Jobs-1 Red: 10 `test-failure`; 18 passed, 228 failed, 246 ran, 372 expects.
+
+### B5 — Node fs, target +3
+
+Source owner is the existing fs builtin/runtime/member boundary. Permission
+policy, the Buffer-size row, existing-Date timezone caching, and active-request
+rewrites are excluded.
+
+```text
+compat/node/test/parallel/test-fs-promises-file-handle-read-worker.js
+compat/node/test/parallel/test-fs-promises.js
+compat/node/test/parallel/test-fs-readdir-ucs2.js
+compat/node/test/parallel/test-fs-access.js
+compat/node/test/parallel/test-fs-existssync-memleak-longpath.js
+compat/node/test/parallel/test-fs-syncwritestream.js
+compat/node/test/parallel/test-fs-filehandle.js
+compat/node/test/parallel/test-fs-promises-readfile.js
+compat/node/test/parallel/test-fs-readdir-stack-overflow.js
+compat/node/test/parallel/test-fs-glob.mjs
+```
+
+Jobs-1 Red: 10 `fail`, 0 pass.
+
+The five lists are path-disjoint and source ownership is disjoint by brief. If
+a worker maps a row outside its owner, it drops that row rather than widening.
+Node VM is the first replacement only if a lane becomes non-actionable before
+dispatch; no replacement is currently required.

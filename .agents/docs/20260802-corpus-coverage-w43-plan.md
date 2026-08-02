@@ -551,7 +551,7 @@ Run A1–A3 with the Node runner and A4–A5 with the Bun runner, at `--jobs 3`;
 
 Append lane target, actual green delta, remaining classifications, issue, commit, member-test result, serial proof count, and elapsed time to the W43 ledger. State `Wave A target missed` if net delta is below 12; do not lower the target after observing results.
 
-- [ ] **Step 4: Push and publish one checkpoint comment**
+- [x] **Step 4: Push and publish one checkpoint comment**
 
 The comment contains source issues/commits, five lane targets→actuals, cumulative new greens, zero-regression result, timeout/OOM movement in the focused sets, physical concurrency, blockers, and the exact Wave B selection command. It explicitly says no post-Wave-A full corpus was run.
 
@@ -565,7 +565,7 @@ The comment contains source issues/commits, five lane targets→actuals, cumulat
 - Consumes: Task 2 full baseline plus Task 8 integrated outcomes.
 - Produces: five literal, disjoint manifests assigned to REPL, combined crypto/webcrypto, Bun third-party, Bun CLI/run, and Node fs; combined target +12 to +22.
 
-- [ ] **Step 1: Run the ranked planner with Wave A areas excluded**
+- [x] **Step 1: Run the ranked planner with Wave A areas excluded**
 
 ```bash
 python3 tools/integration/wave_planner.py \
@@ -583,15 +583,15 @@ python3 tools/integration/wave_planner.py \
   --exclude test-runner
 ```
 
-- [ ] **Step 2: Select only the spec-approved disjoint owners**
+- [x] **Step 2: Select only the spec-approved disjoint owners**
 
 Use this priority order: Node REPL, one combined crypto+webcrypto owner, Bun `js/third_party`, Bun `cli/run`, Node fs. If the planner reports fewer than two actionable files for one owner, take the next ranked owner that does not overlap another source touch-set. Record the literal replacement and planner evidence in the ledger before dispatch.
 
-- [ ] **Step 3: Write literal manifests from baseline rows**
+- [x] **Step 3: Write literal manifests from baseline rows**
 
 Sort each owner's non-green rows by failed-assertion ratio and stable duration, cap each manifest at 12 files, exclude Wave A paths and struck approaches, then write the exact paths to `w43-b1` through `w43-b5`. Run every manifest against the integrated pre-Wave-B binary with `--jobs 1`; remove any now-green path and record it as an inherited Wave A gain rather than Wave B credit.
 
-- [ ] **Step 4: Lock targets before workers start**
+- [x] **Step 4: Lock targets before workers start**
 
 Assign +2 to +5 per Node lane and +2 to +4 per Bun lane, totaling +12 to +22. Targets are written to the ledger and PR checkpoint comment before implementation; they are not changed after results arrive.
 
