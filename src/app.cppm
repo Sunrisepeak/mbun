@@ -1303,6 +1303,12 @@ int run_install(std::span<const std::string_view> args) {
         std::println(std::cerr, "error: {}", result.error().message);
         return 1;
     }
+    // Non-fatal install diagnostics go out on stderr with bun's `warn:` prefix,
+    // the same channel and wording its Log uses for a warning-level message
+    // (runTasks.rs:498 logs an optional dependency's failed GET this way).
+    for (const std::string& warning : result->warnings) {
+        std::println(std::cerr, "warn: {}", warning);
+    }
     // bun prints "Saved lockfile" on stderr when it writes bun.lock
     // (PackageManagerDirectories.rs save_lockfile).
     if (result->savedLockfile) {
@@ -1559,6 +1565,11 @@ int run_add(std::span<const std::string_view> args) {
         return 1;
     }
 
+    // bun times the install and prints the elapsed figure after the summary
+    // line ("1 package installed [46.00ms]", install_with_manager.rs printer);
+    // the corpus strips it with /\s*\[[0-9.]+m?s\]\s*$/, which only matches when
+    // the suffix is actually there.
+    const auto addStarted{std::chrono::steady_clock::now()};
     auto result{mbun::install::command::install_project(packageJsonPath->parent_path(), {})};
     if (!result) {
         std::println(std::cerr, "error: {}", result.error().message);
@@ -1570,6 +1581,7 @@ int run_add(std::span<const std::string_view> args) {
     // bare version under `--exact` (EditOptions::exact_versions, fed from
     // `manager.options.enable.exact_versions()` at :563/:575).
     std::vector<editor::NewDependency> resolved;
+    std::vector<std::string> installedLines;
     for (const auto& request : requests) {
         if (!request.isDistTag) continue;
         const auto match{std::ranges::find_if(result->packages, [&](const std::string& entry) {
@@ -1580,6 +1592,10 @@ int run_add(std::span<const std::string_view> args) {
         })};
         if (match == result->packages.end()) continue;
         const std::string version{match->substr(match->rfind('@') + 1)};
+        // The `installed` line reports the CONCRETE version that landed in
+        // node_modules, not the range package.json ends up carrying — bun
+        // prints `installed BaR@0.0.2` while writing `"BaR": "^0.0.2"`.
+        installedLines.push_back(std::format("{}@{}", request.name, version));
         resolved.push_back(editor::NewDependency{
             request.name, flags.exact ? version : std::format("^{}", version)});
     }
@@ -1592,12 +1608,27 @@ int run_add(std::span<const std::string_view> args) {
         }
     }
 
-    std::println("mbun add v{}\n", mbun::cli::VERSION);
-    for (const auto& dep : resolved) {
-        std::println("installed {}@{}", dep.name, dep.version);
+    // `add` saves the lockfile through the same writer `install` does, so it
+    // announces it the same way: bun's save_lockfile prints "Saved lockfile" on
+    // stderr for every subcommand that writes one, not just `install`
+    // (PackageManagerDirectories.rs save_lockfile is reached from the shared
+    // install_with_manager tail). Only `install` was echoing it here, so a
+    // successful `mbun add` wrote bun.lock silently.
+    for (const std::string& warning : result->warnings) {
+        std::println(std::cerr, "warn: {}", warning);
     }
-    std::println("\n{} package{} installed", result->installed,
-                 result->installed == 1 ? "" : "s");
+    if (result->savedLockfile) {
+        std::println(std::cerr, "Saved lockfile");
+    }
+    std::println("mbun add v{}\n", mbun::cli::VERSION);
+    for (const std::string& line : installedLines) {
+        std::println("installed {}", line);
+    }
+    const double addElapsedMs{
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - addStarted)
+            .count()};
+    std::println("\n{} package{} installed [{:.2f}ms]", result->installed,
+                 result->installed == 1 ? "" : "s", addElapsedMs);
     return 0;
 }
 
