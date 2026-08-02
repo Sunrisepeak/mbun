@@ -1419,9 +1419,10 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
       stdio = stdio.slice();
     }
     // node prepends the inherited (or explicit) execArgv before the module.
-    const execArgv = options.execArgv !== undefined ? options.execArgv : ((G.process && G.process.execArgv) || []);
+    const inheritsExecArgv = options.execArgv == null;
+    const execArgv = inheritsExecArgv ? ((G.process && G.process.execArgv) || []) : options.execArgv;
     const child = new ChildProcess();
-    child.spawn({ file: exe, args: [exe].concat((execArgv || []).map(toStr), [toStr(modulePath)], (args || []).map(toStr)), cwd: options.cwd, env: options.env, stdio, detached: options.detached, timeout: options.timeout, killSignal: options.killSignal, signal: options.signal, serialization: validateSerialization(options.serialization), __mbunTsconfig: options.execArgv === undefined });
+    child.spawn({ file: exe, args: [exe].concat(execArgv.map(toStr), [toStr(modulePath)], (args || []).map(toStr)), cwd: options.cwd, env: options.env, stdio, detached: options.detached, timeout: options.timeout, killSignal: options.killSignal, signal: options.signal, serialization: validateSerialization(options.serialization), __mbunTsconfig: inheritsExecArgv });
     return child;
   }
 

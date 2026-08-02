@@ -123,19 +123,44 @@ class JsonParser {
 public:
     explicit JsonParser(std::string_view text) : s_{text} {}
 
-    std::optional<JsonValue> parse() {
+    std::optional<JsonValue> parse(bool requireEof = false) {
         skip_ws();
         auto v{parse_value()};
         if (!v) {
             return std::nullopt;
         }
         skip_ws();
-        return v;  // trailing content tolerated (package.json is well-formed)
+        if (requireEof && i_ < s_.size()) {
+            fail("end of file");
+            return std::nullopt;
+        }
+        return v;  // package.json probing retains its historical tolerance
     }
+
+    const std::string& error() const { return error_; }
+    std::size_t error_offset() const { return error_offset_; }
 
 private:
     std::string_view s_;
     std::size_t i_{0};
+    std::string error_;
+    std::size_t error_offset_{0};
+
+    void fail(std::string_view expected) {
+        if (!error_.empty()) return;
+        error_offset_ = i_;
+        if (i_ >= s_.size()) {
+            error_ = std::format("Expected {} but found end of file", expected);
+            return;
+        }
+        std::size_t end{i_};
+        while (end < s_.size() && !std::isspace(static_cast<unsigned char>(s_[end])) &&
+               s_[end] != ',' && s_[end] != '}' && s_[end] != ']') {
+            ++end;
+        }
+        if (end == i_) ++end;
+        error_ = std::format("Expected {} but found \"{}\"", expected, s_.substr(i_, end - i_));
+    }
 
     void skip_ws() {
         while (i_ < s_.size()) {
@@ -164,6 +189,7 @@ private:
     std::optional<JsonValue> parse_value() {
         skip_ws();
         if (i_ >= s_.size()) {
+            fail("value");
             return std::nullopt;
         }
         const char c{s_[i_]};
@@ -195,6 +221,7 @@ private:
 
     std::optional<JsonValue> parse_literal(std::string_view lit, JsonValue val) {
         if (s_.substr(i_, lit.size()) != lit) {
+            fail(lit);
             return std::nullopt;
         }
         i_ += lit.size();
@@ -215,6 +242,7 @@ private:
             }
         }
         if (i_ == start) {
+            fail("value");
             return std::nullopt;
         }
         JsonValue v;
@@ -225,6 +253,7 @@ private:
 
     std::optional<std::string> parse_string() {
         if (i_ >= s_.size() || s_[i_] != '"') {
+            fail("string");
             return std::nullopt;
         }
         ++i_;
@@ -236,6 +265,7 @@ private:
             }
             if (c == '\\') {
                 if (i_ >= s_.size()) {
+                    fail("escape sequence");
                     return std::nullopt;
                 }
                 const char e{s_[i_++]};
@@ -250,6 +280,7 @@ private:
                     case 'f': out += '\f'; break;
                     case 'u': {
                         if (i_ + 4 > s_.size()) {
+                            fail("four hexadecimal digits");
                             return std::nullopt;
                         }
                         unsigned cp{0};
@@ -266,6 +297,7 @@ private:
                 out += c;
             }
         }
+        fail("closing quote");
         return std::nullopt;  // unterminated
     }
 
@@ -299,6 +331,7 @@ private:
             v.array.push_back(std::move(*el));
             skip_ws();
             if (i_ >= s_.size()) {
+                fail("',' or ']'");
                 return std::nullopt;
             }
             if (s_[i_] == ',') {
@@ -314,6 +347,7 @@ private:
                 ++i_;
                 return v;
             }
+            fail("',' or ']'");
             return std::nullopt;
         }
     }
@@ -335,6 +369,7 @@ private:
             }
             skip_ws();
             if (i_ >= s_.size() || s_[i_] != ':') {
+                fail("':'");
                 return std::nullopt;
             }
             ++i_;
@@ -345,6 +380,7 @@ private:
             v.object.emplace_back(std::move(*key), std::move(*val));
             skip_ws();
             if (i_ >= s_.size()) {
+                fail("',' or '}'");
                 return std::nullopt;
             }
             if (s_[i_] == ',') {
@@ -360,6 +396,7 @@ private:
                 ++i_;
                 return v;
             }
+            fail("',' or '}'");
             return std::nullopt;
         }
     }
@@ -390,11 +427,17 @@ std::string join_target(std::string_view baseDir, std::string_view rel) {
 // baseUrl (relative to `configDir`) + compilerOptions.paths. `extends` is not
 // followed (paths that matter for the vendored bun test suite are declared in the
 // leaf tsconfig). Returns nullopt only if the JSON is unparseable.
-export std::optional<TsconfigPaths> parse_tsconfig(std::string_view json,
-                                                   std::string_view configDir) {
+std::optional<TsconfigPaths> parse_tsconfig_impl(std::string_view json,
+                                                 std::string_view configDir,
+                                                 std::string* error,
+                                                 std::size_t* errorOffset) {
     JsonParser parser{json};
-    auto root{parser.parse()};
+    auto root{parser.parse(/*requireEof=*/true)};
     if (!root || root->kind != JsonValue::Kind::Object) {
+        if (error != nullptr) {
+            *error = parser.error().empty() ? "Expected object" : parser.error();
+        }
+        if (errorOffset != nullptr) *errorOffset = parser.error_offset();
         return std::nullopt;
     }
     const JsonValue* co{root->find("compilerOptions")};
@@ -429,6 +472,11 @@ export std::optional<TsconfigPaths> parse_tsconfig(std::string_view json,
     return ts;
 }
 
+export std::optional<TsconfigPaths> parse_tsconfig(std::string_view json,
+                                                   std::string_view configDir) {
+    return parse_tsconfig_impl(json, configDir, nullptr, nullptr);
+}
+
 export struct TsconfigLoadResult {
     std::optional<TsconfigPaths> config;
     std::string error;
@@ -449,8 +497,22 @@ export TsconfigLoadResult load_tsconfig_override(const FileSystem& fs,
     auto content{fs.read_file(path)};
     if (!content) return {.error = std::format("Cannot read file \"{}\"", path)};
 
-    auto parsed{parse_tsconfig(*content, paths::dirname(path))};
-    if (!parsed) return {.error = std::format("Cannot parse tsconfig file \"{}\"", path)};
+    std::string parseError;
+    std::size_t errorOffset{0};
+    auto parsed{parse_tsconfig_impl(*content, paths::dirname(path), &parseError, &errorOffset)};
+    if (!parsed) {
+        std::size_t line{1};
+        std::size_t column{1};
+        for (std::size_t i{0}; i < errorOffset && i < content->size(); ++i) {
+            if ((*content)[i] == '\n') {
+                ++line;
+                column = 1;
+            } else {
+                ++column;
+            }
+        }
+        return {.error = std::format("{}\n    at {}:{}:{}", parseError, path, line, column)};
+    }
 
     // Preserve the runtime's existing bounded extends behavior. A leaf with its
     // own paths wins; otherwise inherit the first parent that supplies them.

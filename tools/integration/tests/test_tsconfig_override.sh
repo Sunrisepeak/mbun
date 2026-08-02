@@ -26,6 +26,9 @@ EOF
 cat >"$tmp/project/config/malformed.json" <<'EOF'
 { invalid
 EOF
+cat >"$tmp/project/config/trailing.json" <<'EOF'
+{"compilerOptions":{}} invalid
+EOF
 cat >"$tmp/project/src/value.ts" <<'EOF'
 export const value = 42;
 EOF
@@ -58,13 +61,37 @@ run_runtime_error_case() {
   }
   grep -Fxq 'DEP_EFFECT' "$tmp/$name.out"
   grep -Fxq 'SIDE_EFFECT' "$tmp/$name.out"
-  grep -Fq "$diagnostic" "$tmp/$name.err"
+  [ "$(grep -Fc "$diagnostic" "$tmp/$name.err")" -eq 1 ]
 }
 
 run_runtime_error_case missing config/missing.json 'Cannot find tsconfig file'
-run_runtime_error_case malformed config/malformed.json 'Cannot parse tsconfig file'
+run_runtime_error_case malformed config/malformed.json 'Expected string but found "invalid"'
+run_runtime_error_case trailing config/trailing.json 'Expected end of file but found "invalid"'
 
-for config in config/missing.json config/malformed.json; do
+assert_single_diagnostic() {
+  local config=$1 output=$2 diagnostic
+  case "$config" in
+    config/missing.json) diagnostic='Cannot find tsconfig file' ;;
+    config/malformed.json)
+      diagnostic='Expected string but found "invalid"'
+      grep -Fq "$tmp/project/config/malformed.json:1:3" "$output"
+      ;;
+    config/trailing.json)
+      diagnostic='Expected end of file but found "invalid"'
+      grep -Fq "$tmp/project/config/trailing.json:1:24" "$output"
+      ;;
+  esac
+  [ "$(grep -Fc "$diagnostic" "$output")" -eq 1 ] || {
+    echo "$output: expected exactly one '$diagnostic' diagnostic" >&2
+    cat "$output" >&2
+    exit 1
+  }
+}
+
+assert_single_diagnostic config/malformed.json "$tmp/malformed.err"
+assert_single_diagnostic config/trailing.json "$tmp/trailing.err"
+
+for config in config/missing.json config/malformed.json config/trailing.json; do
   name=${config##*/}
   set +e
   (cd "$tmp/project" && "$bin" --tsconfig-override "$config" -e \
@@ -78,7 +105,7 @@ for config in config/missing.json config/malformed.json; do
     exit 1
   }
   grep -Fxq 'EVAL_EFFECT' "$tmp/eval-$name.out"
-  grep -Eq 'Cannot (find|parse) tsconfig file' "$tmp/eval-$name.err"
+  assert_single_diagnostic "$config" "$tmp/eval-$name.err"
 
   set +e
   (cd "$tmp/project" && "$bin" build --tsconfig-override "$config" entry.ts \
@@ -90,7 +117,7 @@ for config in config/missing.json config/malformed.json; do
     cat "$tmp/build-$name.out" "$tmp/build-$name.err" >&2
     exit 1
   }
-  grep -Eq 'Cannot (find|parse) tsconfig file' "$tmp/build-$name.err"
+  assert_single_diagnostic "$config" "$tmp/build-$name.err"
 
   set +e
   (cd "$tmp/project" && "$tmp/node" --tsconfig-override "$config" entry.ts) \
@@ -103,17 +130,17 @@ for config in config/missing.json config/malformed.json; do
     exit 1
   }
   grep -Fxq 'SIDE_EFFECT' "$tmp/node-$name.out"
-  grep -Eq 'Cannot (find|parse) tsconfig file' "$tmp/node-$name.err"
+  assert_single_diagnostic "$config" "$tmp/node-$name.err"
 
   (cd "$tmp/project" && "$bin" test --tsconfig-override "$config" behavior.test.ts) \
     >"$tmp/test-$name.out" 2>"$tmp/test-$name.err"
   grep -Fq 'TEST_SIDE_EFFECT' "$tmp/test-$name.out"
-  grep -Eq 'Cannot (find|parse) tsconfig file' "$tmp/test-$name.err"
+  assert_single_diagnostic "$config" "$tmp/test-$name.err"
 
   printf '.exit\n' | (cd "$tmp/project" && "$bin" --tsconfig-override "$config" -i) \
     >"$tmp/repl-$name.out" 2>"$tmp/repl-$name.err"
   grep -Fq 'Welcome to Node.js' "$tmp/repl-$name.out"
-  grep -Eq 'Cannot (find|parse) tsconfig file' "$tmp/repl-$name.err"
+  assert_single_diagnostic "$config" "$tmp/repl-$name.err"
 done
 
 cat >"$tmp/project/worker.ts" <<'EOF'
@@ -133,6 +160,18 @@ process.send({
   leaked: Object.prototype.hasOwnProperty.call(process.env, "MBUN_INTERNAL_TSCONFIG_OVERRIDE"),
 });
 EOF
+cat >"$tmp/project/explicit-child.ts" <<'EOF'
+import { parentPort } from "worker_threads";
+let resolved = false;
+try { resolved = require("#/value").value === 42; } catch {}
+const result = {
+  resolved,
+  execArgv: process.execArgv,
+  leaked: Object.prototype.hasOwnProperty.call(process.env, "MBUN_INTERNAL_TSCONFIG_OVERRIDE"),
+};
+if (parentPort) parentPort.postMessage(result);
+else process.send(result);
+EOF
 cat >"$tmp/project/plain-child.ts" <<'EOF'
 console.log(Object.prototype.hasOwnProperty.call(process.env, "MBUN_INTERNAL_TSCONFIG_OVERRIDE") ? "LEAK" : "NO_LEAK");
 EOF
@@ -149,22 +188,40 @@ if (Object.prototype.hasOwnProperty.call(process.env, "MBUN_INTERNAL_TSCONFIG_OV
 
 process.chdir(path.join(root, "elsewhere"));
 
-const workerResult = await new Promise((resolve, reject) => {
-  const worker = new Worker(path.join(root, "worker.ts"));
+const runWorker = (entry, options) => new Promise((resolve, reject) => {
+  const worker = new Worker(path.join(root, entry), options);
   worker.once("message", resolve);
   worker.once("error", reject);
 });
+const workerResult = await runWorker("worker.ts");
 if (workerResult.value !== 42 || workerResult.leaked || !same(workerResult.execArgv, expected)) {
   throw new Error(`worker propagation mismatch: ${JSON.stringify(workerResult)}`);
 }
+const workerNull = await runWorker("worker.ts", { execArgv: null, env: {} });
+if (workerNull.value !== 42 || workerNull.leaked || !same(workerNull.execArgv, expected)) {
+  throw new Error(`worker null execArgv/env propagation mismatch: ${JSON.stringify(workerNull)}`);
+}
+const workerEmpty = await runWorker("explicit-child.ts", { execArgv: [], env: {} });
+if (workerEmpty.resolved || workerEmpty.leaked || !same(workerEmpty.execArgv, [])) {
+  throw new Error(`worker explicit execArgv isolation mismatch: ${JSON.stringify(workerEmpty)}`);
+}
 
-const forkResult = await new Promise((resolve, reject) => {
-  const child = fork(path.join(root, "fork-child.ts"), [], { silent: true });
+const runFork = (entry, options) => new Promise((resolve, reject) => {
+  const child = fork(path.join(root, entry), [], { silent: true, ...options });
   child.once("message", resolve);
   child.once("error", reject);
 });
+const forkResult = await runFork("fork-child.ts");
 if (forkResult.value !== 42 || forkResult.leaked || !same(forkResult.execArgv, expected)) {
   throw new Error(`fork propagation mismatch: ${JSON.stringify(forkResult)}`);
+}
+const forkNull = await runFork("fork-child.ts", { execArgv: null, env: {} });
+if (forkNull.value !== 42 || forkNull.leaked || !same(forkNull.execArgv, expected)) {
+  throw new Error(`fork null execArgv/env propagation mismatch: ${JSON.stringify(forkNull)}`);
+}
+const forkEmpty = await runFork("explicit-child.ts", { execArgv: [], env: {} });
+if (forkEmpty.resolved || forkEmpty.leaked || !same(forkEmpty.execArgv, [])) {
+  throw new Error(`fork explicit execArgv isolation mismatch: ${JSON.stringify(forkEmpty)}`);
 }
 
 const plain = spawnSync(process.execPath, [path.join(root, "plain-child.ts")], {
