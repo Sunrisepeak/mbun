@@ -564,7 +564,28 @@ inline constexpr std::string_view kNodeReplJS = R"JS(
   const REPL_MODE_STRICT = Symbol("repl-strict");
 
   let processNewListenerUseCount = 0;
-  let activeReplServer = null;
+  // The REPL that owns the CURRENT ASYNC CONTEXT. node keeps this in an
+  // AsyncLocalStorage (repl.js `replContext`, entered around every eval), which
+  // is what makes a callback the command scheduled still belong to the REPL
+  // that scheduled it. The plain variable this replaces was restored in a
+  // `finally` and so only spanned the synchronous eval: a
+  // `process.on("uncaughtException", …)` run from a process.nextTick the
+  // command scheduled found no active REPL, skipped ERR_INVALID_REPL_INPUT and
+  // really installed a listener that outlived the REPL
+  // (test-repl-uncaught-exception-async counted it plus the capture below).
+  let replContext = null;
+  function getReplContext() {
+    if (replContext === null) {
+      const ah = M["async_hooks"] || M["node:async_hooks"];
+      replContext = new ah.AsyncLocalStorage();
+    }
+    return replContext;
+  }
+  function currentReplServer() {
+    if (replContext === null) return null;
+    const store = replContext.getStore();
+    return (store && store.replServer) || null;
+  }
   // The most recent REPLServer to run a command — the owner of any async throw
   // its commands scheduled, once every live server has closed.
   let lastEvaluatingServer = null;
@@ -573,51 +594,52 @@ inline constexpr std::string_view kNodeReplJS = R"JS(
   // AsyncLocalStorage + addUncaughtExceptionCaptureCallback; the innermost live
   // server is the same answer for every shape the tests drive.
   const liveServers = [];
-  let installingCapture = false;
   let captureInstalled = false;
-  let captureHandler = null;
+  // node registers the REPL's error router through
+  // process.addUncaughtExceptionCaptureCallback (repl.js:195), which is NOT an
+  // 'uncaughtException' listener — the corpus asserts a closed REPL leaves
+  // process.listenerCount('uncaughtException') === 0
+  // (test-repl-uncaught-exception-async, test-repl-uncaught-exception). mbun's
+  // public capture slot is single-occupancy and belongs to node:domain, so the
+  // REPL gets its own seam (__mbunReplUncaughtCapture), consulted by the
+  // runtime's uncaught dispatch right after the capture callback and before any
+  // user listener. Registering it as a listener instead is what left one of the
+  // two residual listeners behind, and it also made the REPL's own router
+  // indistinguishable from a user handler wherever node counts listeners.
   function setupExceptionCapture() {
     if (captureInstalled) return;
     captureInstalled = true;
-    installingCapture = true;
-    try {
-      captureHandler = (err) => {
-        // A REPL that has evaluated something owns the async throws its
-        // commands scheduled, even after it closed: node reaches the same
-        // answer through the AsyncLocalStorage store captured when the command
-        // ran, which a closed REPL still carries. Ending stdin closes the REPL
-        // before a setImmediate scheduled by the last command fires, and
-        // rethrowing there killed the process instead of reporting through the
-        // REPL's output (test-repl-uncaught-exception-after-input-ended).
-        const server = liveServers[liveServers.length - 1] || lastEvaluatingServer;
-        if (server === undefined || server === null) throw err;
-        server._handleError(err);
-      };
-      process.on("uncaughtException", captureHandler);
-    } finally {
-      installingCapture = false;
-    }
+    getReplContext();
+    // defineProperty, not assignment: node's test/common leak check enumerates
+    // globalThis's own properties and fails any test that added one.
+    Object.defineProperty(G, "__mbunReplUncaughtCapture", {
+      configurable: true, enumerable: false, writable: true,
+      value: (err) => {
+      // A REPL that has evaluated something owns the async throws its
+      // commands scheduled, even after it closed: node reaches the same
+      // answer through the AsyncLocalStorage store captured when the command
+      // ran, which a closed REPL still carries. Ending stdin closes the REPL
+      // before a setImmediate scheduled by the last command fires, and
+      // declining there killed the process instead of reporting through the
+      // REPL's output (test-repl-uncaught-exception-after-input-ended).
+      const server = currentReplServer() ||
+        liveServers[liveServers.length - 1] || lastEvaluatingServer;
+      if (server === undefined || server === null) return false;
+      // node's capture returns `result !== 'unhandled'`: a REPL whose
+      // handleError declined the error must let it reach the process's own
+      // 'uncaughtException' listeners (test-repl-user-error-handler).
+      return server._handleError(err) !== "unhandled";
+      },
+    });
   }
-  // node registers this capture through process.addUncaughtExceptionCaptureCallback
-  // (repl.js:195), which is NOT an 'uncaughtException' listener. mbun's runtime
-  // only offers the event, so the REPL's own handler has to be discounted
-  // wherever node counts listeners: a standalone REPL otherwise reads its own
-  // capture as a user handler, re-emits every eval error into itself instead of
-  // printing it, and `mbun -i` reported nothing at all for a throw.
+  // Every 'uncaughtException' listener is a user's now that the REPL's own
+  // router is not one (see setupExceptionCapture). A standalone REPL uses this
+  // to decide whether to re-emit an eval error instead of printing it.
   function userUncaughtExceptionListeners() {
-    let n = 0;
-    // Indexed loop, not for-of: this runs on every REPL eval error, including the
-    // one raised by user code that just deleted Array.prototype[Symbol.iterator]
-    // (test-repl-unsafe-array-iteration), and a for-of would re-read it here and
-    // replace the user's TypeError with a crash in the error reporter itself.
-    const ls = process.listeners("uncaughtException");
-    for (let i = 0; i < ls.length; i++) {
-      if (ls[i] !== captureHandler) n++;
-    }
-    return n;
+    return process.listenerCount("uncaughtException");
   }
   function processNewListener(event) {
-    if (event === "uncaughtException" && activeReplServer !== null && !installingCapture) {
+    if (event === "uncaughtException" && currentReplServer() !== null) {
       throw ERR_INVALID_REPL_INPUT(
         "Listeners for `uncaughtException` cannot be used in the REPL");
     }
@@ -1418,15 +1440,13 @@ inline constexpr std::string_view kNodeReplJS = R"JS(
       }
 
       const originalEval = eval_;
+      // node repl.js: `replContext.run({ replServer: self }, …)` around the
+      // evaluator, so everything the command schedules inherits the store.
       self.eval = function REPLEval(code, context, file, cb) {
-        const prev = activeReplServer;
-        activeReplServer = self;
         lastEvaluatingServer = self;
-        try {
+        getReplContext().run({ replServer: self }, function REPLEvalInContext() {
           originalEval.call(self, code, context, file, cb);
-        } finally {
-          activeReplServer = prev;
-        }
+        });
       };
 
       self.clearBufferedCommand();
