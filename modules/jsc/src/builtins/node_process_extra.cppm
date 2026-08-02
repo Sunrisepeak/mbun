@@ -1615,13 +1615,24 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
           const M = G.__mbunNativeModules;
           const fsMod = M && (M["fs"] || M["node:fs"]);
           if (!fsMod) return;
-          const wrapSync = (original, names) => function () {
+          // Several fs entry points carry own properties the corpus calls
+          // through -- realpathSync.native, exists.__promisify__ -- so the
+          // wrapper has to inherit them or wrapping silently deletes API.
+          const carryOwn = (original, wrapped) => {
+            for (const key of Reflect.ownKeys(original)) {
+              if (key === "prototype") continue;
+              const d = Object.getOwnPropertyDescriptor(original, key);
+              if (d) { try { Object.defineProperty(wrapped, key, d); } catch (e) {} }
+            }
+            return wrapped;
+          };
+          const wrapSync = (original, names) => carryOwn(original, function () {
             if (inTraceWriter || !groupEnabled(CAT_FS_SYNC)) return original.apply(this, arguments);
             for (let i = 0; i < names.length; i++) emit("B", CAT_FS_SYNC, "fs.sync." + names[i]);
             try { return original.apply(this, arguments); }
             finally { for (let i = names.length - 1; i >= 0; i--) emit("E", CAT_FS_SYNC, "fs.sync." + names[i]); }
-          };
-          const wrapAsync = (original, names) => function () {
+          });
+          const wrapAsync = (original, names) => carryOwn(original, function () {
             const args = Array.prototype.slice.call(arguments);
             const cb = args[args.length - 1];
             if (inTraceWriter || !groupEnabled(CAT_FS_ASYNC) || typeof cb !== "function")
@@ -1635,7 +1646,7 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
             };
             try { return original.apply(this, args); }
             catch (e) { if (!done) { done = true; end(); } throw e; }
-          };
+          });
           for (const method in FS_SYNC_OPS) {
             const original = fsMod[method];
             if (typeof original === "function") { try { fsMod[method] = wrapSync(original, FS_SYNC_OPS[method]); } catch (e) {} }
