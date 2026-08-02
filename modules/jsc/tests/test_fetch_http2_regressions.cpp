@@ -285,6 +285,56 @@ int main() {
         expect(result.has_value() && *result == "head|ab|redirect-ok|gzip|cancel|body-error",
                "HTTP2 fetch resolves on headers and streams decoded bodies (got '" + result.value_or("<eval failed>") + "')");
     }
+
+    auto h1FramingSetup { eval(R"MJS(
+      globalThis.__h1FramingDone = 0;
+      globalThis.__h1FramingResult = "";
+      globalThis.__h1FramingError = "";
+      (async () => {
+        try {
+          const net = require("node:net");
+          let wire = Buffer.alloc(0);
+          const server = net.createServer((socket) => {
+            socket.on("data", (chunk) => {
+              wire = Buffer.concat([wire, chunk]);
+              if (wire.indexOf("\r\n\r\n") !== -1) {
+                socket.end("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+              }
+            });
+          });
+          await new Promise((resolve, reject) => {
+            server.once("error", reject);
+            server.listen(0, "127.0.0.1", resolve);
+          });
+          const response = await fetch(`http://127.0.0.1:${server.address().port}/`, {
+            method: "POST",
+            headers: { "transfer-encoding": "chunked" },
+          });
+          const text = await response.text();
+          await new Promise((resolve) => server.close(resolve));
+          const split = wire.indexOf("\r\n\r\n");
+          const head = wire.subarray(0, split).toString("latin1").toLowerCase();
+          const body = wire.subarray(split + 4);
+          globalThis.__h1FramingResult = text === "ok" &&
+            !head.includes("transfer-encoding:") &&
+            head.includes("content-length: 0") && body.length === 0
+            ? "framed" : `bad:${head.replaceAll("\r\n", "|")}:body=${body.length}`;
+        } catch (error) {
+          globalThis.__h1FramingError = String((error && error.stack) || error);
+        }
+        globalThis.__h1FramingDone = 1;
+      })();
+    )MJS") };
+    expect(h1FramingSetup.has_value(), "H1 request framing regression script evaluates");
+    if (h1FramingSetup.has_value()) {
+        pump_event_loop("globalThis.__h1FramingDone");
+        const auto error { eval_to_string("globalThis.__h1FramingError") };
+        expect(error.has_value() && error->empty(),
+               "H1 request framing regression ran without harness errors: " + error.value_or("<eval failed>"));
+        const auto result { eval_to_string("globalThis.__h1FramingResult") };
+        expect(result.has_value() && *result == "framed",
+               "H1 buffered request emits one coherent framing mode (got '" + result.value_or("<eval failed>") + "')");
+    }
 #endif
 
     if (gFailed != 0) {

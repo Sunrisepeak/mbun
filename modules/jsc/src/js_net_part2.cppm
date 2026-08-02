@@ -2714,7 +2714,13 @@ export constexpr std::string_view kNetJS_part2 = R"JS(
       lines.push("User-Agent: " + (ovUA || ("Bun/" + ((G.Bun && G.Bun.version) || "1.0"))));
     }
     if (!haveAccept) lines.push("Accept: */*");
-    for (const kv of hdrs) lines.push(kv[0] + ": " + kv[1]);
+    // This H1 client materializes every request body before serialization, so
+    // it is always bun's non-streaming build_request branch. That branch drops
+    // a caller Transfer-Encoding and emits one Content-Length framing mode;
+    // forwarding TE here produced TE: chunked + CL: 0 with no terminal chunk.
+    for (const kv of hdrs) {
+      if (kv[0].toLowerCase() !== "transfer-encoding") lines.push(kv[0] + ": " + kv[1]);
+    }
     if (bodyBytes && !haveCL) lines.push("Content-Length: " + bodyBytes.length);
     else if (!haveCL && method !== "GET" && method !== "HEAD" && method !== "OPTIONS" && method !== "TRACE")
       lines.push("Content-Length: 0");
