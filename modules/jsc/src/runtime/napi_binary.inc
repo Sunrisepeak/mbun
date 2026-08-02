@@ -849,3 +849,66 @@ extern "C" napi_status napi_get_all_property_names(napi_env env, napi_value obje
     *result = toNapiValue(JSC::JSValue(out));
     NAPI_RETURN_SUCCESS(env);
 }
+
+// ── property keys (NAPI_VERSION >= 10) ──────────────────────────────────────
+// port: node_api.cc node_api_create_property_key_*. Same text as the matching
+// napi_create_string_* — the difference is that the result is *internalized*,
+// so repeated use as a property key skips re-hashing. JSC's equivalent of V8's
+// kInternalized is an atom string, which Identifier::fromString produces.
+
+namespace mbun::napi_rt {
+
+inline napi_value internalizedKey(napi_env env, const WTF::String& text) {
+    return toNapiValue(
+        JSC::identifierToJSValue(env->vm(), JSC::Identifier::fromString(env->vm(), text)));
+}
+
+}  // namespace mbun::napi_rt
+
+extern "C" napi_status node_api_create_property_key_utf8(napi_env env, const char* str,
+                                                         size_t length, napi_value* result) {
+    NAPI_PREAMBLE_NO_THROW_SCOPE(env);
+    NAPI_CHECK_ARG(env, result);
+    if (length > 0) {
+        NAPI_CHECK_ARG(env, str);
+    }
+    size_t len = length == NAPI_AUTO_LENGTH ? (str ? strlen(str) : 0) : length;
+    WTF::String text = WTF::String::fromUTF8ReplacingInvalidSequences(
+        std::span{reinterpret_cast<const char8_t*>(str), len});
+    *result = mbun::napi_rt::internalizedKey(env, text);
+    return clearLastError(env);
+}
+
+extern "C" napi_status node_api_create_property_key_latin1(napi_env env, const char* str,
+                                                           size_t length, napi_value* result) {
+    NAPI_PREAMBLE_NO_THROW_SCOPE(env);
+    NAPI_CHECK_ARG(env, result);
+    if (length > 0) {
+        NAPI_CHECK_ARG(env, str);
+    }
+    size_t len = length == NAPI_AUTO_LENGTH ? (str ? strlen(str) : 0) : length;
+    WTF::String text{std::span{str, len}};  // span<const char> ctor: Latin-1 bytes
+    *result = mbun::napi_rt::internalizedKey(env, text);
+    return clearLastError(env);
+}
+
+extern "C" napi_status node_api_create_property_key_utf16(napi_env env, const char16_t* str,
+                                                          size_t length, napi_value* result) {
+    NAPI_PREAMBLE_NO_THROW_SCOPE(env);
+    NAPI_CHECK_ARG(env, result);
+    if (length > 0) {
+        NAPI_CHECK_ARG(env, str);
+    }
+    size_t len = length;
+    if (len == NAPI_AUTO_LENGTH) {
+        len = 0;
+        if (str) {
+            while (str[len] != 0) {
+                len++;
+            }
+        }
+    }
+    WTF::String text{std::span{str, len}};
+    *result = mbun::napi_rt::internalizedKey(env, text);
+    return clearLastError(env);
+}
