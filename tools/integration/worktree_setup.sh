@@ -41,7 +41,11 @@ if [ -d "$worktree/.git" ] || [ -f "$worktree/.git" ]; then
   # expensive) and keep the compat symlinks, which are untracked here.
   git -C "$worktree" checkout -q --detach
   git -C "$worktree" reset -q --hard "$start_sha"
-  git -C "$worktree" clean -qfd -e target -e compat
+  # .mcpp is excluded for the same reason target is: it is an expensive cache,
+  # not a build product. Without this, re-pointing a worktree deletes the staged
+  # packages and the next build re-downloads a 293 MB prebuilt at ~150 KB/s. It
+  # also preserves a lane's own repaired libstdc++.a (see build_lock.sh).
+  git -C "$worktree" clean -qfd -e target -e compat -e .mcpp
   git -C "$worktree" checkout -q -B "$branch" "$start_sha"
 else
   git -C "$main_root" worktree add -q --detach "$worktree" "$start_sha"
@@ -94,6 +98,35 @@ for probe in "compat/node/test/parallel" "compat/node/test/common/index.js" "com
 done
 count=$(find "$worktree/compat/node/test/parallel" -maxdepth 1 -name 'test-*.js' | wc -l)
 [ "$count" -gt 0 ] || { echo "$0: wiring failed -- no test files under compat/node/test/parallel" >&2; exit 1; }
+
+# Seed the per-worktree package cache from the main checkout.
+#
+# `.mcpp/` holds the staged prebuilt packages (bun-webkit and friends). A fresh
+# worktree has none, so its first `mcpp build` DOWNLOADS a 293 MB prebuilt --
+# and on this box that has been measured at 145-175 KB/s, i.e. **28 to 35
+# minutes before a single line compiles**. Two W46 lanes lost that
+# independently, and one of them finished at +2 against a +10 goal explicitly
+# because of it. That is the same class of loss as the build-lock queueing and
+# the wrong-libstdc++ link that W44 measured at 57% of lane wall clock.
+#
+# Copying the directory instead takes seconds off local NVMe. It is NOT free:
+# this filesystem is ext4, so --reflink is unavailable and the copy is real
+# (~1.5 GB per worktree). That is the right trade at ~30 minutes saved per lane,
+# and reclaim_disk.sh already treats these as regenerable caches. `target/` is
+# deliberately NOT seeded -- it is ~11 GB per worktree and only saves ~90s.
+#
+# Only ever seeds a worktree that has no .mcpp at all, so it cannot disturb a
+# lane that has already staged or repaired its own packages.
+if [ ! -e "$worktree/.mcpp" ] && [ -d "$main_root/.mcpp" ]; then
+  if cp -a --reflink=auto "$main_root/.mcpp" "$worktree/.mcpp" 2>/dev/null; then
+    # The donor's generated build graphs hold absolute paths into the donor.
+    find "$worktree/.mcpp" -name build.ninja -delete 2>/dev/null || true
+    echo "$0: seeded .mcpp from $main_root (skips the ~293MB prebuilt download)" >&2
+  else
+    rm -rf "$worktree/.mcpp"
+    echo "$0: note -- could not seed .mcpp; the first build will download the prebuilt package" >&2
+  fi
+fi
 
 # Make `git add -A` safe in this worktree.
 #
