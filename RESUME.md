@@ -43,6 +43,26 @@ second `AbortSignal` had replaced mbun's platform one wholesale — the surrende
 exists to end. Residual gap: composite-signal abort ordering (`01234` vs mbun's `41230`),
 which needs node's dependant-signal registry in mbun's platform `AbortSignal`. Its own lane.
 
+### CORRECTION from W46: "loadable" is not "portable"
+
+W46 sized four lanes as port-shaped on the strength of the numbers above, and two of them
+came in at +1 and +2 against +8 and +10. The premise was too broad, and the correction is
+worth more than those files:
+
+**A vendored internal that now loads can still be useless, because it bottoms out in an
+`internalBinding` mbun does not have.** `internal/http2/core.js` is the clean example — it
+loads, and then reaches `internalBinding('http2')`/nghttp2, which mbun has no equivalent of;
+its sibling `internal/http2/compat.js` is pure JS over the core stream API and *is* portable.
+Two `test-http2-*` files are unreachable until mbun's http2 **is** node's, which is a
+campaign-scale lane, not a wave-scale one. The same distinction applies to crypto (argon2 was
+a missing *bridge* over an OpenSSL primitive that was already there — cheap; the PQC families
+are the same shape) and to the test runner (only 1 of 21 files was a load failure at all; the
+other 20 are behavioural gaps in mbun's own runner).
+
+**So before sizing a lane as a port, check what the vendored module bottoms out in**, not just
+whether it loads. The reach probe answers the first question; only reading the module answers
+the second.
+
 ### The next bottleneck, measured rather than guessed
 
 The remaining 63 are **not resolution failures**:
