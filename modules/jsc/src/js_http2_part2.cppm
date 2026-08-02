@@ -342,6 +342,20 @@ export constexpr std::string_view kHttp2JS_part2 = R"JS(
         this.session._sendData(this, Buffer.alloc(0), true);
       } else {
         const block = encodeHeaders(list, sensitive);
+        // node's nghttp2 session rejects a serialized trailer block above
+        // maxSendHeaderBlockLength (64 KiB by default) before it splits the
+        // block into legal wire frames. Report the local frame failure and
+        // reset the stream with FRAME_SIZE_ERROR; treating this as ordinary
+        // HEADERS + CONTINUATION delivery makes the peer wait forever for the
+        // error events asserted by test-http2-exceeds-server-trailer-size.
+        const maxBlock = this.session._options && this.session._options.maxSendHeaderBlockLength !== undefined
+          ? this.session._options.maxSendHeaderBlockLength : 64 * 1024;
+        if (block.length > maxBlock) {
+          this.emit("frameError", FRAME.HEADERS, constants.NGHTTP2_FRAME_SIZE_ERROR, this.id);
+          this.close(constants.NGHTTP2_FRAME_SIZE_ERROR);
+          this.session.close();
+          return;
+        }
         writeHeaderBlock(this.session, this.id, block, FLAG.END_STREAM);
       }
       this._endStreamSent = true;

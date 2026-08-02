@@ -5,6 +5,16 @@
 
 ## 2026-08-02
 
+- W407 Node HTTP/2 server trailer max-block error source fix：`sendTrailers()` 现在在 server 侧先检查默认/显式
+  `maxSendHeaderBlockLength`，超出 64 KiB 时发出 `frameError`，以 `NGHTTP2_FRAME_SIZE_ERROR` reset stream，
+  并 graceful close session；合法 block 仍使用 HEADERS/CONTINUATION 拆分。focused 文件从 **1/1 timeout**
+  到 **1/1 pass**；W404/W403 五文件回归均 **5/5 pass**；serial release builds **59.72s、59.49s**。
+  未修改 upstream fixture、未跑全量 corpus。
+
+- W406 Node HTTP/2 NGHTTP2 error-code mapping revalidation：inventory 标注的六文件 cluster 采用首轮 **5-job
+  wave 5/5 pass** 加第六文件 **1/1 pass** 复核，0 timeout；当前 Linux 构建未复现 source owner，未做 speculative
+  修改、未触发构建。
+
 - W405 Node HTTP/2 autoselect readable-buffer source fix：修复自定义 `net.Socket` 在
   `readable` 监听初始化时通过 `read(0)` 误消费 `_rq` 的问题；现在 `read(0)` 保持非消费，`read(3)`
   只返回请求长度并保留余量，缓存数据到达时按下一轮时序通知 `readable`。focused 文件从 **1/1

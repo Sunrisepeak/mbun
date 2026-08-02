@@ -351,6 +351,8 @@ the observed Linux limits; the coordinator owns the only root build.
 | W403 | Node HTTP/2 delayed request/GOAWAY ready-edge source fix | 5 | baseline selector 4/5 pass + 1 fail; focused target 1/1 fail → 1/1 pass; post selector 5/5 pass, 0 fail, 0 timeout; W402 HTTP/2 regression 5/5 pass, 0 fail, 0 timeout; Bun fake-timer guard 4 green + 1 no-tests, 43 passed / 0 failed / 43 ran / 98 expects; serial release builds 58.98s + 59.16s + 59.29s | defer cleartext HTTP/2 ready handling to the next I/O turn so `request()` + `close()` preserves Node's `ERR_HTTP2_GOAWAY_SESSION` timing; no upstream fixture change |
 | W404 | Node HTTP/2 initial SETTINGS ACK accounting source fix | 5 | baseline selector 2/5 pass + 3 timeout; focused target 1/1 timeout → 1/1 pass; post selector 3/5 pass + 2 timeout; W403 regression 5/5 pass, W402 regression 5/5 pass; serial release build 59.50s | count the server's initial SETTINGS frame in `pendingSettingsAck` so `maxOutstandingSettings: 2` trips on the second application settings call; park autoselect and trailer-size stalled exchanges as separate owners |
 | W405 | Node HTTP/2 autoselect readable-buffer source fix | 5 | focused target 1/1 timeout → 1/1 pass; W403 five-file regression 5/5 pass; W404 post selector 4/5 pass + 1 timeout; five HTTP/2 socket guards 4/5 pass + 1 known timeout-inspect failure; serial release build 59.05s | keep `read(0)` as a non-consuming probe, bound `read(3)` to the requested bytes, and notify `readable` listeners when parked socket data arrives; retain the independent trailer-size and timeout-inspect owners |
+| W406 | Node HTTP/2 NGHTTP2 error-code mapping revalidation | 5 | first five-job wave 5/5 pass; sixth confirmation 1/1 pass; 0 timeout; no build | inventory cause is stale on the current Linux build; no source owner and no speculative change |
+| W407 | Node HTTP/2 server trailer max-block error source fix | 5 | baseline focused target timeout; direct frame-error lifecycle primitive passed; after fix focused target 1/1 pass; W404 regression 5/5 pass; W403 regression 5/5 pass; serial release builds 59.72s + 59.49s | reject server trailer blocks above default/explicit `maxSendHeaderBlockLength` before CONTINUATION splitting, emit `frameError`, reset with `NGHTTP2_FRAME_SIZE_ERROR`, and gracefully close the session |
 
 ## W305 Bun/Deno Event/Performance/URL/crypto leaf probe
 
@@ -1931,6 +1933,35 @@ guards measured **4/5 pass**; the sole failure was the pre-existing
 `test-http2-socket-proxy.js` timer-inspection owner. The serial release build
 took **59.05s**. No upstream fixture changed and no full corpus/workspace-wide
 test ran.
+
+## W406 Node HTTP/2 NGHTTP2 error-code mapping revalidation
+
+The inventory's six-file `http2-nghttp2-error-code-mapping` cluster was
+rechecked in bounded waves: the first five-job wave measured **5/5 passes**,
+then `test-http2-server-rst-stream.js` confirmed **1/1 pass** separately. All
+six files returned without timeout on the current Linux build, so this
+inventory entry is stale for the present source state. No source change or
+build was made for this revalidation.
+
+## W407 Node HTTP/2 server trailer max-block error source fix
+
+`test-http2-exceeds-server-trailer-size.js` initially timed out because the
+pure-JS HTTP/2 writer split its oversized trailer HPACK block into valid
+HEADERS/CONTINUATION frames. Node instead applies the default
+`maxSendHeaderBlockLength` of **64 KiB** to the serialized block before frame
+splitting. A direct lifecycle probe established the required path:
+`frameError(HEADERS, NGHTTP2_FRAME_SIZE_ERROR)` followed by stream reset and
+session close produces the expected server/client stream errors and close
+events.
+
+`js_http2_part2.cppm` now checks the default or explicit maximum in server
+`sendTrailers()`. Oversized blocks emit `frameError`, reset the stream with
+`NGHTTP2_FRAME_SIZE_ERROR`, and request graceful session close; normal trailer
+blocks retain the existing CONTINUATION splitting. The focused target moved
+from **1/1 timeout** to **1/1 pass**. W404's five-file selector and W403's
+five-file selector both remained **5/5 pass**. The two serial release builds
+took **59.72s** and **59.49s**. No upstream fixture changed and no full
+corpus/workspace-wide test ran.
 
 ## W401 Node fs flush revalidation
 
