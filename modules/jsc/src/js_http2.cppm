@@ -406,6 +406,7 @@ export constexpr std::string_view kHttp2JS_part1 = R"JS(
   // method on internalBinding('http2').Http2Stream.prototype. A failed submit
   // is stream-local, so it must become NghttpError on this stream (and its
   // existing destroy path sends the matching RST_STREAM to the peer).
+  let nativeHttp2SessionPrototype = null;
   let nativeHttp2StreamPrototype = null;
   const submitNativeStream = (stream, method, ...args) => {
     const submit = nativeHttp2StreamPrototype && nativeHttp2StreamPrototype[method];
@@ -416,6 +417,41 @@ export constexpr std::string_view kHttp2JS_part1 = R"JS(
     // adopt its constructor before exposing the error for identity checks.
     if (bindingRequested) adoptNodeHttp2Internals();
     stream.destroy(nghttpErr(errno));
+    return false;
+  };
+  // Keep the request-submit seam replaceable for the same reason as the stream
+  // seams above. Node's internal http2 tests replace
+  // `internalBinding('http2').Http2Session.prototype.request` and expect the
+  // live ClientHttp2Session to observe the returned nghttp2 errno before a
+  // HEADERS frame reaches the peer.
+  const submitNativeSessionRequest = (session, stream, headers, options) => {
+    const submit = nativeHttp2SessionPrototype && nativeHttp2SessionPrototype.request;
+    if (typeof submit !== "function") return null;
+    const errno = Reflect.apply(submit, session, [headers, options]);
+    if (typeof errno !== "number" || errno >= 0) return true;
+    if (bindingRequested) adoptNodeHttp2Internals();
+    let err;
+    let sessionError = false;
+    if (errno === -509) {
+      err = mkErr("No stream ID is available because maximum stream ID has been reached", "ERR_HTTP2_OUT_OF_STREAMS");
+    } else if (errno === -501) {
+      err = mkErr("A stream cannot depend on itself", "ERR_HTTP2_STREAM_SELF_DEPENDENCY");
+    } else {
+      err = nghttpErr(errno);
+      sessionError = true;
+    }
+    // requestOnConnect returns a stream even when native submission fails. It
+    // has no id in these cases, so close it without queueing an invalid RST on
+    // stream 0. Generic session failures also cancel that pending stream with
+    // the same ERR_HTTP2_STREAM_CANCEL/cause pair as Node's closeSession().
+    stream.pending = false;
+    stream._closed = true;
+    if (sessionError) {
+      session._fatal(err);
+      G.queueMicrotask(() => { if (!stream.destroyed) stream.destroy(streamCancelErr(err)); });
+    } else {
+      G.queueMicrotask(() => { if (!stream.destroyed) stream.destroy(err); });
+    }
     return false;
   };
   // internal/errors.js AbortError: what request({ signal }) destroys the stream
@@ -1399,7 +1435,18 @@ export constexpr std::string_view kHttp2JS_part1 = R"JS(
       // code NGHTTP2_CANCEL'.
       if (code !== constants.NGHTTP2_NO_ERROR && code !== constants.NGHTTP2_CANCEL) {
         const err = streamErr(code);
-        G.queueMicrotask(() => { if (!stream.destroyed) stream.destroy(err); else stream.emit("error", err); });
+        G.queueMicrotask(() => {
+          // node's stream-close path ends the readable side before delivering
+          // the reset error, so consumers still observe `end` on an aborted
+          // request.
+          if (!stream.destroyed) {
+            http2StreamEndReadable(stream);
+            G.process.nextTick(() => {
+              if (!stream.destroyed) stream.destroy(err);
+              else stream.emit("error", err);
+            });
+          } else stream.emit("error", err);
+        });
         return;
       }
       http2StreamFinish(stream);
@@ -1745,6 +1792,19 @@ export constexpr std::string_view kHttp2JS_part1 = R"JS(
       this._openRequests = 0;
       this._pendingSubmits = [];
       this._destroyPending = false;
+      this._connectAbort = false;
+      const connectSignal = this._options.signal;
+      if (connectSignal && typeof connectSignal.addEventListener === "function") {
+        const onConnectAbort = () => {
+          this._connectAbort = true;
+          if (!this.destroyed) this.destroy(abortErr(connectSignal.reason));
+        };
+        if (connectSignal.aborted === true) G.queueMicrotask(onConnectAbort);
+        else {
+          connectSignal.addEventListener("abort", onConnectAbort, { once: true });
+          this.once("close", () => { try { connectSignal.removeEventListener("abort", onConnectAbort); } catch (e) {} });
+        }
+      }
       // node Http2Session: `encrypted` reflects the transport, `alpnProtocol` is
       // "h2c" for a cleartext session, and `originSet` stays undefined until an
       // ORIGIN frame arrives (DEFERRED).
@@ -1770,7 +1830,10 @@ export constexpr std::string_view kHttp2JS_part1 = R"JS(
       // Only the default-port case is rebuilt here; keeping `u.host` otherwise
       // preserves the bracketed form of an IPv6 literal, which node's
       // `host`-based formula would flatten to `::1:8080`.
-      this._authorityName = u.port ? u.host : u.host + ":" + port;
+      const authorityServername = options && options.servername ? String(options.servername) : "";
+      this._authorityName = authorityServername
+        ? authorityServername + ":" + port
+        : (u.port ? u.host : u.host + ":" + port);
       // node connect(): `host = authority.hostname; if (host[0] === '[') host =
       // host.slice(1, -1)`. A URL keeps an IPv6 literal in its bracketed form,
       // and neither net.connect nor tls.connect accepts the brackets — the
@@ -1822,6 +1885,7 @@ export constexpr std::string_view kHttp2JS_part1 = R"JS(
           servername: options && options.servername ? options.servername
             : (net && typeof net.isIP === "function" && net.isIP(host) ? undefined : host),
         });
+        delete tlsOpts.signal;
         // node initializeTLSOptions: the h2 ALPN list is only imposed when the
         // caller did NOT supply an ALPNCallback (the two are mutually exclusive
         // in tls.connect), and allowHTTP1 appends the fallback protocol.
@@ -1844,9 +1908,21 @@ export constexpr std::string_view kHttp2JS_part1 = R"JS(
         // both. Going through net.connect also lets localAddress/family/lookup
         // reach the transport the way node's spread does.
         const netOpts = Object.assign({ port: String(port), host }, options);
+        delete netOpts.signal;
         const sock = typeof net.connect === "function" ? net.connect(netOpts) : new net.Socket();
         this._rawSocket = sock;
-        sock.on("connect", () => { self.alpnProtocol = "h2c"; self._onSocketReady(); });
+        // net.connect() can report a loopback connection synchronously in the
+        // mbun transport. Node never exposes Http2Session#connect from inside
+        // http2.connect(), though: callers must be able to attach the
+        // listener before the handshake runs. Deferring the ready edge by an
+        // I/O turn keeps request()+close() in the pre-connect state, where Node
+        // reports ERR_HTTP2_GOAWAY_SESSION for the pending request
+        // (test-http2-goaway-delayed-request).
+        sock.on("connect", () => {
+          self.alpnProtocol = "h2c";
+          const nextTurn = typeof G.setImmediate === "function" ? G.setImmediate : G.queueMicrotask;
+          nextTurn(() => self._onSocketReady());
+        });
         sock.on("data", (d) => self._onData(d));
         sock.on("error", (e) => self._onSocketError(e));
         sock.on("close", () => self._onSocketClose());
@@ -1934,7 +2010,11 @@ export constexpr std::string_view kHttp2JS_part1 = R"JS(
       // See the server session's _writeFrame: net.Socket.write() on an ended or
       // destroyed socket EMITS 'error' instead of throwing, so this try/catch
       // cannot contain it. nghttp2 drops frames once the transport is gone.
-      if (this._rawSocket.destroyed || this._rawSocket.writable === false) return;
+      // The public socket proxy deliberately permits callers to assign
+      // `writable`/`readable` for Node parity. Those properties are not the
+      // protocol transport state: only the internal shutdown marker or actual
+      // destruction may suppress an HTTP/2 frame.
+      if (this._rawSocket.destroyed || this._rawSocket._shutW === true) return;
       try { this._rawSocket.write(frame); } catch (e) { if (!this.closed && !this.destroyed) this._fatal(e); }
     }
 
@@ -1984,7 +2064,13 @@ export constexpr std::string_view kHttp2JS_part1 = R"JS(
       // request wait for a free concurrency slot (below) without the caller
       // seeing anything but a normal, corked stream.
       const stream = new ClientHttp2Stream(this, 0, headers, options);
+      const hasNativeRequest = nativeHttp2SessionPrototype &&
+        typeof nativeHttp2SessionPrototype.request === "function";
       const submit = () => {
+        // node requestOnConnect calls the native submit after the caller has
+        // returned the pending stream. Keep that edge observable: internal
+        // tests install the return code immediately after request() returns.
+        if (hasNativeRequest && submitNativeSessionRequest(self, stream, headers, options) === false) return;
         const streamId = self._nextStreamId();
         if (streamId < 0) {
           // node requestOnConnect: a negative id from nghttp2 becomes
@@ -2090,6 +2176,8 @@ export constexpr std::string_view kHttp2JS_part1 = R"JS(
         // 'error' + 'close' like any other failed request.
         stream.pending = false;
         G.process.nextTick(() => { if (!stream.destroyed) stream.destroy(requestError); });
+      } else if (hasNativeRequest) {
+        this._whenConnected(submit);
       } else if (this._pendingSubmits.length > 0 || this._openRequests >= this._maxConcurrentSend()) {
         // Cork exactly the way the constructor corks a not-yet-connected
         // stream: writes and end() issued by the caller are buffered until the
@@ -2257,6 +2345,14 @@ export constexpr std::string_view kHttp2JS_part1 = R"JS(
           this._lastProcStreamId = streamId;
           this._localWindow -= len;
           if (stream) {
+            // A PUSH_PROMISE reserves the stream until response HEADERS arrive.
+            // DATA in that interval is a stream-state error: refuse it with
+            // STREAM_CLOSED, but keep the session alive for later frames.
+            if (stream.pushed === true && !stream._responseEmitted) {
+              this.streams.delete(streamId);
+              http2StreamClose(stream, constants.NGHTTP2_STREAM_CLOSED);
+              return true;
+            }
             if (data.length) stream._pushData(data);
             // maintain flow-control windows so large bodies keep flowing
             if (len > 0) { this._windowUpdate(0, len); this._windowUpdate(streamId, len); }
@@ -2578,7 +2674,10 @@ export constexpr std::string_view kHttp2JS_part1 = R"JS(
       // socket teardown, and force-finishing those cost 5 files (they emit their
       // own 'close'/'aborted' first). A stream on a session that never connected
       // has nothing to drive it at all, so it kept its handle and the loop alive.
-      const pending = !this._connected ? Array.from(this.streams.values()) : [];
+      const pending = this._connectAbort
+        ? Array.from(this.streams.values())
+        : (!this._connected ? Array.from(this.streams.values()) : []);
+      const pendingSet = new Set(pending);
       // An OPEN stream is usually driven to its end by the socket teardown, and
       // force-finishing it in this microtask cost 5 files last time — it ran
       // BEFORE the stream's own 'close'/'aborted' and reordered them. But when
@@ -2588,7 +2687,7 @@ export constexpr std::string_view kHttp2JS_part1 = R"JS(
       // (test-http2-client-session-close-before-stream-close). Sweep them one
       // I/O TURN later instead: every natural path has already run by then, so
       // only the genuinely dangling ones are still here.
-      const open = this._connected ? Array.from(this.streams.values()) : [];
+      const open = this._connected ? Array.from(this.streams.values()).filter((s) => !pendingSet.has(s)) : [];
       // A request still queued behind the peer's concurrency limit has no id and
       // is not in `streams`, so the socket teardown cannot reach it. node
       // destroys its pending streams with ERR_HTTP2_STREAM_CANCEL; leaving them
@@ -2683,7 +2782,7 @@ export constexpr std::string_view kHttp2JS_part1 = R"JS(
     ref() { if (this._rawSocket && this._rawSocket.ref) this._rawSocket.ref(); return this; }
     unref() { if (this._rawSocket && this._rawSocket.unref) this._rawSocket.unref(); return this; }
     // PORT-SOURCE: compat/node/lib/internal/http2/core.js Http2Session `get socket()`
-    get socket() { return sessionSocketProxy(this); }
+    get socket() { return this._rawSocket === undefined ? undefined : sessionSocketProxy(this); }
     set socket(v) { this._rawSocket = v; }
     // node: an inactivity timeout that emits 'timeout' on the session and on
     // every open stream (lib/internal/http2/core.js Http2Session.setTimeout ->

@@ -146,20 +146,40 @@ void test_callback_apis_require_callbacks() {
 }
 
 void test_lookup_does_not_block_the_js_turn() {
+#if !defined(_WIN32)
+    namespace dnsTest = mbun::jsc::runtime::dns_testing;
+    dnsTest::install_delayed_backend();
     static_cast<void>(mbun::jsc::runtime::eval_number(
         "(()=>{const dns=require('node:dns');globalThis.__dnsOrder=[];"
-        "dns.lookup('localhost',(err)=>{__dnsOrder.push(err?'error':'dns')});"
+        "dns.lookup('held-order.test',(err)=>{__dnsOrder.push(err?'error':'dns')});"
         "setTimeout(()=>__dnsOrder.push('timer'),0);return 0})()"));
 
+    if (!spin_until([] { return dnsTest::delayed_backend_entered(); })) {
+        ++gFailed;
+        std::println("  FAIL: ordering test backend was entered");
+        dnsTest::release_delayed_backend();
+        dnsTest::clear_delayed_backend();
+        return;
+    }
     expect_num("globalThis.__dnsOrder.length===0?1:0", 1.0,
                "getaddrinfo completion is not run in the initiating JS turn");
+    if (!pump_until("globalThis.__dnsOrder.includes('timer')?1:0")) {
+        ++gFailed;
+        std::println("  FAIL: zero-delay timer did not progress while worker DNS was held");
+    }
+    expect_num("globalThis.__dnsOrder.includes('dns')?1:0", 0.0,
+               "held worker DNS does not complete before backend release");
+    dnsTest::release_delayed_backend();
     if (!pump_until("globalThis.__dnsOrder.includes('dns')?1:0")) {
         ++gFailed;
-        std::println("  FAIL: asynchronous localhost lookup completed");
+        std::println("  FAIL: asynchronous worker DNS lookup completed after release");
+        dnsTest::clear_delayed_backend();
         return;
     }
     expect_num("globalThis.__dnsOrder[0]==='timer'&&globalThis.__dnsOrder[1]==='dns'?1:0",
                1.0, "a zero-delay timer progresses before worker DNS completion");
+    dnsTest::clear_delayed_backend();
+#endif
 }
 
 #if !defined(_WIN32)
@@ -212,8 +232,10 @@ void test_delayed_backend_keeps_lookup_reverse_and_service_off_js_thread() {
     JSGarbageCollect(static_cast<JSContextRef>(context));
     expect_num("globalThis.__dnsDelayedDone", 0.0,
                "held lookup/reverse/lookupService do not complete on the JS thread");
-    static_cast<void>(mbun::jsc::runtime::eval_number(
-        "globalThis.__mbun_drain_timers ? __mbun_drain_timers(1) : 0"));
+    if (!pump_until("globalThis.__dnsDelayedTimer===1?1:0")) {
+        ++gFailed;
+        std::println("  FAIL: JS timer did not fire while resolver backend was held");
+    }
     expect_num("globalThis.__dnsDelayedTimer", 1.0,
                "JS timers remain responsive while resolver backend is held");
     expect_num("globalThis.__dnsDelayedDone", 0.0,

@@ -50,6 +50,68 @@ std::string drain_openssl_errors() {
     return message;
 }
 
+std::string hostname_mismatch_message(SSL* ssl, std::string_view serverName) {
+    X509* ownedPeer {ssl != nullptr ? ::SSL_get1_peer_certificate(ssl) : nullptr};
+    X509* peer {ownedPeer};
+    // On a client-side handshake that stops during certificate verification,
+    // OpenSSL can release the direct peer handle before fail_() inspects the
+    // result. The unowned peer chain still contains the leaf at this point.
+    if (peer == nullptr && ssl != nullptr) {
+        STACK_OF(X509)* chain {::SSL_get_peer_cert_chain(ssl)};
+        if (chain != nullptr && ::sk_X509_num(chain) > 0) {
+            peer = sk_X509_value(chain, 0);
+        }
+    }
+    if (peer == nullptr) {
+        return "Hostname/IP does not match certificate's altnames: Host: "
+             + std::string {serverName} + ". is not in the cert's altnames";
+    }
+
+    bool hasDnsOrIpSan {false};
+    GENERAL_NAMES* names {static_cast<GENERAL_NAMES*>(::X509_get_ext_d2i(
+        peer, NID_subject_alt_name, nullptr, nullptr))};
+    if (names != nullptr) {
+        const int count {::sk_GENERAL_NAME_num(names)};
+        for (int i {0}; i < count; ++i) {
+            const GENERAL_NAME* name {sk_GENERAL_NAME_value(names, i)};
+            if (name != nullptr && (name->type == GEN_DNS || name->type == GEN_IPADD)) {
+                hasDnsOrIpSan = true;
+                break;
+            }
+        }
+        ::GENERAL_NAMES_free(names);
+    }
+
+    std::string commonName {};
+    if (!hasDnsOrIpSan) {
+        X509_NAME* subject {::X509_get_subject_name(peer)};
+        const int index {subject != nullptr
+                             ? ::X509_NAME_get_index_by_NID(subject, NID_commonName, -1)
+                             : -1};
+        if (index >= 0) {
+            X509_NAME_ENTRY* entry {::X509_NAME_get_entry(subject, index)};
+            ASN1_STRING* value {entry != nullptr ? ::X509_NAME_ENTRY_get_data(entry) : nullptr};
+            unsigned char* utf8 {nullptr};
+            const int length {value != nullptr ? ::ASN1_STRING_to_UTF8(&utf8, value) : -1};
+            if (length > 0 && utf8 != nullptr) {
+                commonName.assign(reinterpret_cast<const char*>(utf8),
+                                  static_cast<std::size_t>(length));
+            }
+            ::OPENSSL_free(utf8);
+        }
+    }
+    if (ownedPeer != nullptr) {
+        ::X509_free(ownedPeer);
+    }
+
+    if (!commonName.empty()) {
+        return "Hostname/IP does not match certificate's altnames: Host: "
+             + std::string {serverName} + ". is not cert's CN: " + commonName;
+    }
+    return "Hostname/IP does not match certificate's altnames: Host: "
+         + std::string {serverName} + ". is not in the cert's altnames";
+}
+
 // PEM passphrase callback — node's crypto_util.cc PasswordCallback.
 //
 // It exists to make sure OpenSSL NEVER falls back to its default UI, which reads
@@ -154,6 +216,7 @@ struct TlsChannel::Impl {
     BIO* wbio_ {nullptr}; // SSL -> network (ciphertext to send)
     HandshakeState state_ {HandshakeState::not_started};
     IoWant want_ {IoWant::none};
+    bool serverHasCredentials_ {false};
     bool shutdownSent_ {false};
     bool shutdownDone_ {false};
     std::string error_ {};
@@ -175,6 +238,14 @@ struct TlsChannel::Impl {
     // ceiling is only ever reached by a peer issuing tickets in a loop.
     std::vector<std::vector<std::uint8_t>> newSessions_ {};
     static constexpr std::size_t kNewSessionMax {16};
+    // The ticket offered for a resumed client handshake. OpenSSL may replace
+    // SSL_get_session() with a freshly issued post-handshake ticket, while
+    // Node's getTLSTicket() continues to expose the ticket that was reused.
+    std::vector<std::uint8_t> resumedTicket_ {};
+    // The first ticket issued on this connection. OpenSSL may advance the
+    // current SSL_SESSION when a later TLS 1.3 ticket arrives, but Node keeps
+    // the ticket observed by the first `session` callback stable.
+    std::vector<std::uint8_t> firstTicket_ {};
     // SERVER: the per-servername credentials the servername callback picks from.
     // Kept on the Impl (not in the by-value Config setup_ received) because the
     // callback runs long after setup_ returned, inside SSL_do_handshake.
@@ -199,6 +270,13 @@ struct TlsChannel::Impl {
         unsigned char* out {der.data()};
         if (::i2d_SSL_SESSION(session, &out) <= 0) return 0;
         self->newSessions_.push_back(std::move(der));
+        if (self->firstTicket_.empty()) {
+            const unsigned char* ticket {nullptr};
+            std::size_t ticketLen {0};
+            ::SSL_SESSION_get0_ticket(session, &ticket, &ticketLen);
+            if (ticket != nullptr && ticketLen > 0)
+                self->firstTicket_.assign(ticket, ticket + ticketLen);
+        }
         return 0;
     }
 
@@ -386,8 +464,7 @@ struct TlsChannel::Impl {
             const long vr {::SSL_get_verify_result(ssl_)};
             if (vr == X509_V_ERR_HOSTNAME_MISMATCH || vr == X509_V_ERR_IP_ADDRESS_MISMATCH) {
                 errorCode_ = "ERR_TLS_CERT_ALTNAME_INVALID";
-                error_ = "Hostname/IP does not match certificate's altnames: Host: " +
-                         serverName_ + ". is not in the cert's altnames";
+                error_ = hostname_mismatch_message(ssl_, serverName_);
                 return;
             }
             // A CHAIN verification failure is reported by node as the X509 error
@@ -466,6 +543,11 @@ struct TlsChannel::Impl {
                 return;
             }
         }
+        if (role_ == TlsRole::server && !serverHasCredentials_
+            && errorCode_ == "ERR_SSL_NO_SHARED_CIPHER") {
+            error_ = "no suitable signature algorithm";
+            return;
+        }
         error_ = std::string {where};
         if (!detail.empty()) {
             error_ += ": ";
@@ -527,6 +609,7 @@ struct TlsChannel::Impl {
 
     bool setup_(Config config) {
         ensure_library();
+        serverHasCredentials_ = role_ == TlsRole::server && config.has_credentials();
         ctx_ = ::SSL_CTX_new(role_ == TlsRole::client ? ::TLS_client_method()
                                                       : ::TLS_server_method());
         if (ctx_ == nullptr) {
@@ -773,6 +856,12 @@ struct TlsChannel::Impl {
                 SSL_SESSION* prior {::d2i_SSL_SESSION(
                     nullptr, &p, static_cast<long>(config.sessionDer.size()))};
                 if (prior != nullptr) {
+                    const unsigned char* ticket {nullptr};
+                    std::size_t ticketLen {0};
+                    ::SSL_SESSION_get0_ticket(prior, &ticket, &ticketLen);
+                    if (ticket != nullptr && ticketLen > 0) {
+                        resumedTicket_.assign(ticket, ticket + ticketLen);
+                    }
                     ::SSL_set_session(ssl_, prior);
                     ::SSL_SESSION_free(prior);
                 } else {
@@ -873,7 +962,7 @@ struct TlsChannel::Impl {
         X509_STORE* store {::SSL_CTX_get_cert_store(ctx_)};
         int added {0};
         X509* cert {nullptr};
-        while ((cert = ::PEM_read_bio_X509(bio, nullptr, nullptr, nullptr)) != nullptr) {
+        while ((cert = ::PEM_read_bio_X509_AUX(bio, nullptr, nullptr, nullptr)) != nullptr) {
             if (::X509_STORE_add_cert(store, cert) == 1) {
                 ++added;
             }
@@ -1240,6 +1329,11 @@ std::vector<std::string> TlsChannel::shared_sigalgs() const {
         entry += hn != nullptr ? hn : "UNDEF";
         out.push_back(std::move(entry));
     }
+    // OBJ_nid2sn reports an unknown signature/hash NID through OpenSSL's
+    // thread-local error queue. This query is informational; leaving that
+    // reason queued makes a later clean-close SSL_read look like a handshake
+    // failure (ERR_OSSL_UNKNOWN_NID).
+    ::ERR_clear_error();
     return out;
 }
 
@@ -1418,6 +1512,9 @@ EphemeralKeyInfo TlsChannel::ephemeral_key_info() const {
     }
     }
     ::EVP_PKEY_free(key);
+    // Informational NID lookup above may leave ERR_R_UNSUPPORTED/unknown-nid
+    // on OpenSSL's queue; it must not become a later transport error.
+    ::ERR_clear_error();
     return info;
 }
 
@@ -1511,6 +1608,10 @@ std::vector<std::uint8_t> TlsChannel::tls_ticket() const {
     if (impl_->ssl_ == nullptr) {
         return out;
     }
+    if (::SSL_session_reused(impl_->ssl_) == 1 && !impl_->resumedTicket_.empty()) {
+        return impl_->resumedTicket_;
+    }
+    if (!impl_->firstTicket_.empty()) return impl_->firstTicket_;
     SSL_SESSION* session {::SSL_get_session(impl_->ssl_)};
     if (session == nullptr) {
         return out;

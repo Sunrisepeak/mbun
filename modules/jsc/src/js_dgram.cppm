@@ -133,7 +133,7 @@ export constexpr std::string_view kDgramJS = R"JS(
     if ((typeof port !== "number" && typeof port !== "string") ||
         (typeof port === "string" && String(port).trim().length === 0) ||
         +port !== (+port >>> 0) || port > 0xFFFF || (port === 0 && allowZero === false)) {
-      const e = new RangeError(name + " should be " + (allowZero === false ? ">= 1 and " : ">= 0 and ") +
+      const e = new RangeError(name + " should be " + (allowZero === false ? "> 0 and " : ">= 0 and ") +
         "< 65536. Received " + inspect(port) + ".");
       e.code = "ERR_SOCKET_BAD_PORT";
       throw e;

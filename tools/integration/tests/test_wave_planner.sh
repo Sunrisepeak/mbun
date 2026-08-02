@@ -52,6 +52,9 @@ printf 'wave\tlane\tcorpus\tarea\tgoal\tdelivered\tminutes\tregressions\tnote\n'
   printf '1\tD\tbun\tnapi/node-napi-tests\t6\t6\t60\t0\tsucceeded before the strike\n'
   # A genuine bust: struck area AND delivered nothing. This one must be dropped.
   printf '1\tE\tbun\tnapi/node-napi-tests\t6\t0\t120\t0\tbust\n'
+  # Planned rows are intentionally present in the shared ledger before their
+  # lane runs. They must not enter the verified throughput totals.
+  printf '1\tF\tbun\tshared-cause\t6\tPENDING\tPENDING\tPENDING\tplanned\n'
 } >>"$tmp/ledger.tsv"
 
 # Pin the disk reading: the guard is real and correctly refuses to plan when the

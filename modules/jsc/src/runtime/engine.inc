@@ -256,6 +256,14 @@ public:
         if (auto r{eval_void(js)}; !r) {
             return r;
         }
+        // Node's internal/event_target module loads only after the builtin image
+        // is assembled. Let the node-process partition repair its
+        // NodeEventTarget/Event realm boundary once top-level require exists.
+        if (auto r{eval_void(
+                "if (typeof globalThis.__mbunPatchNodeEventTarget === 'function') "
+                "globalThis.__mbunPatchNodeEventTarget(globalThis.require);")}; !r) {
+            return r;
+        }
         // Finish the entry Module from C++: `paths` reuses the loader's own
         // transliteration of Module._nodeModulePaths, and the entry becomes the
         // root of the parent chain so top-level require()s land in
@@ -494,6 +502,22 @@ public:
         }
         (void)eval_void("Object.defineProperty(globalThis,'__mbunInPreload',"
                         "{value:false,writable:true,enumerable:false,configurable:true});");
+
+        // Node starts the main entry through Module.runMain after --require
+        // modules have loaded. Keep that dispatch point observable so a
+        // preload can apply the legacy runMain monkey-patch supported by
+        // internal/main/run_main_module.js. Bun continues through the native
+        // entry wrapper below, and Node entries without preloads keep the
+        // existing path because there is no user hook to observe.
+        if (gDialect == mbun::jsc::runtime::Dialect::Node && !gPreloads.empty()) {
+            if (auto r{eval_void("require('module').runMain(" + json_quote_(absPath) + ");",
+                                 absPath)};
+                !r) {
+                return fail_run_(r.error());
+            }
+            pump_event_loop("0");
+            return finish_run_(0);
+        }
         std::string js{source};
         bool tla{false};
         // `// @bun` pragma (after an optional hashbang line): the entry is already
@@ -1075,6 +1099,36 @@ public:
         return out;
     }
 
+    // Node's own `internal/*` modules live under the vendored node source's
+    // `lib/` tree, not in a user `node_modules/` directory. The test runner can
+    // be launched from a temporary cwd, so the normal cwd-based package walk
+    // cannot find them. When an internal request originates from a file in the
+    // vendored tree, add that tree's `lib` directory as a resolver root.
+    static std::vector<std::string> node_paths_for_(std::string_view spec,
+                                                    const std::string& fromDir) {
+        std::vector<std::string> out{node_paths_from_env()};
+        if (!spec.starts_with("internal/")) return out;
+
+        std::error_code ec;
+        std::filesystem::path dir{fromDir};
+        if (dir.empty()) return out;
+        if (!dir.is_absolute()) dir = std::filesystem::absolute(dir, ec);
+        if (ec) return out;
+        dir = dir.lexically_normal();
+        for (int depth{0}; depth < 64; ++depth) {
+            const std::filesystem::path lib{dir / "lib"};
+            if (std::filesystem::is_directory(lib / "internal", ec)) {
+                const std::string root{lib.lexically_normal().string()};
+                if (std::ranges::find(out, root) == out.end()) out.emplace_back(root);
+                return out;
+            }
+            const std::filesystem::path parent{dir.parent_path()};
+            if (parent == dir || parent.empty()) break;
+            dir = parent;
+        }
+        return out;
+    }
+
     const mbun::resolver::TsconfigPaths* find_tsconfig_(const std::string& fromDir) {
         std::error_code ec;
         std::filesystem::path d{fromDir};
@@ -1150,7 +1204,7 @@ public:
         mbun::resolver::Options opts;
         opts.kind = esm ? mbun::resolver::ResolveKind::Import : mbun::resolver::ResolveKind::Require;
         opts.tsconfig = find_tsconfig_(fromDir);
-        opts.node_paths = node_paths_from_env();
+        opts.node_paths = node_paths_for_(spec, fromDir);
         mbun::jsc::module_loader::ModuleLoader loader{os_fs(), std::move(opts), /*cjs=*/true};
         mbun::jsc::module_loader::LoadResult loaded{loader.load(base, fromDir)};
         using mbun::jsc::module_loader::LoadStatus;

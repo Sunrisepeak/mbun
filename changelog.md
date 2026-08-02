@@ -3,6 +3,1051 @@
 > 只记录**实质进展**（模块落地、测试集通过数变化、性能节点），倒序排列。
 > 格式：`## YYYY-MM-DD` + 条目（关联任务 ID / commit / 测试与性能数据）。
 
+## 2026-08-02
+
+- W424 GCC workspace gate timer-order test correction：修正 `test_runtime_dns` 在
+  `setTimeout(..., 0)` 已按整数毫秒语义归一到最小 1ms 后仍只立即 drain 一次的
+  测试竞态；现在在 delayed DNS backend 保持阻塞时 pump 到 timer 真正到期，再验证
+  DNS callback 仍须等 backend release。未回退 runtime timer 语义、未 skip CI；上一轮
+  W423 gate 的 GCC 唯一失败为该测试，LLVM 已通过，修复后需重新取得 Linux CI 绿灯。
+
+- W425 GCC workspace gate timer-order test correction：将真实 `localhost` resolver
+  的 timer-before-DNS 顺序断言改为已有 delayed DNS backend 的确定性场景，先保持
+  worker 阻塞并验证 timer 已到期，再 release backend 验证 DNS callback 顺序。未改
+  runtime timer 语义、未 skip CI、未重写结果；W424 rerun 的 GCC 唯一失败已定位为
+  该同类 1ms wall-clock race，需重新取得 Linux CI 绿灯。
+
+- W423 Bun.file conditional-request response source fix：Bun.serve 现在对 BunFile
+  按 `If-None-Match → If-Modified-Since → Range` 顺序处理 GET/HEAD 条件请求，匹配
+  validator 返回无 body 的 304，非匹配 `If-None-Match` 保持 200 并跳过 IMS，非
+  GET/HEAD 不误触发条件响应；issue #78。五个独立 Linux lane 的 **9 active checks
+  全部通过、0 failed、0 timeout**，串行 release build 通过。README 同步记录这次
+  增量 checkpoint；未修改 upstream fixture、未跑全量 corpus。
+
+- W422 Bun.file single-range response source fix：Bun.serve 现在对 BunFile 的单一
+  GET/HEAD byte range 返回 206 与 Content-Range，越界返回 416，同时保留多区间、
+  显式 Content-Range、普通 Blob 和非 GET/HEAD 的原有边界；issue #77。serial
+  release build **62.05s**（最终补丁复核 build **60.84s**），post 五个独立 lane
+  **13 active checks、0 failed、0 timeout**，
+  W420/W421 五个 regression lane 全部通过。未修改 upstream fixture、未跑全量 corpus。
+
+- W421 Fetch ordinary-response Connection header boundary fix：普通 Fetch response
+  不再暴露 wire-level hop-by-hop `Connection` header，101 WebSocket upgrade 仍保留
+  `Connection: Upgrade`，Node HTTP response 行为不变；issue #76。fresh selector
+  **3/5 pass、2/5 fail**，post 五个独立 probe 全通过，serial release build **60.23s**。
+  清理测试生成物，未修改 upstream fixture、未跑全量 corpus。
+
+- W420 Bun.file Last-Modified metadata source fix：`Bun.file` 现在保存 path-backed
+  与 regular-fd 文件的 mtime，`Bun.serve` 在没有显式同名 header 时自动发出有效的
+  `Last-Modified`；issue #75。串行 release build **60.09s**，五个独立 focused
+  runtime probe **4/5 pass、1/5 fail、0 timeout**，剩余失败已收敛为独立的
+  `connection: keep-alive` snapshot owner。未修改 upstream fixture、未跑全量 corpus。
+
+- W419 Bun missing-file static route source fix：修复 `Response(Bun.file(...))` 与 direct BunFile route 在文件不存在或 route 创建后文件被删除时返回空 200 的问题；path-backed missing static response 现在回退到 `fetch`，fd/FIFO、函数 route 和现有文件路径不变。issue #74；serial release build **61.02s**；五个独立最小进程均验证 `/response` 与 `/direct` fallback，五个 focused corpus lane **4/5 pass、1/5 fail、0 timeout**，唯一剩余为独立 Last-Modified owner。未修改 upstream fixture、未跑全量 corpus。
+
+- W418 Bun static-file route source fix：`Bun.serve({ routes })` 现在接受直接的 `Bun.file(...)`/Blob 静态 route value，并复用既有 Response clone/framing 路径；issue #73。初始五文件 probe 为 **2 green / 3 test-failure、90 passed / 91 failed / 186 ran / 363 expects**，失败文件在 setup 阶段被同一条 route validation 拦截；修复后为 **2 green / 2 test-failure / 1 timeout、89 passed / 10 failed / 100 ran / 361 expects**。五个独立最小进程均确认 direct route accepted，wire probe 返回 **200 + 6185 body bytes**；剩余为 Last-Modified、missing-file fallback、Range、header snapshot 与 stress/subprocess 等独立 owner，未声称完整 `bun-serve-file` 通过。W416 HTTP/2 guard **5/5 pass**、W417 Bun serve leaf **5/5 green / 79 passed / 0 failed / 80 ran** 同批记录；未修改 upstream fixture、未跑全量 corpus。
+
+- W415 Node HTTP/2 internal request-submit seam source fix：修复 live `ClientHttp2Session.request()` 绕过
+  `internalBinding('http2').Http2Session.prototype.request` replacement 的问题；native request 现在在 connect edge
+  调用，`-509`/`-501` 保持 stream error ownership，其他负 nghttp2 errno 走 session error 与 pending-stream cancel。
+  issue #72；baseline **4/5 pass、1 fail、0 timeout**，focused target **1/1 pass**，post selector **5/5 pass、0 fail、0
+  timeout**，focused 独立重复 **5/5 pass**，final serial release build **60.15s**。未修改 upstream fixture、未跑全量
+  corpus。
+
+- W413 Node internal `setUnrefTimeout` pump source fix：`internal/timers.js` 的 private timer list 现在在首次
+  `scheduleTimer()` 时懒加载 `getTimerCallbacks()`，通过现有 native timer queue 调用 `processTimers(now)`，并按
+  ref/unref 状态管理 wake-up。issue #70；baseline **4/5 pass、1 fail、0 timeout**，focused target **1/1 pass**，
+  W413 五文件 selector 和 HTTP/2/socket timer regression 均 **5/5 pass、0 fail、0 timeout**，focused 独立重复
+  **5/5 pass**，serial release build **59.66s**。direct smoke 为 `CALL`/`END 1`、order `1,2`、unref-only 无输出、
+  refresh `2`。未修改
+  upstream fixture、未跑全量 corpus。
+
+- W412 Node non-integer timer bucket source fix：`process_web.cppm` 保留 timer facade 的公开 delay metadata，
+  但将 real-time queue 的 deadline 和 interval period 归一到整数毫秒 bucket，修复 Node
+  `test-timers-non-integer-delay.js` 的注册顺序。issue #69；baseline W145 **4/5 pass、1 fail**，focused
+  target **1/1 pass**，W145/W327/W335 三个五文件回归均 **5/5 pass、0 fail、0 timeout**，serial release
+  build **59.88s**。W411 同时将 W330/W331 两个旧 performance owner 各复核为 **5/5 pass**。未修改 upstream
+  fixture、未跑全量 corpus。
+
+- W410 Node global-console warning stderr-routing source fix：修复默认 warning printer 绕过 live
+  `process.stderr.write` 的问题；issue #68。post-W409 W329 selector 从 **4/5 pass、1 fail** 到
+  **5/5 pass、0 fail、0 timeout**，focused target **1/1 pass**，W410 五文件回归 **5/5 pass**，
+  direct ordering smoke 为 `ORDER 1`，serial release build **59.74s**。未修改 upstream fixture、
+  未跑全量 corpus。
+
+- W409 Node WebCrypto internal/global constructor identity source fix：loader 保留 vendored
+  `internal/crypto/webcrypto` 的实现，但把 `Crypto`、`CryptoKey`、`SubtleCrypto` 与 `crypto`
+  的公开导出统一到 runtime-owned global 对象。fresh W329 probe 从 **3/5 pass、2 fail** 到
+  post selector **4/5 pass、1 fail、0 timeout**，剩余仅为独立的 global-console warning-order owner；
+  focused WebCrypto **1/1 pass**，W409 五文件回归 **5/5 pass、0 fail、0 timeout**，serial release
+  build **58.97s**。未修改 upstream fixture、未跑全量 corpus。
+
+- W408 Node HTTP/2 socket proxy and Timer/TimersList shape source fix：修复 Node `Timeout` 的
+  `TimersList` 链接/inspect 形状、refresh 后 ref 状态与 interval 同延迟重排；补齐 TCP/server handle
+  `hasRef()`，让 HTTP/2 framing 使用内部 shutdown 状态而不是可被用户改写的 public `writable/readable`，并在
+  session teardown 后让 `session.socket` 返回 `undefined`。focused `test-http2-socket-proxy.js` **1/1 pass**；
+  proxy/socket 五文件回归 **5/5 pass、0 fail、0 timeout**；独立 timer guards **5/5 pass**。`test-timers-refresh.js`
+  的剩余 mismatch 属于现有 `internalBinding('timers').setupTimers()` no-op / `setUnrefTimeout()` pump owner，未计入
+  W408 gate；serial release build **59.51s**。未修改 upstream fixture、未跑全量 corpus。
+
+- W407 Node HTTP/2 server trailer max-block error source fix：`sendTrailers()` 现在在 server 侧先检查默认/显式
+  `maxSendHeaderBlockLength`，超出 64 KiB 时发出 `frameError`，以 `NGHTTP2_FRAME_SIZE_ERROR` reset stream，
+  并 graceful close session；合法 block 仍使用 HEADERS/CONTINUATION 拆分。focused 文件从 **1/1 timeout**
+  到 **1/1 pass**；W404/W403 五文件回归均 **5/5 pass**；serial release builds **59.72s、59.49s**。
+  未修改 upstream fixture、未跑全量 corpus。
+
+- W406 Node HTTP/2 NGHTTP2 error-code mapping revalidation：inventory 标注的六文件 cluster 采用首轮 **5-job
+  wave 5/5 pass** 加第六文件 **1/1 pass** 复核，0 timeout；当前 Linux 构建未复现 source owner，未做 speculative
+  修改、未触发构建。
+
+- W405 Node HTTP/2 autoselect readable-buffer source fix：修复自定义 `net.Socket` 在
+  `readable` 监听初始化时通过 `read(0)` 误消费 `_rq` 的问题；现在 `read(0)` 保持非消费，`read(3)`
+  只返回请求长度并保留余量，缓存数据到达时按下一轮时序通知 `readable`。focused 文件从 **1/1
+  timeout** 到 **1/1 pass**；W403 五文件回归 **5/5 pass**；W404 selector **4/5 pass、1 timeout**，仅剩
+  独立 trailer-size stalled exchange；额外 HTTP/2 socket guard **4/5 pass**，唯一失败为既有 timer-inspect
+  owner；serial release build **59.05s**。未修改 upstream fixture、未跑全量 corpus。
+
+- W404 Node HTTP/2 initial SETTINGS ACK accounting source fix：`ServerHttp2Session` 现在把初始 SETTINGS
+  frame 计入 `pendingSettingsAck`，`maxOutstandingSettings: 2` 在第二次 application `settings()` 时
+  正确触发 `ERR_HTTP2_MAX_PENDING_SETTINGS_ACK`。focused 文件从 **1/1 timeout** 到 **1/1 pass**；W404
+  五文件 selector 从 **2/5 pass、3 timeout** 到 **3/5 pass、2 timeout、0 fail**；W403/W402 回归各
+  **5/5 pass**；serial release build **59.50s**。剩余两个 timeout 经 hang-dump 确认为独立 stalled
+  exchange owner，未做 speculative 修改、未修改 upstream fixture、未跑全量 corpus。
+
+- W403 Node HTTP/2 delayed request/GOAWAY ready-edge source fix：修复 loopback `net.connect()` 在同一
+  microtask 发布连接、抢在测试 `setImmediate(client.close())` 之前的问题；cleartext HTTP/2 ready
+  edge 现在延迟到下一轮 I/O，delayed-request 的 `ERR_HTTP2_GOAWAY_SESSION` 时序与 Node 一致。
+  focused 文件从 **1/1 failure** 到 **1/1 pass**；W403 五文件 HTTP/2 selector **5/5 pass、0 fail、0
+  timeout**；W402 HTTP/2 回归 **5/5 pass**；Bun fake-timer guard **4 green + 1 no-tests、43 passed、0
+  failed、43 ran、98 expects**；三次 serial release build **58.98s、59.16s、59.29s**，后者为最终验证状态。
+  未修改 upstream fixture、未跑全量 corpus。
+
+- W402 Node HTTP/2 `unknownProtocol` Duplex identity source fix：HTTP/2-only TLS server 的
+  `unknownProtocol` event 现在传出同时满足 `instanceof stream.Duplex` 的自定义 `net.Socket`，保留
+  reactor-specific socket methods。focused 文件从 **1/1 failure** 到 **1/1 pass**；五文件 HTTP/2
+  selector 从 **4/5 pass、1 fail** 提升到 **5/5 pass、0 fail、0 timeout**；Bun fake-timer 回归
+  **5/5 green、8 passed、0 failed、8 ran、10 expects**；serial release build **59.29s**。W399
+  SNI callback triage **1/5 pass、4 fail**、W400 HTTP/2 error-code revalidation **5/5 pass**、W401
+  fs flush revalidation **5/5 pass** 均已分别记录；未修改 upstream fixture、未跑全量 corpus。
+
+- W398 Node ResourceTiming buffer-size validation source fix：`performance.setResourceTimingBufferSize()`
+  现在对 BigInt/Symbol 抛出 Node-compatible `ERR_INVALID_ARG_TYPE`，其他 invalid non-number 值重置
+  为 zero，合法 finite nonnegative number 截断为整数。focused ResourceTiming 文件从 **1/1 failure**
+  到 **1/1 pass**；五文件 Node performance selector 从 **4/5 pass、1 fail** 提升到 **5/5 pass、0
+  fail、0 timeout**；Bun fake-timer 回归 **5/5 green、8 passed、0 failed、8 ran、10 expects**；三次
+  serial release build **57.34s、59.01s、59.15s**。未修改 upstream fixture、未跑全量 corpus。
+
+- W396 Node TLS empty-SNI-context error mapping source fix：server context 没有 certificate/key 且
+  OpenSSL 返回精确 `ERR_SSL_NO_SHARED_CIPHER` 时，映射为 Node 要求的 `no suitable signature
+  algorithm`，其他 cipher/reset 错误不改。focused 文件从 **1/1 failure** 到 **1/1 pass**；五文件
+  SNI selector 从 **3/5 pass、2 fail** 提升到 **4/5 pass、1 fail、0 timeout**，仅剩 offline
+  Duplex `SNICallback` callback owner；Bun fake-timer 回归 **5/5 green、8 passed、0 failed、8
+  ran、10 expects**；incremental release build **3.58s**。未修改 upstream fixture、未跑全量
+  corpus。
+- W395 Node TLS close callback ordering source fix：raw transport 升级为 TLS 后无 error destroy 的
+  `close` 现在跨过当前 check phase，再于下一 immediate phase 发出，符合 Node close callbacks
+  晚于当前 `setImmediate` 的顺序。focused close-order 文件从 **1/1 failure** 到 **1/1 pass**；
+  五文件 TLS selector 从 W394 的 **4/5 pass、1 fail** 提升到 **5/5 pass、0 fail、0 timeout**；
+  Bun fake-timer 五文件回归 **5/5 green、8 passed、0 failed、8 ran、10 expects**；serial release
+  build **59.09s**。未修改 upstream fixture、未跑全量 corpus。
+- W394 Node TLS close_notify/RST teardown source fix：`tls.Server` 已发送本地 close_notify 后，
+  client 立即 `destroy()` 产生的 server-side `ECONNRESET`/pending close-notify `EPIPE` 不再被误报
+  为 read failure；未发送本地 shutdown 的 reset 仍保留为 error。focused keepAlive/noDelay 文件从
+  **1/1 failure** 到 **1/1 pass**；五文件 TLS selector 从 W393 的 **3/5 pass、2 fail** 提升到
+  **4/5 pass、1 fail、0 timeout**，仅剩 raw TLS close-order owner；Bun fake-timer 回归 **5/5
+  green、8 passed、0 failed、8 ran、10 expects**；两次 serial release build **57.35s、57.43s**。
+  未修改 upstream fixture、未跑全量 corpus。
+- W393 Node TLS `allowHalfOpen` transport source fix：修复 `tls.connect({ allowHalfOpen: true })`
+  的隐藏 plaintext transport 硬编码为 false，导致收到对端 FIN 后提前关闭写侧、丢失 deferred
+  `Bye`。focused 文件从 **1/1 failure** 到 **1/1 pass**；五文件 TLS selector 从 W375 的
+  **2/5 pass、3 fail** 提升到 **3/5 pass、2 fail、0 timeout**，剩余 keepAlive/noDelay teardown
+  与 raw TLS close-order 保持独立 owner；Bun fake-timer 五文件回归 **5/5 green、8 passed、0
+  failed、8 ran、10 expects**；serial release build **57.70s**。未修改 upstream fixture、未跑
+  全量 corpus。
+- W392 Node `PerformanceObserver` forced-GC entry source fix：`globalThis.gc()` 完成真实
+  `Bun.gc(true)` 后，在存在 GC observer 时发布 Node 形状的 forced major-GC entry，并支持
+  `gc` observation selector。focused GC 文件 **1/1 pass**；五文件 performance selector 从
+  W391 的 **4/5 pass、1 fail** 提升到 **5/5 pass、0 fail、0 timeout**；Bun fake-timer 五文件
+  回归 **5/5 green、8 passed、0 failed、8 ran、10 expects**；serial release build **58.98s**。
+  未修改 upstream fixture、未跑全量 corpus。
+- W391 Node `performance.nodeTiming` milestone source fix：`node_perf.cppm` 补齐有序 startup
+  milestones、动态 loop start/exit、live duration、idleTime=0 和 Node 要求的 startTime=0。focused
+  timing 文件从 **1/1 failure** 到 **1/1 pass**；五文件 performance selector 为 **4/5 pass、1 fail、0
+  timeout**，唯一剩余是 GC callback owner。Bun fake-timer 回归保持 **5/5 green、8 passed、0 failed、8
+  ran、10 expects**；serial release build **58.82s**，未修改 upstream fixture、未跑全量 corpus。
+- W390 Node `PerformanceObserver.observe()` validation source fix：`node_perf.cppm` 补齐 options
+  object、`entryTypes`/`type` 必选、数组类型和互斥校验，并补上 Node received-value 错误文案。
+  focused Node 文件从 **1/1 failure** 到 **1/1 pass**；五文件 performance selector 为 **3/5 pass、2
+  fail、0 timeout**，剩余为 GC callback 与 milestone 顺序两个独立 owner。Bun fake-timer 五文件
+  回归保持 **5/5 green、8 passed、0 failed、8 ran、10 expects**；serial release build **59.06s**，
+  未修改 upstream fixture、未跑全量 corpus。
+- W389 Node `uvMetricsInfo` source fix：`node_perf.cppm` 现在暴露
+  `PerformanceNodeTiming.uvMetricsInfo`，`node_internal_binding.cppm` 使用同一 live
+  timer/check loop counter，不再固定返回全零。目标 Node 文件从失败变为 **1/1 pass**；五文件
+  performance selector 为 **2/5 pass、3 fail、0 timeout**，剩余失败仍是 GC callback、observer
+  参数校验和 timing 顺序三个独立 owner。W387 Bun fake-timer 回归保持 **5/5 green、8 passed、0
+  failed、8 ran、10 expects**；serial release build **59.24s**，未修改 upstream fixture、未跑
+  全量 corpus。
+- W388 Node performance 五文件窄 triage：修复前 **1/5 pass、4 fail、0 timeout**，将
+  `nodeTiming.uvMetricsInfo` 缺失与其余三个性能 owner 分离；没有扩大到全量 performance corpus。
+- W387 Bun fake-timer sinon leaf revalidation：五文件、**5 jobs**，结果 **5/5 green、8 passed、0
+  failed、8 ran、10 expects、0 timeout**，作为后续运行时改动的回归 guard。
+- W386 Bun fake-timer hrtime precision source fix：`modules/jsc/src/test_runner.cppm` 让
+  `process.hrtime()`/`.bigint()` 读取 fake clock，以十进制纳秒截断避免浮点 round-off，并让
+  fake `Date.now()` 保持整数。W385 五文件 selector 从 **3 green、1 no-tests、1 failure、36
+  passed、7 failed、43 ran、98 expects** 到 **4 green、1 no-tests、0 failure、43 passed、43 ran、98
+  expects、0 timeout**；W382 回归 **3 green、2 no-tests、49 passed、49 ran、44 expects**。incremental
+  release build **15.14s**，未修改 upstream fixture、未跑全量 corpus。
+- W385 Bun high-resolution fake-timer leaf probe：五文件 bounded selector **3 green、1 no-tests、1
+  failure**，**36 passed、7 failed、43 ran、98 expects、0 timeout**；失败全部集中在 sinon issue-207
+  的 `process.hrtime`/fractional clock rounding，base fake-timers **30/30**、issue-1852 **1/1**、
+  issue-187 **2/2** 通过，未做 speculative 修改。
+- W384 Node process fresh leaves：五文件 selector **5/5 pass、0 timeout**，覆盖 exit-code、exit
+  handler、groups、env 与 execve validation；无 source owner，未跑全量 corpus。
+- W383 Node HTTP fresh leaves：两个五文件 bounded selector 合计 **10/10 pass、0 timeout**，覆盖
+  client/header/error/timeout/keepalive leaves；无 source owner，未跑全量 corpus。
+- W382 Bun fake-timer Intl default-format source fix：W381 的唯一 Intl owner 已关闭；
+  `modules/jsc/src/test_runner.cppm` 在 fake-timer 生命周期内包装 configurable 的
+  `Intl.DateTimeFormat.prototype.format` accessor，仅在缺省日期参数时注入 fake Date，并在
+  `useRealTimers()` 恢复原 descriptor。focused timer file 从 **6/7 pass、1 fail、24 expects**
+  到 **7/7 pass、0 fail、27 expects**；完整五文件 Bun selector 为 **3 green、2 no-tests、0
+  failure、49 passed、49 ran、44 expects、0 timeout**。Node fs + child-process 回归 **10/10 pass**；
+  incremental release build **15.23s**，未修改 upstream fixture、未跑全量 corpus。
+- W381 Bun run-mode fake-timers source fix：`test-timers.test.ts` 从 **3/7 pass、4 fail** 推进到
+  **6/7 pass、1 fail、24 expects**；`modules/jsc/src/builtins/bootstrap.cppm` 为
+  `Bun.jest().jest` 补齐真实 queue-backed fake timers、timer handle、Date rebasing、restore 和
+  arbitrary pre-set timer globals。完整 W378 五文件波次为 **2 green、2 no-tests、1 test-failure**，
+  **48 passed、1 failed、49 ran、41 expects、0 timeout**；剩余仅为 Intl.DateTimeFormat 格式 owner。
+  W379 fs + W380 child-process 回归最终 **10/10 pass**；serial release build **59.24s**，未修改
+  upstream fixture、未跑全量 corpus。
+- W380 Node child-process stdio fresh leaves：五文件 bounded selector **5/5 pass、0 timeout**，覆盖
+  stdout write、default options、double pipe、destroyed stdio 与普通 stdio；fd1 raw-write/未读管道
+  增长保持独立 owner，未做 speculative 修改、未跑全量 corpus。
+- W379 Node fs fresh leaves：五文件 selector 在 **5 jobs** 与 **1 job 串行复核**均为 **5/5 pass、0
+  timeout**，覆盖 write/read/optional writeSync/readv/writev；无 source owner，未修改 upstream
+  fixture、未跑全量 corpus。
+- W378 Bun event-loop/timer/perf + stderr fd source fix：初始五文件 bounded selector 为 **2
+  green、1 no-tests、2 test-failure**，共 **45 passed、5 failed、50 ran、36 expects、0 timeout**。
+  失败的 socket-wait fixture 已定位到 `fs.writeSync(2, ...)` 被 raw fd fallback 错误拒绝；
+  `modules/jsc/src/runtime/io_fd_raw.inc` 现允许有效 POSIX fd 2，保持 fd 0/1 的 Bun.spawn
+  未读管道增长 owner 独立停车。serial release build **58.05s** 后，同一五文件波次为 **2
+  green、2 no-tests、1 test-failure**，**45 passed、4 failed、49 ran、38 expects、0 timeout**；
+  socket-wait 文件可输出 timer marker 并 clean-exit，`spawn-pipe-leak` 独立确认 **1/1 green、
+  3 passed、0 failed、3 ran**。剩余四个 fake-timers assertion 属于 run-mode `jest.useFakeTimers`
+  owner；未修改 upstream fixture、未跑全量 corpus。
+- W377 Node ResourceTiming buffer source fix：ResourceTiming 目标从 **0/1** 推进到 **1/1 pass**；
+  五文件 performance selector 从 **2/5 pass、3 fail、0 timeout** 提升到 **3/5 pass、2 fail、0
+  timeout**。`modules/jsc/src/builtins/node_perf.cppm` 补齐 bounded resource buffer、
+  `resourcetimingbufferfull` overflow event、resize/clear 及 callback 后 promotion/discard；目标文件
+  五-job 与 **1/1 串行复核**均通过。剩余 `uvMetricsInfo()`、GC observer 为独立 owner，W375 TLS
+  回归保持 **2/5 pass、3 fail、0 timeout**；serial release build **59.24s**，未修改 upstream
+  fixture、未跑全量 corpus。
+- W376 Node performance timeline source fix：五文件 selector 从 **1/5 pass、4 fail、0 timeout**
+  推进到 **2/5 pass、3 fail、0 timeout**。`modules/jsc/src/builtins/node_perf.cppm` 让
+  `getEntries*()` 按 `startTime` 稳定排序，并将缺失参数错误对齐为 Node 的
+  `ERR_MISSING_ARGS` `TypeError`；决定性 timeline 文件五-job 运行及 **1/1 串行复核**均通过。
+  W375 TLS 回归保持 **2/5 pass、3 fail、0 timeout**。剩余 ResourceTiming、`uvMetricsInfo()`、
+  GC observer 为独立 owner；三次串行 release build，未修改 upstream fixture、未跑全量 corpus。
+- W375 Node TLS socket option/close triage：五文件 selector **2/5 pass、3 fail、0 timeout**；其中
+  HWM 与 socket `allowHalfOpen` guard 通过。三个失败分别在 **1 job** 串行复核中稳定重现：connect
+  half-open 的延迟 `Bye` 数据收尾、keepalive/noDelay teardown reset、raw net/TLS close 顺序。
+  三者不是一个安全的 option-forwarding owner，暂不 speculative 修改源码，未构建、未修改 upstream
+  fixture、未跑全量 corpus。
+- W374 Node IPv6/TLS address-family source fix：五文件回归 selector 基线 **4/5 pass、1 fail、
+  0 timeout**。失败先定位为 `localhost + family: 6` 的逻辑 peer 被 v4 bridge 覆盖，随后定位到
+  TLS informational NID 查询残留 `ERR_OSSL_UNKNOWN_NID`。`modules/jsc/src/js_net.cppm` 保留
+  `::1` 逻辑 peer，`modules/tls/src/openssl.cpp` 在 `shared_sigalgs()`/`ephemeral_key_info()`
+  后清理 OpenSSL error queue；三次增量 release build **59.65s、3.65s、3.61s** 后 W374
+  **5/5 pass、0 fail、0 timeout**，W371/W372 回归各 **5/5 pass**。未修改 upstream fixture，
+  未跑全量 corpus。
+- W373 Node `net` `ipv6Only` source fix：W373 基线 **4/5 pass、1 fail、0 timeout**，失败证明
+  `Server.listen({ host: "::", ipv6Only: true })` 只在 JS 层记录选项，native 仍创建 AF_INET
+  listener。`modules/jsc/src/js_net.cppm` 透传该选项，`modules/jsc/src/runtime/net.inc`
+  在该路径创建 AF_INET6 并启用 `IPV6_V6ONLY`；串行 release build **59.71s** 后 W373
+  **5/5 pass、0 fail、0 timeout**，W371/W372 回归各 **5/5 pass**。未修改 upstream fixture，
+  未跑全量 corpus。
+- W371/W372 Node net 绿色覆盖：两个相邻五文件 selector 均为 **5/5 pass、0 fail、0 timeout**；
+  结果保留到源码 checkpoint，未拆成 docs-only commit。
+- W365–W370 bounded triage：W365 修正 selector 后 **1/5 green、8 passed、4 failed、12 ran、
+  0 timeout**；W366 Bun util **5/5 green、171 passed、1 ahead、172 ran、4101 expects**；
+  W367 Bun crypto **4/5 green、10 passed、8 failed、18 ran、78 expects**；W368 Node HTTP
+  **3/5 pass、0 fail、2 timeout**；W369 Node fs **4/5 pass、1 fail、0 timeout**；W370 Node TLS
+  **2/5 pass、3 fail、0 timeout**。缺失依赖、liveness、JSC 通用错误文案、TLS callback/engine
+  等 owner 已分别停车，未做 speculative source patch。
+- W346 Node readline Unicode line-separator source fix：W345 基线为 **4/5
+  file-level pass、1 fail、0 timeout**；`modules/jsc/src/builtins/node_readline.cppm`
+  的 `lineEnding` 正则只识别 CR/LF，导致 U+2028/U+2029 留在同一行。最小修复将
+  两个 Unicode 行终止符纳入同一分隔逻辑；重建后目标文件 **1/1 pass**，同面邻接
+  回归（no-trailing-newline、recursive-writes、set-raw-mode、position，加目标文件）
+  **5/5 pass、0 timeout**。未修改 `compat/` 上游测试，未跑全量 corpus。
+- W347 Node dgram port-message source fix：W340 基线为 **4/5 pass、1 fail、0
+  timeout**，失败是 `ERR_SOCKET_BAD_PORT` 的 `>= 1` 文案与 Node 要求的 `> 0`
+  不一致。`modules/jsc/src/js_dgram.cppm` 仅修正 `allowZero=false` 分支；重建后
+  Node dgram selector **5/5 pass、0 timeout**，Bun 原生 `node:dgram` guard **3/3
+  passed、0 failed、4 expects**。未修改 `compat/` 上游测试，未跑全量 corpus。
+- W348 Node TTY `WriteStream` forwarding source fix：W343 基线为 **4/5 pass、1
+  fail、0 timeout**，`test-tty-backwards-api.js` 中四个 readline forwarding
+  方法均未调用 mock。`modules/jsc/src/builtins/node_os.cppm` 现将
+  `clearLine`、`clearScreenDown`、`cursorTo`、`moveCursor` 转发到 readline；
+  no-cache release rebuild 后 Node selector **5/5 pass、0 timeout**，Bun 原生
+  窄 guard **19/19 passed、0 failed、88 expects**。Bun 整文件的 25 个
+  `readline.Interface` 失败保持单独记录，未修改 `compat/`、未跑全量 corpus。
+- W350 Node `trace_events` leaf probe：5 个 fresh 文件中 **4/5 pass、1 skipped、
+  0 fail、0 timeout**；skip 是 upstream inspector-disabled guard，promise tracing
+  的 intentional child rejection diagnostic 不影响成功退出。未发现 source owner，
+  未构建、未跑全量 corpus。
+- W352 Node EventTarget/AbortSignal realm source fix：初始 W351 残留为 **4/5
+  pass、1 fail、0 timeout**，失败先落在 `NodeEventTarget` 的 Event brand，继而暴露
+  `AbortSignal` internal listener-map 边界。`node_process_extra.cppm` 加入延迟到
+  top-level `require` 之后的 Node realm bridge，`engine.inc` 负责调用并在缺少
+  internals 时安全跳过；最终 W352 selector **5/5 pass、0 fail、0 timeout**，W348
+  TTY/readline 回归 **5/5 pass、0 timeout**。最终 no-cache release build **88.49s**；
+  未修改 `compat/`、未跑全量 corpus，Bun guard 因当前 bun:test 环境无法解析
+  `internal/event_target` 未纳入计数。
+- W351 Node `EventEmitter.on` invalid-argument source fix：初始 selector **4/5
+  pass、1 fail、0 timeout**；`modules/jsc/src/builtins/bootstrap.cppm` 补齐无效
+  emitter、`null` options、Symbol 安全错误构造和 dotted-name `ERR_INVALID_ARG_TYPE`
+  文案。精确 Node focused guard **8/8**，W348 回归 **5/5**，Bun 原生 guard
+  **10/10 passed、0 failed、15 expects**。完整 upstream 文件剩余一个独立
+  EventTarget realm owner，未修改 `compat/`、未跑全量 corpus。
+- W349 Node `EventEmitter.on` watermark metadata source fix：fresh selector 首次
+  为 **4/5 pass、1 fail、0 timeout**，失败是 async iterator 缺少
+  `Symbol.for("nodejs.watermarkData")`。`modules/jsc/src/builtins/bootstrap.cppm`
+  现提供 `size/low/high/isPaused` getter；no-cache release rebuild 后目标
+  selector **5/5 pass**，W348 TTY/readline 回归 **5/5 pass**，Bun 原生
+  `EventEmitter.on` 窄 guard **10/10 passed、0 failed、15 expects**。未修改
+  `compat/`、未跑全量 corpus。
+- W353 Node TLS CLI version-dispatch leaf probe：修正 CLI 参数位置后，五个
+  `--tls-{min,max}-version` 控制文件 **5/5 pass、0 fail、0 timeout**；首个错误
+  参数位置的启动错误未计入结果。无 source/fixture 改动，未跑全量 corpus。
+- W354 Node fs FileHandle leaf probe：`pull`、`pullSync`、writer 以及 aggregate/close
+  error 五个真实 Node 文件 **5/5 pass、0 fail、0 timeout**；旧 inventory 条目确认
+  为 stale，未做 speculative source 改动。
+- W355 Node TLS client-auth verification source fix：初始五文件 selector **4/5
+  pass**，失败定位为服务端客户端证书链错误的 Node `ECONNRESET` 映射、trusted PEM
+  CA block 解析和 TLS1.3 late fatal alert 三个同一 TLS owner 的边界。分别在
+  `modules/jsc/src/js_tls_live.cppm`、`modules/tls/src/openssl.cpp`、
+  `modules/jsc/src/js_net.cppm` 做最小修复；最终串行 release rebuild **59.59s**，
+  W355 **5/5 pass、0 fail、0 timeout**，W348 回归 **5/5 pass**。未修改 `compat/`，
+  未跑全量 corpus。
+- W356 Node HTTP/2 TLS servername authority source fix：四文件基线为 **1/4 pass、
+  2 fail、1 timeout**；`test-http2-create-client-secure-session.js` 的失败定位为
+  自定义 `options.servername` 未进入 `:authority`。`modules/jsc/src/js_http2.cppm`
+  现按 Node 的 `options.servername || host` 规则生成 authority；重建 **60.44s** 后
+  目标文件 **1/1 pass**，W356 selector **2/4 pass、1 fail、1 timeout**，W355 五文件
+  回归 **5/5 pass**。剩余 unknownProtocol `Duplex` 身份和 TLS socket timeout 分别
+  停车，未修改 `compat/`、未跑全量 corpus。
+- W357 Node HTTP/2 error-code mapping leaf probe：inventory 中六个真实文件全部
+  **6/6 pass、0 fail、0 timeout**（五个 bounded jobs 加一个单文件边界复测），确认该
+  条目 stale；无 source/fixture 改动，未跑全量 corpus。
+- W358 Node TLS session-ticket/resumption source fix：初始五文件 **3/5 pass**；
+  `modules/jsc/src/js_tls_live.cppm` 过滤 resumed connection 的错误 session event，
+  `modules/tls/src/openssl.cpp` 稳定首个 issued/offered ticket 的返回值。最终原 selector
+  **4/5 pass**，三文件 follow-up **2/3 pass**，唯一两个失败分别停车在 cluster session
+  sharing/OpenSSL code 和 HTTPS Agent alt-name 文案；W355 回归 **5/5 pass**。最终增量
+  release rebuild **6.04s**，未修改 `compat/`、未跑全量 corpus。
+- W359 Node TLS hostname/CN diagnostic source fix：五文件基线 **2/5 pass、3 fail、0
+  timeout**；`modules/tls/src/openssl.cpp` 在客户端 hostname verify 失败时从 peer chain
+  恢复 leaf，并在无 DNS/IP SAN 时输出 Node 要求的 CN-specific 文案。串行增量 release
+  rebuild **3.66s** 后，目标文件 **1/1 pass**，完整 selector **3/5 pass、2 fail、0
+  timeout**；HTTPS Agent SNI 传播和 TLS SNI `no shared cipher` 文案保留为两个独立 owner。
+  W355 `test-tls-friendly-error-message.js` 回归 **1/1 pass**。未修改 `compat/`、未跑全量
+  corpus。
+- W360 Node TLS server-side no-SNI value source fix：五文件 SNI selector 基线 **1/5
+  pass、4 fail、0 timeout**；`modules/jsc/src/js_tls_live.cppm` 让无 ClientHello SNI 的
+  server-side `TLSSocket.servername` 暴露为 `false`，client-side 未设置选项仍为
+  `undefined`。重建后目标 HTTPS Agent SNI 文件 **1/1 pass**，SNI context 回归 **1/1
+  pass**，selector **2/5 pass、3 fail、0 timeout**；剩余为 SNICallback 授权、invalid
+  context 错误映射和离线 ClientHello 三个独立 owner。未修改 `compat/`、未跑全量 corpus。
+- W361 Node fs near-green triage：五文件 Linux selector **4/5 pass、1 fail、0 timeout**；
+  `test-fs-readdir-stack-overflow.js` 的唯一失败属于 JSC 通用 `RangeError.message`
+  句点差异，且错误对象持有 own message；Bun 原生测试要求带句点，未做危险的全局文本替换，
+  owner 停车。未修改 source/fixture，未跑全量 corpus。
+- W362 Node `dns/promises` constant source fix：五文件基线 **3/5 pass、1 fail、1 timeout**；
+  `modules/jsc/src/js_dns.cppm` 将 Node DNS error-code constants 补到共享的
+  `dnsPromises` 对象，`test-dns-promises-exists.js` 从 fail 变为 pass。串行构建后 selector
+  **4/5 pass、0 fail、1 timeout**；`test-dns-resolveany.js` 在并行 30s 与单文件 60s
+  复测均 timeout，保留为独立 packet/liveness owner。未修改 `compat/`、未跑全量 corpus。
+- W363 Node HTTP low-coupling green slice：五文件 Linux selector **5/5 pass、0 fail、0
+  timeout**，覆盖 invalid transfer-encoding、empty write、local address、immediate
+  client error 与 response close；无 source/fixture 改动，未跑全量 HTTP corpus。
+- W364 Node DNS timeout/backoff source fix：五文件基线 **2/5 pass、1 fail、2 timeout**；
+  `modules/jsc/src/js_dns.cppm` 接入共享 Node error formatter，`modules/jsc/src/runtime/dns.inc`
+  与 `modules/dns/src/client.cppm` 传递并实现 `maxTimeout` 的 exponential retry/backoff
+  cap。最终 selector **3/5 pass、0 fail、2 timeout**，目标文件打印
+  `timeout1=3504ms, timeout2=1502ms`；两个 channel-cancel timeout 保留为独立 liveness
+  owner。`test-dns-promises-exists.js` focused regression pass，未跑全量 corpus。
+
+## 2026-08-01
+
+- W266 fresh Node HTTP framing/status/listening plain-script leaf probe（3 jobs、复用现有 coordinator binary、无构建）**3/3 files pass、0 fail、0 timeout**：no-content-length framing、statusMessage 与 server listening transitions 全部 clean-exit；Node runner 按 file-level 计数，单文件耗时 200–250ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W265 fresh Node fs append/rename/stream-type plain-script leaf probe（3 jobs、复用现有 coordinator binary、无构建）**3/3 files pass、0 fail、0 timeout**：appendFileSync data/mode/FD、rename type guards 与 WriteStream invalid-options TypeErrors 全部 clean-exit；Node runner 按 file-level 计数，单文件耗时 199–201ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W264 fresh Bun spyMatchers/pretty-format/test.failing leaf probe（3 jobs、复用现有 coordinator binary、无构建）**1/3 files green、130 passed、24 failed、159 ran、494 expects、0 runner timeout**：pretty-format **1/1**；spyMatchers **124 pass + 5 todo**；test.failing **5/8**，失败拆为 matcher error/argument semantics、expected-failure format、non-function message 与 missing `jest.setTimeout` owners。单文件耗时 197–750ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W263 fresh Node stream append/backpressure/order plain-script leaf probe（3 jobs、复用现有 coordinator binary、无构建）**3/3 files pass、0 fail、0 timeout**：Readable data-time append、Writable backpressure 与 Readable push ordering 全部 clean-exit；Node runner 按 file-level 计数，单文件耗时 182–183ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W262 fresh Node crypto Certificate/DH/keygen plain-script leaf probe（3 jobs、复用现有 coordinator binary、无构建）**3/3 files pass、0 fail、0 timeout**：Certificate fixture/API、`modp2` Diffie-Hellman 与 empty-passphrase keygen no-prompt 全部 clean-exit；Node runner 按 file-level 计数，单文件耗时 202–252ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W261 fresh Node Buffer iterator/read/allocation plain-script leaf probe（3 jobs、复用现有 coordinator binary、无构建）**3/3 files pass、0 fail、0 timeout**：Buffer iterator variants、read boundary/error guards 与 negative/NaN allocation validation 全部 clean-exit；Node runner 按 file-level 计数，单文件耗时 200–201ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W260 fresh Bun hooks/custom matcher/mock-fn leaf probe（3 jobs、复用现有 coordinator binary、无构建）**2/3 files green、78 passed、34 failed、113 ran、20,472 expects、0 runner timeout**：expect-extend **28/28**、jest-hooks **17 pass + 1 todo**；mock-fn **33/67**，失败聚焦 metadata/this、call bookkeeping、missing APIs、reset/restore 与 spyOn owners。单文件耗时 182–232ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W259 fresh Node child-process IPC/exec plain-script leaf probe（3 jobs、复用现有 coordinator binary、无构建）**2/3 files pass、1 fail、0 timeout**：disconnect async/self-termination 与 exec encoding 全部 clean-exit；send-return-boolean 因 IPC server-handle transfer unsupported TypeError 收敛为单一 owner。Node runner 按 file-level 计数，单文件耗时 201–602ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W258 fresh Node child-process stdio/destroy plain-script leaf probe（3 jobs、复用现有 coordinator binary、无构建）**3/3 files pass、0 fail、0 timeout**：child stdio inherit/flush 与 destroy/kill state transitions 全部 clean-exit；Node runner 按 file-level 计数，单文件耗时 199–352ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W257 fresh Bun mock.module/re-export leaf probe（3 jobs、复用现有 coordinator binary、无构建）**2/3 files green、6 passed、6 failed、13 ran、32 expects、0 runner timeout**：re-export mocks **2/2**、non-existent-specifier **1/1**；mock-module 外层 **3/10** executable pass、6 fail、1 todo，拆为 async mock、restore identity、relative-file mock、cache/update 四个 owner。单文件耗时 184–187ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W256 fresh Node fs/http/url plain-script leaf probe（3 jobs、复用现有 coordinator binary、无构建）**3/3 files pass、0 fail、0 timeout**：TypedArray `fs.promises.writeFile`、HTTP header name/value validation 与 invalid `file:` URL path rejection 全部 clean-exit；Node runner 按 file-level 计数，单文件耗时 199–250ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W255 fresh Bun retry/jest-each/fake-timers leaf probe（3 jobs、复用现有 coordinator binary、无构建）**2/3 files green、40 passed、4 failed、44 ran、61 expects、0 runner timeout**：jest-each **25/25**、retry/repeats **12/12**；test-timers **3/7**，失败收敛为 Intl fake-clock 日期格式与 child-eval 缺少 `jest.useFakeTimers` 两个 owner。单文件耗时 200–652ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W254 fresh Bun test-runner hook/scope leaf probe（3 jobs、复用现有 coordinator binary、无构建）**2/3 files green、15 passed、11 failed、26 ran、21 expects、0 runner timeout**：nested-describes **3/3**、onTestFinished **12/12**；failure-skip 外层 **0/11**，全部收到空 child stdout，收敛为 nested child-runner/fixture output owner。单文件耗时 199–1402ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W253 fresh Node events/listener plain-script probe（3 jobs、复用现有 coordinator binary、无构建）**3/3 files pass、0 fail、0 timeout**：EventEmitter eventNames/listenerCount 与 EventSource-disabled global guard 全部 clean-exit；Node runner 按 file-level 计数，单文件耗时 200–201ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W252 fresh Bun base64/highlighter/UUID leaf probe（3 jobs、复用现有 coordinator binary、无构建）**2/3 files green、28 passed、11 failed、39 ran、575 expects、0 runner timeout**：base64url **5/5**、highlighter **16/16**；randomUUIDv7 **7/18**，失败拆为 timestamp validation/error-shape、12-bit rollover/order、旧 timestamp ordering、counter seeding 四个 owner。单文件耗时 252–855ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W251 fresh Node process exec/argv/umask plain-script probe（3 jobs、复用现有 coordinator binary、无构建）**3/3 files pass、0 fail、0 timeout**：symlink execPath、child argv[0]、umask read/write restoration 与 invalid object/string validation 全部 clean-exit；Node runner 按 file-level 计数，单文件耗时 198–298ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W250 fresh Node process queue/mask/CPU plain-script probe（3 jobs、复用现有 coordinator binary、无构建）**3/3 files pass、0 fail、0 timeout**：nextTick callback/error propagation、umask mask coercion、cpuUsage result/argument validation 全部 clean-exit；Node runner 按 file-level 计数，单文件耗时 200–251ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W249 fresh Node process identity/memory plain-script probe（3 jobs、复用现有 coordinator binary、无构建）**3/3 files pass、0 fail、0 timeout**：process.ppid child relation、process.release LTS/version、process.availableMemory numeric shape 全部 clean-exit；Node runner 按 file-level 计数，单文件耗时 200–351ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W248 fresh Node console assignment/error plain-script probe（3 jobs、复用现有 coordinator binary、无构建）**3/3 files pass、0 fail、0 timeout**：global Console primitive replacement/self-assignment、Writable primitive-write error handling 全部 clean-exit；Node runner 按 file-level 计数，单文件耗时 199–201ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W247 fresh Node util.deprecate/inspect plain-script probe（3 jobs、复用现有 coordinator binary、无构建）**3/3 files pass、0 fail、0 timeout**：deprecate code validation、one-time warning/prototype behavior、util.inspect primordial isolation 全部 clean-exit；Node runner 按 file-level 计数，单文件耗时 199–349ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W246 fresh Node console/util plain-script probe（3 jobs、复用现有 coordinator binary、无构建）**3/3 files pass、0 fail、0 timeout**：Console method constructor/name guards、stdio setter routing、util.inherits 多级 prototype/constructor 关系全部 clean-exit；Node runner 按 file-level 计数，单文件耗时 198–199ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W245 fresh Node console/process plain-script probe（3 jobs、复用现有 coordinator binary、无构建）**2/3 files pass、1 fail、0 timeout**：`test-console-count.js` 与 `test-process-uptime.js` clean-exit；`test-console-group.js` 停在 multiline object pretty-print/indentation（mbun 单行对象、Node 逐属性多行）owner。Node runner 按 file-level 计数，单文件耗时 198–250ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W244 fresh Bun test matcher leaf probe（3 jobs、复用现有 coordinator binary、无构建）**3/3 files green、45 passed、0 failed、45 ran、92 expects、0 runner timeout**：expect label 3/3、expect.assertions 外层守卫 1/1（子 runner 按设计 0 pass/5 fail 验证欠断言失败计数）、toHaveReturnedWith/toHaveLastReturnedWith 41/41 全部通过，单文件耗时 199–350ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W243 fresh Bun Web Fetch/Response leaf probe（3 jobs、复用现有 coordinator binary、无构建）**3/3 files green、86 passed、0 failed、86 ran、192 expects、0 runner timeout**：Response constructor/redirect/clone 23/23、body-used TypeError 2/2、fetch option conversion/no-send 61/61 全部通过，单文件耗时 182–283ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W242 fresh Bun spawn/mock leaf probe（3 jobs、复用现有 coordinator binary、无构建）**3/3 files green、11 passed、0 failed、11 ran、45 expects、0 runner timeout**：spawn 伪造 u32 上限数组长度 3/3、mock disposable/restore 3/3、mock.module 参数校验与 resolver short-circuit 5/5 全部通过，单文件耗时 199–350ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W241 fresh Bun Node HTTP leaf probe（3 jobs、复用现有 coordinator binary、无构建）**2/3 files green、7 passed、1 failed、8 ran、13 expects、0 runner timeout**：`node-http-maxHeaderSize` 4/4、HTTP primordials 1/1；`node-http-proxy-url` 2/3，唯一失败为 proxy agent 对 CR/LF host 未返回预期 `ERR_INVALID_CHAR`，收敛为 host-validation owner。单文件耗时 251–652ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W240 fresh Node stream state/destroy leaf probe（3 jobs、复用现有 coordinator binary、无构建）**2/2 files pass、0 fail、0 timeout**：Readable pause/resume/backpressure、Writable destroy/error/custom-destroy lifecycle 全部 clean-exit，单文件耗时 198–199ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W239 fresh Node stream pipeline/state leaf probe（3 jobs、复用现有 coordinator binary、无构建）**3/3 files pass、0 fail、0 timeout**：pipeline listener cleanup/uncaught delivery、Writable needDrain、writableCorked transitions 全部 clean-exit，单文件耗时 198–299ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W238 fresh Node stream lifecycle leaf probe（3 jobs、复用现有 coordinator binary、无构建）**3/3 files pass、0 fail、0 timeout**：Readable Web termination、Writable cork-buffer accounting、Duplex end/half-open 全部 clean-exit，单文件耗时 198–200ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W237 fresh Bun Node stream probe（3 jobs、复用现有 coordinator binary、无构建）**1/2 files green、92 passed、6 failed、104 ran、165 expects、0 runner timeout**：Uint8Array stream 5/5；广义 stream 87/99，失败拆为 stdin subprocess、Web/Node cancellation reason、Bun.serve direct sink、gated require.resolve.paths owners，广义文件约 8.2s。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W236 fresh Bun timers probe（3 jobs、复用现有 coordinator binary、无构建）初始 3 个候选中 2 个 Node-style plain scripts 被 runner 正确判定 `no-tests` 而排除；计数文件 **1/1，18 passed、2 failed、20 ran、31 expects、0 runner timeout**：UTF-16 timer-id string classification 与 immediate-exception fixture subprocess 两个 owner。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W235 fresh Node timers leaf probe（3 jobs、复用现有 coordinator binary、无构建）**3/3 files pass、0 fail、0 timeout**：zero-timeout/interval 参数与取消、clearImmediate、timer callback receiver/arguments 全部 clean-exit，单文件耗时 198–199ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W234 fresh Bun Node util promisify/callbackify leaf probe（3 jobs、复用现有 coordinator binary、无构建）**2/3 files green、297 passed、2 failed、300 ran、559 expects、0 timeout**：util.promisify 16/17（1 skip）、util.callbackify 90/90；util.test 191/193，两个失败均为 runner color-disabled policy 下的 ANSI styleText colorization。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W233 fresh Node path/querystring/URL leaf probe（3 jobs、复用现有 coordinator binary、无构建）**3/3 files pass、0 fail、0 timeout**：path.parse/format、querystring、legacy url.parse/url.format 全部 clean-exit，单文件耗时 200–250ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W232 fresh Node string/events/URL leaf probe（3 jobs、复用现有 coordinator binary、无构建）**1/3 files pass、2 fail、0 timeout**：url.parse query clean-exit；events.once invalid options 缺少预期 `ERR_INVALID_ARG_TYPE` code，StringDecoder forged receiver 未抛 `ERR_INVALID_THIS`，收敛为两个 API semantic owners。单文件耗时 198–401ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W231 fresh Bun Node util/events/string_decoder probe（3 jobs、复用现有 coordinator binary、无构建）**3/3 files green、214 passed、0 failed、214 ran、6538 expects、0 timeout**：EventEmitter 67、StringDecoder 95、util.types 52 全部 clean-exit，单文件耗时 200–451ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W230 fresh Bun Node path/URL leaf probe（3 jobs、复用现有 coordinator binary、无构建）**3/3 files green、8 passed、0 failed、8 ran、0 expects、0 timeout**：path.basename 4/4、path.extname 3/3、WHATWG url.format 1/1 全部 clean-exit，单文件约 200ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W229 fresh Bun Node URL/path leaf probe（3 jobs、复用现有 coordinator binary、无构建）**3/3 files green、4 passed、0 failed、5 ran、2 expects、0 timeout**：path.parse/format、zero-length path、legacy url.parse query-object guard clean-exit；URL 文件保留 1 个 upstream TODO。首个 querystring 候选因 Bun runner 正确判定 no-tests 而排除。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W228 fresh Node crypto/WebCrypto leaf probe（3 jobs、复用现有 coordinator binary、无构建）**3/3 files pass、0 fail、0 timeout**：KeyObject own-key guard、AES-GCM empty-payload round-trip、short-tag `OperationError` rejection 全部 clean-exit；Node runner 按 file-level 计数，单文件耗时 199–200ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W227 fresh Node crypto leaf probe（3 jobs、复用现有 coordinator binary、无构建）**2/3 files pass、1 fail、0 timeout**：HKDF 与 KeyObject brand-check clean-exit；randomFill 在字符串 offset 校验断言处失败，收敛为 crypto.randomFill* offset/size type-validation owner。Node runner 按 file-level 计数，单文件耗时 198–300ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W226 fresh Node crypto leaf probe（3 jobs、复用现有 coordinator binary、无构建）**3/3 files pass、0 fail、0 timeout**：cipher encoding validation、getCipherInfo lookup/type/range、RSA-OAEP empty payload 全部 clean-exit；Node runner 按 file-level 计数，单文件耗时 231–233ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W225 fresh Node Buffer read/string probe（3 jobs、复用现有 coordinator binary、无构建）**3/3 files pass、0 fail、0 timeout**：basic reads、toString range/coercion、JSON Buffer serialization 全部 clean-exit；Node runner 按 file-level 计数，单文件耗时 199–200ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W224 fresh Node Buffer write probe（3 jobs、复用现有 coordinator binary、无构建）**3/3 files pass、0 fail、0 timeout**：generic write encoding/range、Double BE/LE、UInt BE/LE offset/OOB 全部 clean-exit；Node runner 按 file-level 计数，单文件耗时 200–201ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W223 fresh Node Buffer float probe（3 jobs、复用现有 coordinator binary、无构建）**3/3 files pass、0 fail、0 timeout**：Float32/Float64 BE/LE read/write 与 OOB/range guards 全部 clean-exit；Node runner 按 file-level 计数，单文件均 199ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W222 fresh Node Buffer numeric probe（3 jobs、复用现有 coordinator binary、无构建）**3/3 files pass、0 fail、0 timeout**：signed/unsigned integer reads、signed integer writes 的 OOB/type/range 与 endianness 全部 clean-exit；Node runner 按 file-level 计数，单文件耗时 201–202ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W221 fresh Node Buffer continuation probe（3 jobs、复用现有 coordinator binary、无构建）**3/3 files pass、0 fail、0 timeout**：bad hex、BigInt64/BigUInt64 endian/range、ArrayBuffer sharing/offset/length 全部 clean-exit；Node runner 按 file-level 计数，单文件耗时均约 200ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W220 fresh Bun stack/stdio/HTTP probe（3 jobs、复用现有 coordinator binary、无构建）**21 passed、29 failed、50 ran、114 expects、0 runner timeout**：proxy-style HTTP 为 2/3（CR/LF host 未抛 `ERR_INVALID_CHAR`）；stdio write-after-end 为 0/4（pipe state 与 file report 两类 owner）；capture-stack-trace 为 19/43，失败拆为 stack/frame formatting、internal hook exposure、async/sourceURL/limit、lazy error-info/timeout owners；单文件耗时 582–5645ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W219 fresh Node Buffer plain-script probe（3 jobs、复用现有 coordinator binary、无构建）**3/3 files pass、0 fail、0 timeout**：isUtf8 valid/invalid input、Buffer.byteLength 类型/编码边界、Buffer.compare offset/range 全部 clean-exit；Node runner 按 file-level 计数，单文件耗时 232–285ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W218 fresh Node console plain-script probe（3 jobs、复用现有 coordinator binary、无构建）**3/3 files pass、0 fail、0 timeout**：console 被非对象替换后恢复、primitive throw 写入、util.inspect 不调用函数 toString 全部 clean-exit；Node runner 按 file-level 计数，单文件耗时 199–200ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W217 fresh Node assert owner-split probe（3 jobs、复用现有 coordinator binary、无构建）**0/3 files pass、3 fail、0 timeout**：Assert class destructuring 停在 `assert.Assert` constructor 缺失；Error cause deep-equality 停在 Node message/stack formatting；TypedArray/ArrayBuffer deepEqual 停在预期 AssertionError 未抛出。Node runner 仅做 file-level 计数，未虚构子测试数量；单文件耗时 199–1604ms。首次使用 cwd-relative selector 被 runner 前置校验拒绝、0 tests 未计入，随后改为 root-relative selector 执行。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W216 fresh Bun VM leak/integration probe（3 jobs、复用现有 coordinator binary、无构建）**2/3 files green、5 passed、1 failed、6 ran、1 expect、0 timeout**：`vm-script-fetcher-leak` 4/4 与 `script-leak` 1/1 通过；happy-dom VM 复现停在缺少 `ParentNodeUtility.getElementByTagName` 的 DOM integration owner。单文件耗时 182–887ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W215 fresh Bun TLS leaf probe（3 jobs、复用现有 coordinator binary、无构建）**3/3 files green、7 passed、0 failed、7 ran、33 expects、0 timeout**：rootCertificates immutable、no-cipher-match error shape、createSecureContext extra-argument validation 全部通过；初选的 top-level HTTP script 只报告 0 tests，已排除并替换，未计入覆盖。单文件耗时 202–206ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W214 fresh Bun process/TLS/HTTP leaf probe（3 jobs、复用现有 coordinator binary、无构建）**1/3 files green、4 passed、2 failed、6 ran、6 expects、0 timeout**：`process-stdio-stack-overflow` 4/4 通过；TLS `allowHalfOpen` contract 得到 `true` 而非 Node 期望的 `false`，HTTP ondata leak guard 在 fixture bootstrap 停在 internal handle 缺失；两者分别保留为 TLS option propagation 与 HTTP internal-handle owners。单文件耗时 235–686ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W213 fresh Bun VM/TLS/zlib leaf probe（3 jobs、复用现有 coordinator binary、无构建）**2/3 files green、5 passed、3 failed、8 ran、262 expects、0 timeout**：`vm-sourceUrl` 3/3、`node-tls-internals` 2/2 通过；zlib native handle 重入叶子 3/3 失败，稳定停在子进程 native handle 缺少 `write` 方法的 exposure owner，未归因到生命周期重入；单文件耗时 201–502ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W212 fresh Node DNS contract probe（3 jobs、复用现有 coordinator binary、无构建）**3/5 files pass、2 fail、0 timeout**：get-server、lookup-promises options、setServers type-check 通过；dns/promises 缺 `ENODATA` 常量，Resolver maxTimeout 停在校验 error code/shape；单文件耗时 166–317ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W211 fresh Bun Node crypto probe（3 jobs、复用现有 coordinator binary、无构建）**5/5 files green、72 passed、0 failed、72 ran、383 expects、0 timeout**：LazyHash、one-shot hash/verify、RSA sign variants、X509 subclass 与 random API 全部通过；单文件耗时 170–1423ms，random API 最慢但仍在 bounded limit 内。未发现 source owner，未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W210 fresh Node dgram UDP lifecycle probe（3 jobs、复用现有 coordinator binary、无构建）**5/5 files pass、0 fail、0 timeout**：address、asyncDispose、default bind address、AbortSignal close 与 send bytes-length 全部通过；单文件耗时 165–247ms。未发现 source owner，未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W209 fresh Bun Node Buffer/DOM/crypto probe（3 jobs、复用现有 coordinator binary、无构建）**5/5 files green、17 passed、0 failed、17 ran、74 expects、0 timeout**：Buffer Symbol.toPrimitive、resolveObjectURL、Node DOMException、crypto invalid-this 与 HKDF callback/key-object 全部通过；单文件耗时 165–300ms。未发现 source owner，未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W208 fresh Node events lifecycle probe（3 jobs、复用现有 coordinator binary、无构建）**2/4 files pass、2 fail、0 timeout**：addAbortListener 与静态 getEventListeners 通过；事件 async-iterator 停在 invalid-argument `ERR_INVALID_ARG_TYPE` code，uncaught-exception stack 停在首行 stack-shape owner；单文件耗时 233–332ms。未修改 source/fixture，原始日志未发布，未跑全量 corpus/workspace-wide test。
+- W207 fresh Node diagnostics_channel probe（3 jobs、复用现有 coordinator binary、无构建）**5/5 files pass、0 fail、0 timeout**：has-subscribers、object-channel pub/sub、named pub/sub、symbol-named 与 sync-unsubscribe 全部通过；单文件耗时 168–252ms。未发现 source owner，未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W206 fresh Bun Web/Atomics/URLPattern probe（3 jobs、复用现有 coordinator binary、无构建）修正路径后为 **4/5 files green、447 passed、12 failed、459 ran、6375 expects、0 timeout**：explicit-resource-management、nationalized、WebCrypto SHA-3、Atomics 全绿；URLPattern 为 396/408，失败拆分为 URL 解析、非法 pattern/port、base-URL wildcard 序列化和 Unicode regexp set owners。首次 cwd-relative selector 产生 5 个 harness load-error、0 tests ran，已排除且未计入覆盖。
+- W205 fresh Node stream state/lifecycle probe（3 jobs、复用现有 coordinator binary、无构建）**5/5 files pass、0 fail、0 timeout**：Readable asyncDispose、readableListening、setEncoding(null)、unpipe-resume 与 Writable ending-state 全部通过；单文件耗时 166–316ms。未发现 source owner，未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W204 fresh Node pipeline/pipe cleanup probe（3 jobs、复用现有 coordinator binary、无构建）**5/5 files pass、0 fail、0 timeout**：pipeline async-iterator、Duplex、listeners、empty-string 与 pipe cleanup 全部通过；单文件耗时 166–299ms。未发现 source owner，未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W203 fresh Node pipe error/flow probe（3 jobs、复用现有 coordinator binary、无构建）**5/5 files pass、0 fail、0 timeout**：error-handling、error-unhandled、flow-after-unpipe、flow、multiple-pipes 全部通过；单文件耗时 165–282ms。flow/multiple-pipes 与 W182 邻近 cluster 可能重叠，按复核记录，不夸大新增覆盖。
+- W202 fresh Node pipeline/finished probe（3 jobs、复用现有 coordinator binary、无构建）**3/5 files pass、2 fail、0 timeout**：queued-end-destroy 与 uncaught pipeline 通过；pipeline-process 停车在 child command invocation，finished-async-local-storage 停车在 AsyncContextFrame/enabled-hooks owner。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W201 fresh Node pipe continuation probe（3 jobs、复用现有 coordinator binary、无构建）**5/5 files pass、0 fail、0 timeout**：deadlock、manual-resume、needDrain、object-mode bridge、without-listenerCount 全部通过；单文件耗时 165–281ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W200 fresh Node pipe/backpressure probe（3 jobs、复用现有 coordinator binary、无构建）**5/5 files pass、0 fail、0 timeout**：after-end、await-drain、manual-resume、push-while-write、cleanup-pause 全部通过；单文件耗时 166–185ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W199 fresh Node Duplex/destroy/finalization probe（3 jobs、复用现有 coordinator binary、无构建）**5/5 files pass、0 fail、0 timeout**：Duplex destroy、readable end、base Duplex、stream destroy、finished default path 全部通过；单文件耗时 198–265ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W198 fresh Node Duplex probe（3 jobs、复用现有 coordinator binary、无构建）**5/5 files pass、0 fail、0 timeout**：Duplex from、props、readable/writable、writable-finished、end 全部通过；单文件耗时 165–283ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W197 fresh Node Readable boundary probe（3 jobs、复用现有 coordinator binary、无构建）**5/5 files pass、0 fail、0 timeout**：unshift、unimplemented `_read`、next-no-null、object multi-push、destroy 全部通过；单文件耗时 165–265ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W196 fresh Node Readable readiness/encoding probe（3 jobs、复用现有 coordinator binary、无构建）**5/5 files pass、0 fail、0 timeout**：readable-then-resume、readingMore、resume HWM/scheduled、existing-buffer encoding 全部通过；单文件耗时 165–200ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W195 fresh Bun resolver import/meta probe（3 jobs、复用现有 coordinator binary、无构建）**1/5 files green、42 passed、28 failed、70 ran、82 expects、0 timeout**：import-meta-resolve 15/15 全绿；其余停车在 import.meta path、empty-module shape、CJS __esModule 三个 owners。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W194 fresh Bun JSC/resolve/transpiler probe（3 jobs、复用现有 coordinator binary、无构建）**3/5 files green、39 passed、73 failed、130 ran、286 expects、0 timeout**：native constructor identity 4/4、string-noAtomize 1/1、bun.lock 1/1；REPL transform 与 TypeScript type-export 分别停车在 parser/output 与 bytecode/compile owners。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W193 fresh Bun low-coupling probe（3 jobs、复用现有 coordinator binary、无构建）**3/5 files green、323 passed、12 failed、604 ran、2302 expects、0 timeout**：direct-readable 269 pass/268 skip、libuv error-name 1 pass/1 skip、histogram 38 pass；两份 internal sourcemap 分别停车在 path/UTF-8 与 astral/long-line/cache owners。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W192 fresh Bun parser/cron adjacent probe（3 jobs、复用现有 coordinator binary、无构建）**3/5 files green、464 passed、78 failed、578 ran、755 expects、0 timeout**：JSON5 suite 113/113、JSONC suite 319/319、TLS segment guard 1 pass/1 skip；cron.test 与 in-process-cron 分别停车在 registration/parse mixed owner 与未实现 scheduler。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W191 fresh Bun util probe（3 jobs、复用现有 coordinator binary、无构建）**5/5 files green、105 passed、0 failed、106 ran、1 skipped、409 expects、0 timeout**：password、xxHash、error name/code、sleepSync、invalid pathToFileURL 全部通过；password 单文件 8.789s，其余 198–264ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W190 fresh Bun parser/API probe（3 jobs、复用现有 coordinator binary、无构建）**5/5 files green、719/719 tests passed、0 failed、0 timeout、5324 expects**：cron-parse、INI、JSON5、JSONC、JSONL 全部通过；单文件耗时 465ms–4.166s。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W189 correction：5/5 files pass、0 fail、0 timeout，但 `test-stream-readable-no-unneeded-readable.js` 已在 W115 通过；本轮实际新增 **4 个** Readable readiness 文件，另 1 个为历史 guard 复核。
+- W189 fresh Node Readable readiness probe（3 jobs、复用现有 coordinator binary、无构建）**5/5 files pass、0 fail、0 timeout**：emitted-readable、needReadable、no-unneeded-readable、pause/resume、single readable event 全部通过；单文件耗时 165–250ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W188 fresh Node Readable event/end probe（3 jobs、复用现有 coordinator binary、无构建）**5/5 files pass、0 fail、0 timeout**：end-destroyed、ended、error-end、readable event、flow recursion 全部通过；单文件耗时 164–248ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W187 fresh Node Readable basic probe（3 jobs、复用现有 coordinator binary、无构建）**5/5 files pass、0 fail、0 timeout**：constructor、data 中追加 chunk、default encoding、didRead、short-stream readable emission 全部通过；单文件耗时 164–199ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W186 fresh Node Writable final/error probe（3 jobs、复用现有 coordinator binary、无构建）**5/5 files pass、0 fail、0 timeout**：abort、final throw、finish-destroyed、write error、writev-finish 全部通过；单文件耗时 164–200ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W185 fresh Node Writable-adjacent probe（3 jobs、复用现有 coordinator binary、无构建）**5/5 files pass、0 fail、0 timeout**：default encoding、end callback errors、重复 end、finished state、duplicate write callback 全部通过；单文件耗时 164–249ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W184 fresh Node Writable probe（3 jobs、复用现有 coordinator binary、无构建）**5/5 files pass、0 fail、0 timeout**：constructor method settings、final async/destroy、destroy lifecycle、write callback error 全部通过；单文件耗时 165–201ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W183 fresh Node Transform probe（3 jobs、复用现有 coordinator binary、无构建）**5/5 files pass、0 fail、0 timeout**：callback-twice、final sync、object-mode falsey、HWM 0、destroy 全部通过；单文件耗时 166–201ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W182 fresh Node stream pipe probe（3 jobs、复用现有 coordinator binary、无构建）**5/5 files pass、0 fail、0 timeout**：pipe cleanup、events/flow、多 destination、same destination twice 全部通过；单文件耗时 164–250ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W181 fresh Node Readable/Web BYOB probe（3 jobs、复用现有 coordinator binary、无构建）**4/4 files pass、0 fail、0 timeout**：Readable-to-Web BYOB、BYOB termination、Readable-to-Web module、server-response bridge 全部通过；单文件耗时 200ms–2.259s。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W180 fresh Node stream advanced probe（3 jobs、复用现有 coordinator binary、无构建）**4/5 files pass、1 fail、0 timeout**：compose、consumers、DuplexPair、promises 通过；finished 唯一失败为 callback count mismatch，停车为 finished-callback owner。单文件耗时 164–398ms，未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W179 fresh Node stream pipeline probe（3 jobs、复用现有 coordinator binary、无构建）**5/5 files pass、0 fail、0 timeout**：basic pipeline、listeners、empty-string、Duplex、async-iterator pipelines 全部通过；单文件耗时 165ms–1.183s。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W178 fresh Node stream iterator probe（3 jobs、复用现有 coordinator binary、无构建）**4/5 files pass、1 fail、0 timeout**：iterator push、sync/async sources、validation 通过；readable interop 唯一失败为 Buffer vs Uint8Array deep-strict identity/shape mismatch，停车为 typed-array interop owner。单文件耗时 265–365ms，未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W177 fresh Node stream encoding/buffer probe（3 jobs、复用现有 coordinator binary、无构建）**4/5 files pass、1 fail、0 timeout**：Readable HWM zero/default encoding、Writable clear buffer/null 全部通过；stream-wrap-encoding 唯一失败为 callback count mismatch，停车为 stream-wrap callback owner。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W176 fresh Node stream/Web strategy probe（3 jobs、复用现有 coordinator binary、无构建）**5/5 files pass、0 fail、0 timeout**：Readable↔Web termination、Readable strategy option、Writable default encoding、stream default HWM 全部通过；单文件耗时 165–333ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W175 fresh Node stream state/event probe（3 jobs、复用现有 coordinator binary、无构建）**5/5 files pass、0 fail、0 timeout**：Writable ended/needDrain、Readable data/readable events、isPaused 全部通过；单文件耗时 165–200ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W174 fresh Node stream error/end probe（3 jobs、复用现有 coordinator binary、无构建）**5/5 files pass、0 fail、0 timeout**：readable/writable invalid chunks、writable finished、end-of-streams、Duplex end 全部通过；单文件耗时 165–230ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W173 fresh Node stream basic probe（3 jobs、复用现有 coordinator binary、无构建）**5/5 files pass、0 fail、0 timeout**：Duplex、Readable state、Writable properties、string pushes、TypedArray chunks 全部通过；单文件耗时 199–316ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W172 fresh Bun I/O probe（3 jobs、复用现有 coordinator binary、无构建）**3/3 files green、53 passed、0 failed、53 ran、1728 expects、0 timeout**：FileSink **46/46**（1.160s）、ArrayBufferSink **6/6**、Bun.file.exists **1/1** 全部通过；未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W171 fresh Node fs directory/stat probe（3 jobs、复用现有 coordinator binary、无构建）**4/4 executable files pass、1 MacOS-only skip、0 fail、0 timeout**：opendir、readdir entry types、symlink entry types、stat 通过；readdir-buffer 明确 MacOS-only，未计入 green denominator。可执行文件耗时 165–352ms，未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W170 fresh Node fs vector/copy/truncate probe（3 jobs、复用现有 coordinator binary、无构建）**5/5 files pass、0 fail、0 timeout**：readv、writev、writevSync、copyfile、truncateSync 全部通过；单文件耗时 165–265ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W169 fresh Node fs/promises basic probe（3 jobs、复用现有 coordinator binary、无构建）**4/5 files pass、1 fail、0 timeout**：exists、fd-backed readfile、statfs path validation、writefile 通过；basic readfile 唯一失败为已知 zero-byte-liar child-fixture callback count mismatch，未归并新 source owner。单文件耗时 164–449ms，未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W168 fresh Bun util error/ANSI probe（3 jobs、复用现有 coordinator binary、无构建）**2/4 files green、50 passed、203 failed、253 ran、261 expects、0 timeout**：error-code-mirror **2/2**、exotic-global-mutable-prototype **1/1** 通过；reportError 失败横跨 native error-printer output/stack 与 lone-surrogate handling，wrapAnsi 失败横跨 wrapping、width accounting、ANSI composition，均停车未混修。
+- W167 fresh Node fs delete/error probe（3 jobs、复用现有 coordinator binary、无构建）**5/5 files pass、0 fail、0 timeout**：rename/unlink type validation、rmdir not-found/file-target errors、mkdir/rmdir lifecycle 全部通过；单文件耗时 164–249ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W166 fresh Bun util/file probe（3 jobs、复用现有 coordinator binary、无构建）**3/4 files green、28 passed、4 failed、32 ran、73 expects、0 timeout**：fileUrl **20/20**、Bun.file read **1/1**、concat **5/5** 通过；bun-file broad file 的 4 个失败复现已停车的 async-stack 与 empty-JSON-message owners，未开新 issue 或混修。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W165 fresh Node fs error/read probe（3 jobs、复用现有 coordinator binary、无构建）**3/3 executable files pass、2 Windows-only skips、0 fail、0 timeout**：empty read、readfile error、readlink type validation 通过；两个 Windows-only invalid-path leaves 在 Linux 明确 skip，不计入 green denominator。可执行文件耗时 165–350ms，未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W164 fresh Node fs I/O pure-contract probe（3 jobs、复用现有 coordinator binary、无构建）**5/5 files pass、0 fail、0 timeout**：read、zero-length read、writeSync optional params、appendFileSync、readFile UTF-8 fast path 全部通过；单文件耗时 165–265ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W163 fresh Node fs pure-contract probe（3 jobs、复用现有 coordinator binary、无构建）**4/5 files pass、1 fail、0 timeout**：fs.constants、mkdir、mkdtemp、open-flags 通过；fs.promises.access 唯一失败为 expected async stack shape，停车为 error-stack owner。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W162 fresh Bun WebStreams compression/large probe（3 jobs、复用现有 coordinator binary、无构建）**1/3 files green、159 passed、13 failed、172 ran、350 expects、0 timeout**：compression **11/11** 通过；streams-leak 失败分为 native pull-buffer 与 memory accounting，streams.test 11 个失败横跨 error shape/stack、string allocation limit、batching、controller、foreign-realm、async iterator owners，均停车未混修。
+- W161 fresh Bun WebStreams probe（3 jobs、复用现有 coordinator binary、无构建）**4/4 files green、15 passed、0 failed、15 ran、23 expects、0 timeout**：readable-stream Blob consumption、sync pull fast path、TransformStream leak、native-source close 全部通过；单文件耗时 200ms–4.121s，native-source close 标记为慢但 bounded guard。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W160 fresh Bun Web URL/Response/clone probe（3 jobs、复用现有 coordinator binary、无构建）**2/3 executable files green、131 passed、1 failed、148 ran、842 expects、0 timeout**：URLSearchParams **17/17** 与 structured-clone-fastpath **92/92** 通过；Response **22/23**，唯一失败为 FileRef print-size snapshot 的相对路径根差异；Windows URL 文件 Linux 下 **16/16 skipped**，不计入 green denominator。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W159 fresh Node assert owner-split probe（3 jobs、复用现有 coordinator binary、无构建）**2/5 files pass、3 fail、0 timeout**：assert-fail 与 assert-if-error 通过；deep、partial-deep-equal、typed-array-deepequal 跨 generic deep-comparison、partial-matching、typed-array assertion owners，分别停车，未混修或猜测性开 issue。
+- W158 fresh Node Buffer compare/copy probe（3 jobs、复用现有 coordinator binary、无构建）**5/5 files pass、0 fail、0 timeout**：compare、copy、equals、indexOf、double-precision read 全部通过；单文件耗时 165–300ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W157 fresh Node Buffer numeric read/write probe（3 jobs、复用现有 coordinator binary、无构建）**5/5 files pass、0 fail、0 timeout**：signed/unsigned integer reads、floating-point reads、signed/unsigned integer writes 全部通过；单文件耗时 164–201ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W156 fresh Node util low-coupling probe（3 jobs、复用现有 coordinator binary、无构建）**5/5 files pass、0 fail、0 timeout**：util.deprecate、util.inherits、util.types、type-existence helpers、VT control-character stripping 全部通过；单文件耗时 165–350ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W155 fresh Node querystring/URL query probe（3 jobs、复用现有 coordinator binary、无构建）**5/5 files pass、0 fail、0 timeout**：querystring encode/escape、非有限 `maxKeys`、多字符 separator、legacy URL query parsing 全部通过；单文件耗时 164–200ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W154 fresh Node URLSearchParams getter probe（3 jobs、复用现有 coordinator binary、无构建）**5/5 files pass、0 fail、0 timeout**：get、getAll、has、keys、values 全部通过；单文件耗时 165–201ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W153 fresh Node URL utility probe（3 jobs、复用现有 coordinator binary、无构建）**3/3 files pass、0 fail、0 timeout**：pathToFileURL、revokeObjectURL 参数校验、urlToHttpOptions 全部通过；单文件耗时 199–252ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W152 fresh Bun Fetch body/cyclic cluster（3 jobs、复用现有 coordinator binary、无构建）**3/3 files green、6 passed、0 failed、6 ran、8 expects、0 timeout**：async-iterator body、Request cyclic、Response cyclic 全部通过；heapStats 未复现 W146 的 NaN owner；单文件耗时 253–404ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W151 fresh Node URL format/property probe（3 jobs、复用现有 coordinator binary、无构建）**3/5 files pass、2 fail、0 timeout**：fileURL/path、format invalid input、WHATWG format 通过；URL invalid-this 未抛 TypeError，URL method descriptor enumerable 为 false vs Node true，两个独立 owner 停车。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W150 fresh Bun Blob focused cluster（3 jobs、复用现有 coordinator binary、无构建）**4/4 files green、27 passed、0 failed、27 ran、62 expects、0 timeout**：array fast path、copy-on-write、file-name ownership、blob.write 全部通过；单文件耗时 165–350ms。首次错误目录 selector 在 dispatch 前被路径校验拒绝，未计入结果；未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W149 fresh Bun Fetch/Web basic cluster（3 jobs、复用现有 coordinator binary、无构建）**4/4 files green、27 passed、0 failed、27 ran、40 expects、0 timeout**：Body mixin errors、FormData Content-Length、wire header case、UTF-8 BOM 全部通过；单文件耗时 200–216ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W148 fresh Node path namespace/glob probe（3 jobs、复用现有 coordinator binary、无构建）**3/3 files pass、0 fail、0 timeout**：path glob、path.posix identity、path.win32 identity 全部通过；单文件耗时 198–200ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W147 fresh Node path adjacent probe（3 jobs、复用现有 coordinator binary、无构建）**3/3 files pass、0 fail、0 timeout**：join、normalize、relative 全部通过；单文件耗时 198–199ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W146 fresh Bun Web Request probe（3 jobs、复用现有 coordinator binary、无构建）**2/3 files green、14 passed、6 failed、20 ran、24 expects、0 timeout**：Request subclass 2/2 通过；clone-leak 12/12 通过但耗时 21.240s，标记 slow stress 不进入 fast lane；request-method-getter 6/6 因 heapStats 为 NaN 失败，停车为 memory-accounting owner。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W145 fresh Node timers adjacent probe（3 jobs、复用现有 coordinator binary、无构建）**4/5 files pass、1 fail、0 timeout**：API refs、clearTimeout/interval equivalence、setImmediate、callback this 通过；non-integer delay 回调顺序为 1,4,3,2，Node 期望 1,2,3,4，停车为 fractional-delay ordering owner。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W144 fresh Bun Web console basic probe（3 jobs、复用现有 coordinator binary、无构建）**2/4 files green、3 passed、7 failed、10 ran、15 expects、0 timeout**：UTF-16 与 recursive formatting 通过；`console.log` 失败横跨 snapshot/formatting、long-array cutoff、console.group stack、SharedArrayBuffer，`console.timeLog` 失败横跨 timing/log format，均为多 owner 停车。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W143 fresh Node timers basic cluster（3 jobs、复用现有 coordinator binary、无构建）**5/5 files pass、0 fail、0 timeout**：args、clear null/object、invalid clear、zero timeout 全部通过；单文件耗时 165–350ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W142 fresh Node string_decoder probe（3 jobs、复用现有 coordinator binary、无构建）**2/3 files pass、1 fail、0 timeout**：string-decoder-end 与 fuzz 通过；主 contract 仅在脱离实例调用 `StringDecoder.prototype.write` 时缺少 Node 要求的 `ERR_INVALID_THIS`，停车为 private-brand owner。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W141 fresh Node events basic probe（3 jobs、复用现有 coordinator binary、无构建）**3/5 files pass、2 fail、0 timeout**：CustomEvent、events list、listener-count 通过；`getMaxListeners(AbortSignal)` 默认值 10 vs Node 0，`events.once` invalid-argument error 缺少 `ERR_INVALID_ARG_TYPE` code，两个独立 owner 暂停。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W140 fresh Bun Web timers basic cluster（3 jobs、复用现有 coordinator binary、无构建）**4/4 files green、12 passed、0 failed、12 ran、58 expects、0 timeout**：setImmediate、setImmediate2、performance、performance-entries 全部通过；单文件耗时 166ms–1.709s。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W139 fresh Bun Web Abort cluster（3 jobs、复用现有 coordinator binary、无构建）**3/3 files green、15 passed、0 failed、15 ran、27 expects、0 timeout**：Abort 基础 contract、AbortController GC reason、AbortSignal listener leak 全部通过；单文件耗时 298–800ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W138 fresh Node os pure-contract cluster（3 jobs、复用现有 coordinator binary、无构建）**5/5 files pass、0 fail、0 timeout**：checked-function、signal constants、EOL、homedir fallback、userinfo getter errors 全部通过；单文件耗时 199–349ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W137 fresh Node path pure-contract cluster（3 jobs、复用现有 coordinator binary、无构建）**5/5 files pass、0 fail、0 timeout**：basename、dirname、extname、isabsolute、zero-length strings 全部通过；单文件耗时 164–200ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W136 fresh Bun Web Encoding probe（3 jobs、复用现有 coordinator binary、无构建）**4/5 files green、82 passed、34 failed、116 ran、10777 expects、0 timeout**：bad chunks、single-byte decoder、TextEncoder、TextEncoderStream 全部通过；CJK decoder 34 个 case 均因缺少 Shift_JIS/EUC-JP/Big5/EUC-KR/GBK/GB18030/ISO-2022-JP legacy encoding label 支持而失败，停车为宽编码 subsystem owner。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W135 fresh Bun spawn/io low-coupling probe（3 jobs、复用现有 coordinator binary、无构建）**3/5 files green、58 passed、14 failed、75 ran、1391 expects、0 timeout**：exit-code、empty ArrayBuffer/Blob stdin、kill-signal 全部通过；`Bun.write` 7 个失败横跨 file/content、mtime、GC、copyFileRange、fd/createPath、timed output，`spawnSync` 7 个失败横跨 timeout、memfd/counters、uid/gid，均暂不归并或猜测性开 issue。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W134 fresh Node HTTP low-coupling cluster（3 jobs、复用现有 coordinator binary、无构建）**5/5 files pass、0 fail、0 timeout**：agent close、destroyed-socket、default headers、input function、null-prototype options 全部通过；单文件耗时 205–299ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。首次 selector 路径校验未启动测试，不计入结果。
+- W133 fresh Bun.Terminal native cluster（3 jobs、复用现有 coordinator binary、无构建）**3/3 files green、129 passed、0 failed、130 ran、334 expects**：core terminal、platform gaps、terminal spawn integration 全部通过；单文件耗时 1.233–3.694s，无 timeout。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W132 fresh Node VM/WHATWG streams/URL probe（3 jobs、复用现有 coordinator binary、无构建）**3/5 pass、2 fail、0 timeout**：VM own-property names、URLSearchParams entries、WritableStream close 通过；VM readonly assignment message mismatch issue [#66](https://github.com/Sunrisepeak/mbun/issues/66)，TextDecoderStream 五个 invalid-receiver getter 静默返回 `undefined` issue [#67](https://github.com/Sunrisepeak/mbun/issues/67)。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W131 fresh Node VM/URL/WHATWG probe（3 jobs、复用现有 coordinator binary、无构建）**5/5 files pass、0 fail、0 timeout**：VM indexed/global assignment、legacy URL query、IDN ASCII/Unicode、URLSearchParams invalid-this 全部通过；单文件耗时 164–215ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W130 Node REPL focused probe（3 jobs、复用现有 coordinator binary、无构建）**1/3 pass、1 fail、1 timeout**：multiline navigation 281ms 通过；autolibs 182ms 失败，主 REPL 在 30s bound 超时；两条非绿路径均先报 `RegExp.$N getters require RegExp constructor as |this|`，直接 bounded `RegExp.$1` probe 复现同一 TypeError，issue [#65](https://github.com/Sunrisepeak/mbun/issues/65) 已创建。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W129 corpus-specific Bun/Node probe（Bun 3 jobs + Node 3 jobs、复用现有 coordinator binary、无构建）**2/3 valid files green**：Node net closed-socket、domain uncaught-exception **2/2 pass**，248–250ms；Bun console iterator **0 passed / 17 failed / 17 ran / 0 timeout**，根因收敛为 `for await (const line of console)` 缺失 async iterator/input contract，issue [#64](https://github.com/Sunrisepeak/mbun/issues/64) 已创建。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W128 Node worker/message-port probe（3 jobs、复用现有 coordinator binary、无构建）初始 **4/5 pass、1 timeout**；`test-worker-message-port-message-before-close.js` 经 1 job/60s 隔离复测通过，耗时 **57.762s**，确认是 slow stress leaf 而非稳定 hang；其余四个叶子耗时 165–651ms。最终保留 **5/5 pass**，但该 10,000-message race 不进入默认 30s 快速 lane。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W127 corrected corpus-specific Bun/Node probe（Bun 3 jobs + Node 3 jobs、复用现有 coordinator binary、无构建）**4/5 valid files green**：Bun **31 passed / 2 failed / 34 ran / 84 expects**，`console.write` **1/1**，`console.table` **30/33**；Node HTTP upgrade、URL auth header、net capture-rejection **3/3 pass**。两个 Bun 失败收敛为 TablePrinter primitive cell/header padding alignment，issue [#63](https://github.com/Sunrisepeak/mbun/issues/63) 已创建。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W126 corrected split Bun/Node probe（Bun 3 jobs + Node 3 jobs、复用现有 coordinator binary、无构建）**4/5 valid files green**：Bun **350 passed / 53 failed / 403 ran / 54616 expects**，`index-of-line` **4/4**、`Bun.main` **2/2**；Node HTTP 两文件 **2/2 pass**，耗时 232ms/6.242s。CryptoHasher 的 HMAC keying 与 unsupported-algorithm matrix 分开停车。初次混用 Bun runner 产生的两条 Node `no-tests` 已排除，不计入覆盖；未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W125 fresh Node HTTP/fs stream lifecycle probe（3 jobs、复用现有 coordinator binary、无构建）**5/5 files pass、0 fail、0 timeout**：HTTP agent error/close、empty write、cpSync symlink error、WriteStream uncork、uncaught request callback 全部通过；四个叶子耗时 215–234ms，empty-write HTTP 为 4.289s，仍在 30s bound 内。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W124 fresh Bun util object/string/file/GC/stdin probe（3 jobs、复用现有 coordinator binary、无构建）**2/5 files green、11 passed、6 failed、17 ran、250 expects、0 timeout**：stdin slice **2/2**、Error GC **4/4** 保留；BunObject 缺 `hasNonReifiedStatic` internal helper、BunString 缺 refcount-delta helper、Bun.file 的 async stack 与 empty-JSON message 为分离 owners，暂不混修或猜测性开 issue。原始 runner log 仅本地诊断且含环境展开，未进入文档、commit 或 PR；未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W123 fresh Node fs error/HTTP lifecycle probe（3 jobs、复用现有 coordinator binary、无构建）**5/5 files pass、0 fail、0 timeout**：WriteStream 参数校验、两个 `cpSync` 错误契约、HTTP 无 Content-Length response、HTTP agent timeout 全部通过；单文件耗时 215–265ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W122 fresh Bun util file/stream probe（3 jobs、复用现有 coordinator binary、无构建）**4/5 files green、12 passed、2 failed、14 ran、432 expects**：Bun.file offset、fd-backed read、ArrayBufferSink、file MIME type 通过；`readablestreamtoarraybuffer` 两个测试观察到 patched `Promise.prototype.then` 各调用 6 次（期望 0/1），issue [#62](https://github.com/Sunrisepeak/mbun/issues/62) 已创建，停车为 intrinsic Promise plumbing owner。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W121 fresh Node HTTP/FS/UDP/zlib probe（3 jobs、复用现有 coordinator binary、无构建）**4/5 files pass、1 fail、0 timeout**：HTTP agent=false、HTTP listening、dgram BlockList、fs Buffer leaves 通过；`test-zlib-unused-weak.js` 唯一失败，最小 bounded probe 复现 `process.memoryUsage().external` 在创建 100 个 gzip handle 前后均为 0，属于 zero-denominator memory accounting/GC owner，暂不猜测性开 issue 或改 source。单文件耗时 165–351ms，未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W120 fresh Bun util encoding/memory/promise/worker probe（3 jobs、复用现有 coordinator binary、无构建）**5/5 files green、15 passed、0 failed、15 ran、43 expects**：UTF-16 allocation fallback、file MIME type、unsafe buffer/string conversion、promise peek、`Bun.isMainThread` worker guard 全部通过；worker guard 718ms，其余单文件 166–249ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W119 fresh Node assert/buffer/diagnostics/encoding/http probe（3 jobs、复用现有 coordinator binary、无构建）**4/5 files pass、1 fail、0 timeout**：Buffer 负长度、diagnostics tracing、TextDecoder ignoreBOM、HTTP header validators 通过；`test-assert-class.js` 12 个子测试均因 `require("assert").Assert` 缺失而失败，最小复现确认 export/constructor owner，issue [#61](https://github.com/Sunrisepeak/mbun/issues/61) 已创建。单文件耗时 165–251ms，未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W118 fresh Bun util encoding/file/error/path probe（3 jobs、复用现有 coordinator binary、无构建）**5/5 files green、15 passed、0 failed、16 ran、559 expects**：base64url、Bun.file.exists、error name/code preservation、pathToFileURL invalid-input no-crash、Bun.which 全部通过；单文件耗时 199–266ms。未发现 source owner、未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W117 fresh Bun util UUID/cookie/width/error probe（3 jobs、复用现有 coordinator binary、无构建）**2/5 files green、288 passed、54 failed、360 ran、1297 expects**：cookie **101/101**、UUIDv5 **40/40** 保留；UUIDv7 **7/18**、`stringWidth` **139/173**、`inspect-error` **1/10** 的失败分别跨 timestamp/counter validation、ANSI/Unicode width、source-context/error formatting owners，分开停车，不猜测性混修。未修改 source/fixture，未跑全量 corpus/workspace-wide test；原始本地路径、用户名和机器信息未进入文档、commit 或 PR。
+- W116 fresh Node streams state/encoding probe（3 jobs、复用 W108 fresh binary、无构建）**5/5 files pass、0 fail、0 timeout**：default encoding、ended state、needDrain state、readable HWM=0、writable properties 全部通过；单文件耗时 165–248ms。W114/W116 合计新增 10 个 streams green 文件。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W115 fresh Node streams event-order/pipe probe（3 jobs、复用 W108 fresh binary、无构建）**4/5 files pass、1 fail、0 timeout**：readable no-unneeded、pipe/unpipe、destroy event order、readable aborted 通过；`test-stream-writable-samecb-singletick.js` 在 1 job/60s 隔离复测仍失败。对照确认 `process.nextTick` 和显式 callback 的 Writable 写入能产生 `TickObject`，只有 callback-less Console/Writable 路径缺少内部 tick；issue [#60](https://github.com/Sunrisepeak/mbun/issues/60) 已创建。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W114 fresh Node streams writable/readable basic probe（3 jobs、复用 W108 fresh binary、无构建）**5/5 files pass、0 fail、0 timeout**：writable finished、重复 end、invalid chunk、write callback error、readable state 全部通过；单文件耗时 166–183ms。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W113 fresh Node process environment/runtime probe（3 jobs、复用 W108 fresh binary、无构建）**4/5 files pass、1 fail、0 timeout**：allowed flags、execve 参数校验、thread CPU usage、no-deprecation 通过；`test-process-env-tz.js` 在 1 job/60s 隔离复测仍失败。根因收敛为同一 `Date` 实例首次 `toString()` 后的 JSC 本地 Gregorian 缓存只按毫秒复用，TZ 名称更新但 offset 仍旧；issue [#59](https://github.com/Sunrisepeak/mbun/issues/59) 已创建。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W112 fresh Node child_process adjacent-contract probe（3 jobs、复用 W108 fresh binary、无构建）**5/5 files pass、0 fail、0 timeout**：`execFile`、exec 环境、stdio 形状、IPC 参数类型错误、kill 生命周期全部通过；单文件耗时 231–666ms。未修改 source/fixture，IPC backlog/handle 和 signal-race owners 未混入，未跑全量 corpus/workspace-wide test。
+- W111 fresh Node child_process basic-contract probe（3 jobs、复用 W108 fresh binary、无构建）**5/5 files pass、0 fail、0 timeout**：cwd、exec encoding、exit code、spawn type validation、stdio validation 全部通过；单文件耗时 215–850ms。未修改 source/fixture，fork/IPC、large-buffer、timeout/kill 等高耦合 owners 未混入，未跑全量 corpus/workspace-wide test。
+- W110 fresh Bun util low-coupling probe（3 jobs、复用 W108 fresh binary、无构建）**5/5 files green、57 passed、0 failed、57 ran、966 expects**：`escapeHTML`、`escapeRegExp`、`fileURL`、`hash`、`sleepSync` 全部通过。未修改 source/fixture，未跑全量 corpus/workspace-wide test。
+- W109 fresh Node TLS constructor/default-option probe（3 jobs、复用 W108 fresh binary、无构建）**3/5 files pass、
+  1 fail、1 timeout**：server identity、no-host connect、boolean option validation 通过；parent constructor
+  只剩 accepted TLS socket 的 pauseOnConnect 传递问题；socket default options 无输出超时。该 timeout
+  以 1 job/60s 隔离复测仍复现，未创建猜测性 issue，未修改 source/fixture，未跑全量 corpus。
+- W108 issue [#58](https://github.com/Sunrisepeak/mbun/issues/58) 推进 Bun
+  Node-net constructor/server shape：pre-fix **2/5 files green、147 passed / 20 failed /
+  175 ran / 300 expects**；1d755dc 修复 callable constructor parent、_connections、
+  _unref、_usingWorkers、highWaterMark 和连接计数，post-fix 为 **2/5 files green、
+  152 passed / 15 failed / 175 ran / 301 expects**。server.spec.ts 从 6 个 shape
+  failures 收敛到 1 个 harness toMatchObject own-property gap；node-net.test.ts 的
+  9 个失败仍跨多个 owner，socketaddress.spec.ts 的 5 个失败是 matcher 缺失。W107
+  Node net guard 保持 **5/5 pass**。未修改上游 fixture，未跑全量 corpus/workspace-wide test。
+- W107 fresh Node net low-coupling leaf probe（3 jobs、复用 W106 fresh binary、无构建）**5/5 files pass**：
+  IPv4 classification、argument normalization、Socket constructor、listening state、本地 address/port
+  全部通过。未发现 source owner，未修改上游 fixture，未跑全量 corpus/workspace-wide test。
+- W106 issue [#57](https://github.com/Sunrisepeak/mbun/issues/57) 修复 Node
+  process.exitCode contract：pre-fix 五文件 selector 为 **4/5 pass**；92dd963
+  让 exitCode 不可配置、为 Node 方言补精确的删除错误文本，并使 invalid
+  process.exit(code) 子进程以状态 1 退出。fresh serialized build 后 W106 为
+  **5/5 files pass**；W105 进程身份/计时回归保持 **5/5 pass**。未修改上游 fixture，未跑全量
+  corpus/workspace-wide test。
+- W105 fresh Node process identity/timing leaf probe（5 jobs、复用 W101 binary、无构建）**5/5 files pass**：`argv[0]`、
+  `uptime`、symlinked `execPath`、`ppid`、Linux `O_NOATIME` 全部通过。未发现 source owner，未修改上游 fixture，
+  未跑全量 corpus。
+- W104 fresh Bun Node process/stdio leaf probe（5 jobs、复用 W101 binary、无构建）**5/5 files green、39 passed、0
+  failed、39 ran、93 expects**：memoryPressure **5/5**、signal listener count **3/3**、process constructor **2/2**、
+  setgroups/hrtime accessor guard **5/5**、invalid UTF-16 stdout/stderr **24/24**。未发现 source owner，未修改上游
+  fixture，未跑全量 corpus。
+- W103 fresh Bun `node:module`/SourceMap leaf probe（5 jobs、复用 W101 binary、无构建）测得 **3/5 files green、44
+  passed、10 failed、54 ran、142 expects**：`module-resolve-filename-paths` **6/6**、`module-sourcemap` **3/3**、
+  `module-children-concurrent-gc` **1/1** 全绿。`node-module-module` 为 **21 passed / 9 failed / 30 ran / 102
+  expects**，失败跨 builtin inventory、`_resolveFilename`/`Module.prototype.require` override、builtin cache export、
+  `Module.runMain` 和 children tree；`sourcemap` 为 **13 passed / 1 failed / 14 ran / 22 expects**，唯一失败是
+  malformed inline map 未输出预期 decode warning。两个失败 owner 分离且属于 deferred CJS/source-map integration，
+  不混修、不猜测性开 issue；未修改上游 fixture，未跑全量 corpus。
+- W102 fresh Node `node:module` introspection/lookup probe（5 jobs、复用 W101 binary、无构建）测得 **4/5 files pass、1
+  failed**：module version、`Module._stat`、builtin list、relative lookup 全绿；multi-extensions 依赖可变的
+  `require.extensions` custom loader，而当前 CJS loader 已明确将该集成列为 deferred，停车不混修。未修改上游
+  fixture，未跑全量 corpus。
+- W101 issue [#56](https://github.com/Sunrisepeak/mbun/issues/56) 修复 Node CLI preload 的 `Module.runMain` 入口钩子：
+  pre-fix 五文件 module-loader probe 为 **3/5 pass、1 skipped、1 failed**，根因是 preload 已执行但 native
+  entry 直接评估主文件，导致 `runMain` monkey-patch 不可观察；`f296040` 让 Node 方言且存在 preload 时经过
+  `Module.runMain()`，Bun 入口保持原路径。fresh serialized build 后 W101 为 **4/5 pass、1 skipped、0 failed**，
+  W100 FileHandle regression **5/5 pass**；未修改上游 fixture，未跑全量 corpus。
+- W100 fresh Node `fs/promises` FileHandle leaf probe（5 jobs、复用现有 binary、无构建）**5/5 files pass**：
+  close-errors、aggregate-errors、pull、readFile、writer 全部通过。作为 W93 chmod/stat/truncate/write/sync
+  之后的扩展 guard，未发现 source owner；未修改上游 fixture，未跑全量 fs/corpus。
+- W99 fresh Bun fs/streams/spawn/DNS/URL leaf probe（5 jobs、无构建）初测 **4/5 files green、108 passed、1 failed、
+  109 ran、355 expects**：spawn null-byte **20/20**、fs leak **4/4**、pipeTo signal leak **2/2**、URL **14/14**。
+  DNS 为 **68/69**，唯一失败是公共域名返回的 IPv6 地址与 fixture 固定值不同；同文件 1-job isolated rerun
+  为 **69/69**，第二次 5-job 复跑再次出现 answer variance，判定为外部 DNS 波动，不改 runtime。未修改上游
+  fixture，未跑全量 corpus。
+- W98 fresh Bun standard-module/API leaf probe（5 jobs、复用 W97 binary、无构建）测得 **4/5 files green、161
+  passed、1 ahead-of-reference、165 ran、100536 expects**：sleep **2/2**、Deno URLSearchParams **32/32**、Node
+  X509 **14/14**、TextDecoder **104/104**；`resolve/require` 为 **9 passed / 1 ahead-of-reference / 3 todo /
+  13 ran**，唯一 failure 是 Bun `test.failing` 标记的用例在 mbun 中通过，按“比参考实现更正确”记录，不做
+  猜测性修复。未修改上游 fixture，未跑全量 corpus。
+- W97 issue [#55](https://github.com/Sunrisepeak/mbun/issues/55) 修复 Node HTTP/2 connect AbortSignal teardown：fresh
+  五文件 Node probe 从 **4/5 pass** 变为 **5/5 pass**。根因是 transport signal 与 session teardown 竞态让
+  pending request 收到 `ABORT_ERR`，而 Node 要求 session 保留 `AbortError`、request 收到
+  `ERR_HTTP2_STREAM_CANCEL`；`ed9c854` 让 session 单独消费 signal，并在 abort teardown 中取消 streams，普通
+  session destroy 保持原语义。W96 Node regression **5/5 pass**，W95 Bun HTTP/2/Worker regression **5/5 green、
+  8 passed、0 failed、8 ran、8 expects**。fresh build 通过，未修改上游 fixture，未跑全量 corpus。
+- W96 issue [#54](https://github.com/Sunrisepeak/mbun/issues/54) 修复 Node HTTP/2 RST lifecycle：fresh five-file
+  Node probe 从 **4/5 pass** 变为 **5/5 pass**。根因是 client reset path 在错误前没有结束 readable、server
+  收到非零 peer RST 只 finish 而没有进入 `ERR_HTTP2_STREAM_ERROR`；`fa2373e` 让 client `end` 在错误前完成，
+  并让 server non-zero reset 经过 `_destroy`，CANCEL 保持 non-error destroy。相邻 Bun HTTP/2/Worker 五文件
+  guard 保持 **5/5 green、8 passed、0 failed、8 ran、8 expects**；fresh build 通过。未修改上游 fixture，未跑
+  全量 corpus；原始本地路径和环境信息未进入文档、commit 或 PR。
+- W95 issue [#53](https://github.com/Sunrisepeak/mbun/issues/53) 修复 HTTP/2 reserved push stream 的 DATA
+  状态：W94 的 **4/5 files green、7 passed、1 failed、8 ran、6 expects** 经 fresh serialized build 后变为
+  **5/5 files green、8 passed、0 failed、8 ran、8 expects**。仅在 client DATA path 对 response HEADERS 前的
+  pushed stream 发送 `STREAM_CLOSED` 并保持 session 可处理后续 PING；HTTP/2 late-RST、streams-rehash、
+  Worker SAB 与 transfer-terminate guards 均保持通过，未修改上游 fixture，未跑全量 corpus。
+- W94 fresh Bun HTTP/2/Worker staged probe（5 jobs、无构建）测得 **4/5 files green、7 passed、1 failed、8
+  ran、6 expects**；唯一失败是 reserved-push DATA refusal 3.5 秒 timeout，已由 #53 单 owner 定位。
+- W93 fresh Node `fs/promises` FileHandle leaf probe（5 jobs、复用 W92 binary、无构建）**5/5 files pass**：
+  chmod、stat、truncate、write、sync 全部通过。作为 W92 AbortError 修复后的 Node-side guard，未发现
+  新 source owner，未修改 fixture，未跑全量 corpus。
+- W92 issue [#52](https://github.com/Sunrisepeak/mbun/issues/52) 修复 `fs/promises` AbortError
+  message owner：W90 的 **17 passed / 12 failed / 34 ran** 经 fresh build 后变为 **24 passed / 5 failed /
+  34 ran**，四个 child_process/fs guards 仍全绿；Bun focused aggregate 为 **4/5 files green、46 passed、
+  5 failed、56 ran、114 expects**。仅在 `fsAbortErr()` 补 Node 要求的末尾句号，Node/Bun direct smoke
+  均为 `AbortError`、`ABORT_ERR`、`The operation was aborted.`；剩余失败跨 async stack、internal loader、
+  FileHandle 生命周期和 async-iterator abort assertion，未混修。Node guard 2/3 pass，剩余一项为独立
+  zero-byte-liar fixture assertion。
+- W91 fresh Bun Node-net leaf probe（5 jobs、复用 W85 binary、无构建）测得 **3/5 files green、5 passed、
+  1 failed、7 ran、15 expects**：`double-connect` **1/1**、allowHalfOpen **2/2**、socket reconnect
+  **2/2**。`handle-leak` 为 no-tests stress entrypoint 但实际完成 100,000 次连接；
+  autoSelectFamily destroy-pending Linux case 5 秒超时，属于 net liveness boundary，未做猜测性修复。
+- W90 fresh Bun Node-fs/child_process leaf probe（5 jobs、复用 W85 binary、无构建）先纠正一次 selector
+  拼写错误后，以真实 `fs/promises.test.js` 重跑；权威结果为 **4/5 files green、39 passed、12 failed、
+  56 ran、107 expects**。`child-process-exec` **11/11**、rlimit **1/1**、stdio **7/7**、Linux
+  fs-stat-seccomp **3/3**；`fs/promises` 为 **17 passed / 12 failed / 34 ran**，失败跨 async stack、
+  internal stream loader、FileHandle 生命周期和 AbortError shape 多个 owner，停车不混修。
+- W89 fresh Bun Node-inspector probe（5 jobs、复用 W85 binary、无构建）测得 **4/5 files green、34
+  passed、27 failed、64 ran、131 expects**：`inspector.test` **5/5**、diagnostics channel **6/9**、
+  perf hooks **8/8**、timers promises **4/4**；`inspector-profiler` 为 **11 passed / 27 failed / 38 ran**。
+  失败跨 Session 状态、Profiler enable/start/stop 和 unsupported-method，源码核对确认当前
+  `process.features.inspector=false` 且缺少 inspector/profiler 子系统，停车不做猜测性修复。
+- W88 fresh Bun Node-fs directory/Stats leaf probe（5 jobs、复用 W85 binary、无构建）确认 **5/5
+  files green、52 passed、0 failed、55 ran、138 expects**：`dir` **23/23**、`fs-mkdir` **21/24**、
+  async-iterator writeFile **2/2**、Stats constructor **3/3**、Stats truncate **3/3**。这是对旧
+  W70 记录的 fresh bounded refresh，未发现单一 source owner；未修改上游 fixture，未跑全量 corpus。
+- W87 fresh Bun Node-fs leaf probe（5 jobs、复用当前 Linux binary、无构建）确认 **5/5 files
+  green、46 passed、0 failed、70 ran、92 expects**：fs.glob **27/27**、fs-path-length
+  **11/11**、Linux birthtime **5/5**、cp symlink target **2/2**、recursive readdir error leak
+  **1/1**。旧记录经 fresh evidence 复核，未发现 source owner；未修改上游 fixture，未跑全量
+  corpus。
+- W86 Buffer completion regression guard（5 jobs、复用 W85 binary、无构建）测得 **4 green
+  files、25 passed、6 failed、31 ran、46 expects**。compare-bounds、from-encoding-leak、
+  inspectmaxbytes、utf16 全绿；`buffer-concat` 的 6 个失败跨 OOM 错误形状、resizable shrink
+  和 detach 传播，属多个 native concat owner，未与 #51 混修，未跑全量 corpus。
+- W85 fresh Bun `node:os`/`string_decoder` probe（5 jobs）先测得 **3 green + 1 all-skipped、
+  147 passed、2 failed、150 ran、3035 expects**。两条 `string_decoder` 失败实际共享
+  Buffer allocator 上限：Bun dialect 仍拒绝 `2**31` 以上 buffer，child 在进入 decoder 前退出。
+  Issue [#51](https://github.com/Sunrisepeak/mbun/issues/51) 的最小修复由 `03b22da` 落地：
+  Bun 64-bit 采用 `MAX_LENGTH=2**32`、`MAX_STRING_LENGTH=2**31-1`，Node dialect 保持原值，
+  并同步 `Buffer.alloc*`/`concat` 与 module constants；release build **60.13 秒**。修复后
+  W85 为 **4 green + 1 all-skipped、149 passed、0 failed、150 ran、3038 expects**，
+  `string_decoder` **95/95**，`node:os` **52/52**。未跑全量 corpus。
+- W84 fresh Bun Node-path continuation（5 jobs、复用当前 Linux binary、无构建）新增 **5/5
+  files green、88 passed、0 failed、89 ran、382 expects**：`browserify` **52/52**、
+  `matches-glob` **31/31**、`path` 基础属性、15704 长路径保护和 zero-length strings 均绿。
+  未修改上游 fixture，未跑全量 corpus；继续保持 3–5 worker 与低 swap/disk 策略。
+- W83 fresh Bun Node-path probe（5 jobs）先测得 **4/5 files green、15 passed、1 failed、16 ran、9
+  expects**；唯一失败是 `path.format(null)` 的 Bun 方言错误文案。Issue [#50](https://github.com/Sunrisepeak/mbun/issues/50)
+  的最小修复由 `7f6af93` 落地：Bun dialect 保留 `property + typeof` 文案，Node dialect 保留
+  `Received ...` 文案；release build **60.34 秒**。修复后 W83 为 **5/5 files green、16
+  passed、0 failed、16 ran、9 expects**；与 W82 合并的 10-file path guard 为 **10/10
+  green、29 passed、0 failed、29 ran**，Node `test-path-parse-format.js` 亦为 **1/1 pass**。
+  未修改上游 fixture，未跑全量 corpus；构建期间记录 swap 仅约 48 MiB 可用、磁盘约 20 GiB
+  可用，继续保持串行构建与 bounded runner。
+- W82 fresh Node path leaf probe（5 jobs、复用当前 Linux binary、无构建）新增 **5/5 files
+  green、13 passed、0 failed、13 ran、0 expect() calls**：basename、dirname、extname、
+  isAbsolute、join 全绿；0 expect 是因为上游使用 Node assert，不代表缺少断言。未修改
+  上游 fixture，未跑全量 corpus。
+- W81 fresh Node console/zlib probe（5 jobs、复用当前 Linux binary、无构建）测得 **4 green
+  files、390 passed、12 failed、404 ran、480 expects**。console constructor/core、zlib leak、
+  reset-race 全绿；`zlib.test` 的失败跨 invalid raw data、libdeflate level validation、
+  chunk/output bounds、async buffer lifetime 多个 owner，未混修。未修改上游 fixture，未跑全量
+  corpus。
+- W80 fresh Node zlib probe（5 jobs、复用当前 Linux binary、无构建）测得 **3 green files、17
+  passed、30 failed、47 ran、64 expects**。bytesWritten、deflate-streaming、zlib.kMaxLength
+  全绿；handle-bounds 与 onerror-reentrancy 的失败跨 native handle bounds/writeState、缺失
+  handle 方法、close 后 init 校验和 reentrancy，属 zlib binding lifecycle/handle owner，未混修。
+  未修改上游 fixture，未跑全量 corpus。
+- W79 fresh Bun crypto probe（3 jobs、复用当前 Linux binary、无构建）测得 **2 green files、
+  9515 passed、736 failed、10251 ran、29406 expects**。cipheriv-decipheriv 与
+  x25519-derive-bits 全绿；WPT generateKey 的失败集中在 empty-algorithm 与 RSA
+  algorithm-property validation 的异常类型/校验矩阵，未混修。未修改上游 fixture，未跑
+  全量 corpus。
+- W78 fresh Bun file/util leaf probe（5 jobs、复用当前 Linux binary、无构建）测得 **4 green
+  files、27 passed、1 failed、28 ran、227 expects**。bun-file-fd-read、bun-file-read、
+  bun-isMainThread、fileUrl 全绿；`BunObject` 唯一失败是缺少
+  `bun:internal-for-testing.hasNonReifiedStatic` 的 Bun object/bootstrap lazy-static helper，
+  属内部 owner，未做 test-specific shim。探测产生的本地环境 dump 已删除，未复制到文档、
+  commit 或 PR；未修改上游 fixture，未跑全量 corpus。
+- W77 fresh Node crypto probe（5 jobs、复用当前 Linux binary、无构建）测得 **4 green files、51
+  passed、8 failed、59 ran、344 expects**。sign regression、X509、scrypt、oneshot 全绿；
+  `crypto-extra-memory` 的 8 个失败均是 `heapStats().extraMemorySize` 未反映 SecretKey、
+  asymmetric key、Hash/Hmac/Cipher、ECDH、Sign、Verify 的 native wrapper external-memory，
+  属 JSC GC/native accounting 架构 owner，未混修。未修改上游 fixture，未跑全量 corpus。
+- W76 fresh Node assert leaf probe（5 jobs、复用当前 Linux binary、无构建）测得 **4 green +
+  1 ahead-of-reference、275 passed、22 failed、297 ran、451 expects**。doesNotMatch、match、
+  promise、assert spec 四个文件全绿；`deep-equal` 的 22 个失败均为上游 `test.failing` 且
+  mbun 实际通过，涉及 prototype/own-property/RegExp/collection 等多语义矩阵，未误计为
+  green，未混修。未修改上游 fixture，未跑全量 corpus。
+- W75 fresh Bun util leaf probe（5 jobs、复用当前 Linux binary、无构建）新增 **5/5 files
+  green、13 passed、0 failed、13 ran、24 expects**：file exists、Bun.concat、error-code
+  mirror、error-name preservation 和 file-type detection 全绿。未修改上游 fixture，未跑
+  全量 corpus。
+- W74 fresh Node events/stream/assert/console leaf probe（5 jobs、复用当前 Linux binary、无构建）
+  测得 **4 green files、136 passed、2 failed、138 ran、279 expects**。event-emitter、
+  node-stream-uint8array、assert TypedArray deep-equal、console table iterator 全绿；
+  `node-timers` 的失败分成 JSC UTF-16 字符串表示与 immediate 异常后的 microtask 调度两个
+  owner，停车不混修。未修改上游 fixture，未跑全量 corpus。
+- W73 fresh Node crypto probe 先以 **5 jobs** 测得 **4 green files、33 passed、2 failed、35
+  ran、85 expects**；HMAC、invalid-this、lazyhash、HKDF 全绿，`crypto-random` 的 sync/async
+  `checkPrime` 失败都来自同一参数快照 owner。Issue [#49](https://github.com/Sunrisepeak/mbun/issues/49)
+  的最小修复由 `b2b5bae` 落地：先复制 candidate bytes，再只读取一次 `options.checks`；root
+  release build **60.40 秒**。同一五文件 bounded regression 现为 **5/5 files green、35
+  passed、0 failed、35 ran、87 expects**。未修改上游 fixture，未跑全量 corpus。
+- W72 fresh Bun child-process probe 先以 **5 jobs** 测得 **4 green files、20 passed、1
+  failed、21 ran、44 expects**，根因定位到未 `listen()` 的 `net.Server`（`_fd === -1`）传给
+  `child.send()` 时错误进入 `ERR_INVALID_HANDLE_TYPE`；Node 对照为返回 `true` 且 callback
+  为 `null`。Issue [#48](https://github.com/Sunrisepeak/mbun/issues/48) 的最小修复已由
+  `d390ad7` 落地，root release build **60.59 秒**；focused IPC **1/1**，完整 W72 回归
+  **5/5 files green、21 passed、0 failed、21 ran、44 expects**，fake/unsupported handle
+  仍保留 `ERR_INVALID_HANDLE_TYPE`。未修改上游 fixture，未跑全量 corpus。
+- W71 fresh Bun HTTP probe（5 jobs、复用当前 Linux binary、无构建）测得 **3 green
+  files、22 passed、13 failed、35 ran、68 expects**。numeric headers、response
+  setTimeout/unref、early-hints 全绿；HTTPParser 与 transfer-encoding/trailer 的
+  状态机、校验和 timeout 失败为多 owner，未混修。未跑全量 corpus。
+- W70 fresh Bun filesystem leaf probe（5 jobs、复用当前 Linux binary、无构建）新增 **5/5
+  files green、52 passed、0 failed、55 ran、138 expects**：目录、mkdir、async-iterator
+  writeFile、Stats constructor/truncate 全绿。未跑全量 corpus。
+- W69 fresh Bun module-loader probe（5 jobs、复用当前 Linux binary、无构建）测得 **2
+  green files、46 passed、17 failed、63 ran、158 expects**。module resolve paths **6/6**、
+  node:module SourceMap API **3/3** 全绿；Module hooks/children、require.extensions
+  和 entry sourcemap warning/stack 分别属于多 owner loader cluster，未做猜测性修复。
+  未跑全量 corpus。
+- W68 fresh Bun process probe（5 jobs、复用当前 Linux binary、无构建）测得 **3 green
+  files、30 passed、6 failed、36 ran、131 expects**。`process-args`、`process-on`、
+  invalid-UTF-16 stdio 全绿；`process-exitCode-with-exit.js` 确认为需要数值 argv 的
+  fixture（显式传入数值后 direct smoke 输出 `PASS`）；`process-nexttick` 的失败分散
+  在 callback validation、queue ordering、repeated scheduling，多 owner 停车。未跑
+  全量 corpus。
+- W67 fresh Bun `worker_threads` triage（5 jobs、复用当前 Linux binary、无构建）测得
+  **2 green files、8 passed、3 failed、12 ran、13 expects**，另有 1 个 all-skipped。
+  `worker-async-dispose` 与 `worker-transfer-list` 全绿；`worker-thread-id` 是缺少
+  parent worker context 的 fixture-style entry；`worker-top-level-await` 串行复测为
+  **4/6 pass、2 fail**，同属 unsettled-TLA exit-code 13 与 worker liveness 的跨
+  corpus owner，按既有实测停车，未做猜测性 source patch。未跑全量 corpus。
+- W66 fresh Bun util/parse_args leaf probe（5 jobs、复用当前 Linux binary、无构建）为
+  **4/5 files green、128 passed、0 failed、128 ran、273 expects**：MIME API、两个
+  `parse_args` 文件和 AbortSignal 全绿；`util/exact/mime-test.js` 为 **no-tests**，
+  未将成功退出误计为 coverage。未跑全量 corpus。
+- W65 fresh Bun URL API leaf probe（5 jobs、复用当前 Linux binary、无构建）新增 **5/5
+  files green、135 passed、0 failed、137 ran、130 expects**：`url-parse-query`、
+  `url-format`、`url-format-whatwg`、`url-domain-ascii-unicode`、
+  `url-canParse-whatwg`。这是增量覆盖数据，不代表整个 URL subtree 或已停车的
+  parser cluster；未跑全量 corpus。
+- `#47` 修复 Node URL setter 的 WebIDL `USVString` 边界：`href`、`protocol`、
+  `username`、`password`、`host`、`hostname`、`port`、`pathname`、`search`、
+  `hash` 现在先执行 JavaScript `ToString`，拒绝 Symbol，并将 lone surrogate
+  归一化为 U+FFFD；Bun 方言与已停车的 URL parser 路径保持不变。root release build
+  **60.86 秒**；focused setter **1/1 pass**，五文件 bounded regression（5 jobs）为
+  **4/5 files pass**，唯一失败仍是 W63 已记录的 URL custom-parsing message/parser
+  owner；未跑全量 corpus。
+- `#44` 新增 Node 方言 `buffer.transcode` 模块导出，覆盖 Node corpus 使用的
+  utf8/latin1/ascii/utf16le/ucs2 编码转换，并将 latin1/ascii 不可表示字符替换为
+  `?`；Bun 方言仍保持 `buffer.transcode` 与 `Buffer.transcode` 为 `undefined`。
+  root release build **60.12 秒**；focused `test-icu-transcode.js` **1/1 pass**，
+  目标文件加 10 个 Buffer/Node guards **11/11 files pass**。五文件 fresh probe
+  由 **1/5** 提升为 **2/5 pass**，其余三个 URL 文件为独立 owner；未跑全量 corpus。
+- `#45` 修复 Node URL custom-inspect 边界：单引号字段与 Node 顺序、`showHidden`
+  的 URLContext、动态子类名和 depth-zero 输出均对齐，Bun 输出保持不变。root
+  release build **60.24 秒**；focused URL inspect **1/1 pass**，含 transcode、URL
+  inspect、URL parsing、URL setters、Buffer.fill 的五文件候选集为 **3/5 pass**，
+  后两个 URL 文件仍是独立 owner；未跑全量 corpus。
+- W63 URL custom-parsing triage 停车：临时 Node message-normalization 实验把首个
+  mismatch 推进到 **9 个 invalid URL no-throw**，证明底层 parser acceptance 与
+  error wording 是同一多 owner cluster；实验已回退、无 source commit、无 green
+  claim。诊断 root build **60.76 秒**，focused 文件仍 red，未跑全量 corpus。
+- `#43` 修复 Node `Buffer.prototype.fill` 的三个同入口 contract：hex 填充值现在
+  拒绝奇数长度/非法字符并返回 `ERR_INVALID_ARG_VALUE`，非字符串 encoding 返回
+  `ERR_INVALID_ARG_TYPE`，伪造 `length` 与 TypedArray 实长不一致时返回
+  `ERR_BUFFER_OUT_OF_BOUNDS`。root release build **60.70 秒**；focused fill + 9
+  Buffer guards **10/10 pass**，完整 W59 15 文件样本由 **13/15** 提升为
+  **14/15 pass**。剩余 `test-buffer-constants.js` 是独立 JSC String capacity
+  边界，未扩大为全局 String 修改；未跑全量 corpus。
+- W59 Node buffer leaf sample（默认 bounded profile、**3 jobs**，无构建/全量）测得
+  首批 `test-buffer-ascii`、`badhex`、`compare`、`isascii` **4/5 pass**，相邻
+  `arraybuffer`、`bytelength`、`equals`、`includes`、`indexof` **5/5 pass**；合计
+  **9/10 files pass**。唯一失败 `test-buffer-constants.js` 是
+  `MAX_STRING_LENGTH + 1` 未触发 `RangeError`，指向通用 JSC 字符串容量边界，未为
+  单文件猜测性修改全局 String 行为。未跑全量 corpus。
+- W58 parser sample（默认 **4G/512、3 jobs**，复用已有 fresh binary，无构建）新增
+  JSON5 扩展 **321/321**、JSON5 官方 suite **113/113**、YAML block-scalar matrix
+  **1084/1084**，合计 **3/4 files green、1521/1530 tests passed、9 failed、1809
+  expects**。`import-attributes` 的 9 个失败跨无扩展 JS/TS、JSON/JSONC/TOML/YAML
+  loader、tsconfig JSONC 识别以及 wasm/不存在模块处理，按多 owner 停车，不建混合
+  issue。未跑全量 corpus。
+- W57 fresh Bun built-in probes（默认 **4G/512、3 jobs**，无构建）新增 13 个绿色文件：
+  `ini` **62/62**、`JSONC` **43/43**、`JSONL` **269/269**、Markdown heading IDs
+  **17/17**，以及 cookie 四文件 **124/124**、cron parse **24/24**；合计新增绿色
+  文件 **9/10**、**576/591 tests passed**、**15 failed**、**5479 expects**。第三批
+  util probe 再新增 base64url **5/5**、escapeHTML **10/10**、escapeRegExp **2/2**、
+  which **5/5**；其余 `stripANSI` 为 **284/296**，12 failed。三批合计 **13/15 files
+  green、882/909 tests passed、27 failed、7451 expects**。GFM 与 stripANSI 的失败
+  都拆成多个 owner，停车不混修。未跑全量 corpus。
+- `d8d8082`（issue #42）修复 Bun.Glob 路径边界兼容：复用平台 path policy，在
+  pattern、目录下降、`directory_entry` status/iterator 的 `ENAMETOOLONG` 路径上保留
+  Bun 错误信号，同时修正 only-files fast path 的 `absolute` 输出。新增 glob scan
+  error-code 回归，`test_glob` **1497 checks、0 failures**；`glob/path-length.test.ts`
+  从 **1/6** 提升为 **6/6**。W56 九文件 bounded lane（默认 **4G/512、3 jobs**）为
+  **9/9 files green、193/193 tests、0 failed、3856 expects**，其中四条既有 guards
+  全部保持 green。root release build 约 **59.3 秒**，未跑全量 corpus。
+- W55 fresh-binary triage 更新路线：Node fs inventory 中 FileHandle 6 文件与
+  flush/AbortSignal/WHATWG URL 5 文件均已 **11/11 pass**，确认旧 inventory 不能直接
+  作为当前 owner 来源；Bun CSS `cssInternals` 5 文件 bounded probe 为 **1/5 files
+  green、6/15 tests passed、9 failed、30 expects**，失败分裂为 `_test` 缺失、angle
+  序列化、attribute-selector parser、nested expansion 四个 owner，按 TOO_BIG/多 owner
+  规则停车。未新增构建、未跑全量 corpus。
+- `#41` 修复 `ReadableStream.prototype` 的 `text/json/bytes/arrayBuffer/blob` 对非法
+  receiver 不同步执行 brand check 的问题：现在同步抛出 `ERR_INVALID_THIS`，valid
+  stream 的 Promise、locked、used 语义保持不变。`readablestream-helpers.test.ts`
+  从 **12/30、18 failed** 提升到 **30/30、0 failed、43 expects**；W54 六文件
+  bounded lane 合计 **172/172 tests、0 failed、635 expects**。root release build
+  约 **60.50 秒**，未跑全量 corpus；资源约 **44 GiB available、43 MiB swap free、
+  20 GiB disk free**，继续暂停 broad build。
+- `#40` 修复 `Bun.spawn({ stdout: "pipe" })` 的 custom readable adapter 在
+  `Response(proc.stdout)` 消费后仍允许重复 `text()` 的问题：direct helper、async
+  iterator 和 `pipeTo` 现在共享一次性 consumed 状态，重复消费返回
+  `ReadableStream has already been used`。`process-stdin.test.ts` 从 **13/14** 提升到
+  **14/14、27 expects**；4-file adapter lane 为 **28/46 passed、18 failed、410
+  expects**，其中 10 个 stdout conversion checks 全通过，18 个剩余失败集中在既有
+  `ReadableStream.prototype.*` wrong-this 断言；四条既有 green guards 保持
+  **128/128、0 failed、565 expects**。root release build 约 **60.21 秒**，未跑全量
+  corpus。
+- `#39` 修复 `Bun.spawn({ stdin: Bun.file(...) })` 将 regular-file stdin 错误降级为
+  anonymous pipe 的问题：child `process.stdin.ref` 从 `function` 对齐为 `undefined`，
+  相邻 pipe contract 保持 `function`，真实 file-byte 读取 smoke 通过。focused
+  `process-stdin.test.ts` **12/14→13/14、26 expects**；W52 四文件复测 **126/134
+  passed、8 failed、3015 expects**，比修复前净增 1。首次 root 构建触及 GCC raw payload
+  constexpr 上限，按分区移出后 release build 约 **60.26 秒** 成功；唯一剩余 stdin
+  红测是独立 stdout WebStream disturbed/reject 语义 owner。四条既有 guards 保持
+  **128/128、0 failed、565 expects**，未跑全量 corpus。
+- `#38` 修复 `process.stdin.read(size)` 在返回最后缓冲字节前同步触发 `end` 的
+  时序缺陷：最小 `abcdefgh`/`read(3)` smoke 从 `end` 观察到 `abc,def` 修复为
+  `abc,def,gh`。root release build 约 **60 秒**；目标文件从 **11/14** 提升到
+  **12/14、24 expects**，W48 四文件复测为 **36/45 passed、8 failed、355 expects**。
+  剩余两项属于 `Bun.file()` child stdin ref 形态与 stdout WebStream disturbed
+  语义两个独立 owner；四条既有 green guards 保持 **128/128、0 failed、565 expects**。
+  资源水位触发后停止 workspace-wide 构建，仅保留 root 窄构建和 bounded 验证，未跑
+  全量 corpus。
+- `90d895d` 将 Bun `spawn` 的 `ReadableStream` 与 async iterable stdin 接入已有
+  异步 pipe 路径，补上 child-exit 时 reader `cancel()` / iterator `return()` 收口。
+  fresh Linux build 后，`spawn-stdin-readable-stream` 从 **7/30** 提升到
+  **27/30**，两项 async-iterable 用例通过；相邻 `spawn-streaming-stdout` 保持
+  **1/1、211 expects**。四文件 bounded probe 合计 **34 passed、8 failed、47 ran、
+  288 expects**。剩余 object-count 失败明确是 upstream 50-child burst 的
+  `fork()` 资源边界；同文件在单文件 `34G/1024 tasks` bounded scope 下为
+  **28 pass、2 TODO、0 fail**，确认不是 stdin 源适配回归，而是默认 runner
+  `4G/512` profile 的测量边界。未跑全量 corpus，`spawnSync` 与 broad `spawn.test`
+  继续停车。
+- W48 无构建近绿筛选：Bun `process-stdin` **11/14**、`node-timers` **18/20**、
+  `url-parse-format` **4/6**、`v8-date-parser` **2/5**，四文件合计 **35/45 passed、
+  9 failed、355 expects**；Node `test-vm-context.js` **1/1 file green**，
+  callbackify/util.format/vm-basic 各自卡 stack、inspect constructor label、JSC
+  parser message。红测 ownership 分散，未混修、未新增构建、未跑全量。
+- W49 fresh-binary 回归闸门：`events/event-emitter`、`os/os`、
+  `timers.promises`、`stream/node-stream-uint8array` 四文件均通过，合计
+  **128/128 tests、0 failed、565 expects**；未新增构建、未跑全量。
+- `1449975`（issue #37）为 `bun_corpus_runner.py` 增加显式单 lane resource
+  profile：默认 **4G/512** 不变，非默认 `--memory-max/--tasks-max` 强制
+  `--jobs 1`，并在 summary 记录 profile。真实 stream stdin 文件在
+  `34G/1024` 下为 **28/30 pass、0 fail、2 TODO、61 expects**；self-test 和
+  journal regression 均通过，未构建、未跑全量。
+- `0ddb3f3` 修复 `path.win32.toNamespacedPath` 对裸 namespace root
+  (`\\\\?\\foo`) 丢失 Node 要求的尾斜杠；fresh Linux build 后目标文件
+  **4/4** 全绿。与 `events/event-emitter` **67/67**、`os/os` **52/52**、
+  `timers.promises` **4/4** 组成 4-file bounded 回归，合计 **127/127**、
+  **0 failed**、542 expects；未跑全量 corpus。
+- 复用 fresh binary 复跑此前扩展 path 样本，结果由 **3/4 files、9/10 tests**
+  提升为 **4/4 files、10/10 tests**：`dirname` **3/3**、`is-absolute` **2/2**、
+  `to-namespaced-path` **4/4**、`win32-exists` **1/1**；仅做 bounded no-build
+  确认，不宣称完整 path corpus。
+- `5f36ae9` 修复 `Console#table` 的 Bun 语义：按显示宽度居中 cell，奇数余量放在右侧；
+  原实现误用了 Node CLI table 的左对齐规则。`console-table-iterators` 从 **0/1**
+  提升为 **1/1**；fresh-build 4-file 回归（含 path/events/os）合计 **124/124**、
+  **0 failed**、537 expects。
+- 随后 4-file triage probe（无新构建）将下一批 owner 分开：`url-parse-format`
+  **4/6**（1 failure + 1 TODO，invalid-port 与已绿 Node 合同冲突，停车）、
+  `process-stdin` **11/14**（3 个独立 stdin stream 行为差异）、`v8-date-parser`
+  **2/5**（3 个 JSC date-parser semantics 差异）；该 probe 合计 **17/26 passed**、
+  **8 failed**，不做跨 owner 混修。
+- 首轮 Node guard 暴露了两个真实方言冲突：Node table cell 左对齐、Node bare
+  namespace root 无尾斜杠。`cea1bc4` 复用既有进程级 `__mbunDialect` 做分流；fresh
+  build 后 Bun 4-file guard 仍为 **124/124**，Node `test-path-makelong`、
+  `test-path-resolve` 与 Node custom smoke 均通过。Node `test-console-table` 剩余为
+  独立 Map-iterator Key/Values shape gap，`test-console` 剩余为 `_times` 私有字段 gap，
+  不计为本 patch 回归。
+- Node test-runner 4-file triage：`test-runner-get-test-context` **1/1** green；
+  `test-runner-cli` 卡 fixture discovery/cwd，`test-runner-diagnostics-channel` 卡
+  bindStore/event payload，`test-runner-error-reporter` 卡 reporter failure counts。
+- build-free Bun.Terminal checkpoint：`terminal.test` **94/94**、
+  `terminal-spawn` **16/17**（1 declared skip）、`terminal-platform-gaps` **19/19**、
+  `spawn-path` **1/1**；4 files 合计 **130 passed、1 skip、0 failed、336 expects**，
+  未启动构建或 Bun 全量。
+  实测 **1/4 files green**，三者 ownership 不同，维持 port/graft 路线，未做猜测性 patch。
+
+### W41 Linux 优先推进：planner 修复、8 条候选 lane 实测与 Node 近绿切片
+
+- 全量基线沿用 PR #35 合并树：Node **3134/4433 (70.7%)**、Bun
+  **1015/1902 (53.4%)**；planner 识别 Node **425**、Bun **170** 个 actionable
+  文件。本轮没有重复全量语料。
+- `00b1fcc` 修复 `wave_planner.py --throughput` 把 `PENDING` 计划行当作已交付数据的
+  问题；新增回归 fixture，planner self-test 全绿。资源闸门在可用内存约 45 GiB、
+  磁盘约 27 GiB 时将并发上限裁为 5，构建保持单 owner。
+- 首轮 5 lane 实测：Node crypto **0/24**、VM **0/19**、WebCrypto **0/19**；Bun
+  third-party **0/25**（其余 1280 pass、134 fail assertions）和 CLI/run **0/17**
+  （19 pass、258 fail assertions）。二轮 3 lane 实测：Node test-runner **0/30**、
+  test-util **0/12**、test-v8 **0/11**。主要阻塞分别归因于原生算法/可选依赖、运行时
+  所有权、以及未实现的 snapshot/profile/queryObjects API，已动态降权而非盲目扩展。
+- `561a905` 修复 Node `RegExp` 非法 flags 诊断：保留 JSC 原生调用/构造语义，仅在
+  Node 兼容边界恢复 Node 需要的 flags 回显与 `RegExp.prototype.constructor` 身份。
+  `test-runner-string-to-regexp.js` **0/1 → 1/1**；直接调用、`new` 构造、`instanceof`
+  和 constructor identity smoke 均通过。回归对照：`test-runner-option-validation.js`
+  frozen/new 均 **1/1**；两个 inspect 抽样 frozen/new 均 **0/2**，没有新增失败。
+- 当前 coordinator 又完成 `util.promisify` 的 `customPromisifyArgs` 语义切片：loader
+  将 vendored `internal/util` 的私有 symbol 归一到进程级 identity，bootstrap public
+  `util.promisify` 依据字段名组装多值 callback 结果。direct smoke 输出
+  `{"first":5,"second":17}`；`test-fs-readv-promisify.js` 保持 **1/1**。完整
+  `test-util-promisify.js` 的 custom-args 断言不再出现；随后 bootstrap wrapper
+  保留原函数返回值并补发 `DEP0174`，该文件现为 **1/1 file green**，warning
+  expectations 与 `test-fs-readv-promisify.js` **1/1** 均通过。
+- W41 runner slice 复用 vendored `SnapshotManager`，接通 `t.assert.snapshot()`、
+  `t.assert.fileSnapshot()`、`node:test.snapshot` setter、update-snapshots flag 与
+  exit-time write。`test-runner-snapshot-file-tests.js` **0/1 → 1/1**；
+  `test-runner-snapshot-tests.js` serial 复测为 **33/33 subtests pass**。多文件
+  `--test --test-isolation=none` 从任意临时 cwd 做 update/read round 已达 **6/6**；
+  新增的 loader root discovery 解决了此前 `Snapshot support is unavailable`。
+  TAP reporter 现在输出失败事件的结构化 error message，负向用例也通过；不把五 lane
+  并发时共享 child shim 的一次 `ENOENT` 计为 runtime 回归。`test-runner-assert.js` 的 methods
+  枚举断言已通过，剩余 source-expression stack 缺口另行处理；option-validation 与
+  RegExp 回归仍各 **1/1**。
+- warning 节点后的低风险 `node:util` probe 采用 5 条并行 bounded lane：
+  `test-util-getcallsites.js`、`test-util-getcallsites-preparestacktrace.js`、
+  `test-util-stripvtcontrolcharacters.js`、`test-util-types-exists.js`、
+  `test-util-parse-env.js` 均 exit 0。`test-util-callbackify.js` 仍为单个
+  `processTicksAndRejections` stack-shape 断言失败；`test-util-format.js`、
+  `test-util-types.js`、`test-util-inspect-getters-accessing-this.js` 各有独立
+  语义 blocker，未做推测性修改。`t.assert` source-position 进一步确认走
+  bootstrap `AErr` live path，未验证的 internal-binding bridge 已移除并 parked。
+- `5514993` 补齐 `util.types.isExternal()` 的真实身份边界：internal `JSStream`
+  现在提供 non-enumerable `_externalStream`，由私有 WeakSet 标记，普通对象不会被
+  误判为 External。`test-util-types.js` 已越过原先的 `undefined`/`isExternal` blocker，
+  继续停在 `%PrepareFunctionForOptimization` 的 V8 native-syntax 解析差异，仍不计
+  新增 green；5 个 util/promisify/snapshot 回归 lane 全部 exit 0。
+- `e6e1740` 在显式 `--allow-natives-syntax` 下将两个优化控制 intrinsic
+  （`%PrepareFunctionForOptimization`、`%OptimizeFunctionOnNextCall`）按 JSC 的真实能力
+  作为 no-op 接受，普通进程不改变 eval 路径。`test-util-types.js` 现 exit 0，
+  `test-buffer-swap-fast.js`、`test-timers-fast-calls.js`、`test-os-fast.js` 三条并行
+  回归也 exit 0；URL.canParse 与 process.hrtime 的失败分别保留为独立 blocker。
+- `3427591` 补齐 `process.hrtime(previousTime)` 的 Node 参数合同：显式校验 Array
+  及长度 2，并保留纳秒差值计算。`test-process-hrtime.js` 从缺少 TypeError 的 RED
+  变为 exit 0；新鲜 bounded 回归中的 `test-process-hrtime-bigint.js`、
+  `test-util-types.js`、`test-buffer-swap-fast.js`、`test-runner-snapshot-file-tests.js`
+  也全部 exit 0。没有重复全量语料；`test-whatwg-url-canparse.js` 的 TypeError
+  mismatch 作为下一条独立候选。
+- `800d2a9` 关闭 `URL.canParse()` 单文件 blocker：根因是公共 bootstrap wrapper
+  把所有解析异常都吞成 `false`，零参数所需的 `ERR_MISSING_ARGS` TypeError 因而丢失；
+  不是 internal URL binding 未注册。仅增加参数计数守卫后，fresh build 下
+  `test-whatwg-url-canparse.js` exit 0，绝对 URL 与带 base 的相对 URL smoke 均保持 true；
+  `test-process-hrtime.js`、`test-process-hrtime-bigint.js`、`test-util-types.js`、
+  `test-runner-snapshot-file-tests.js` 四条 bounded 回归也全绿，未跑全量。
+- `test-util-callbackify.js` 的下一候选评估未提交代码：临时复现确认 falsy rejection
+  需要 `process.processTicksAndRejections` stack frame；窄兼容实验可越过该断言，但随后
+  在 callback throw 的通用 uncaught 路径停在 **9 行 vs 7 行**。这是 generic nextTick/
+  uncaught stack boundary，不与 callbackify 混修；实验已回退，当前没有新增 green。
+- `test-util-format.js` 也完成根因评估但不提交代码：`Object.setPrototypeOf(new Foo(), null)`
+  的输出为 `[Object: null prototype] {}` 而非 Node 的 `[Foo: null prototype] {}`；Node
+  依赖 V8 internal `getConstructorName` 在 null prototype 后恢复原 constructor，mbun 的
+  JS-only inspect 无该信息。需要全局 setPrototypeOf tracking 或 engine seam，故不做推测性
+  wrapper；当前没有新增 green。
+- `a93a26d` 关闭已量化的 getter-display blocker：Node inspector 现在在 `showHidden` 下收集
+  用户原型链 accessor，按 `getters` 选项以原 receiver 调用 getter，并恢复循环根对象的
+  `<ref *1>` 标记；默认 Node layout 同时遵守 `breakLength` 折行边界。
+  `test-util-inspect-getters-accessing-this.js` fresh build 后 **0 → exit 0**，覆盖
+  receiver-sensitive getter value、prototype getter label、root circular marker 与
+  multiline layout；`test-util-types.js`、`test-runner-snapshot-file-tests.js`、
+  `test-process-hrtime.js` 四条 bounded regression（含目标文件）并行全 exit 0，未跑全量。
+- W41 Node VM 五文件 probe 中，`test-vm-create-context-arg.js`、`test-vm-is-context.js`、
+  `test-vm-options-validation.js` 首轮即 exit 0；`test-vm-context.js` 的唯一 blocker 是
+  display-errors offset。`f3a7393` 将 `vm.Script` 的 `lineOffset`/`columnOffset` 传入
+  decorated error header 与首个 stack frame，并保持 source excerpt/caret 的原始位置；
+  fresh build 后 `test-vm-context.js` **1 → exit 0**。随后 5 条 bounded lane（含 getter
+  回归）并行全 exit 0。`test-vm-basic.js` 仍只剩 JSC 通用 `Parser error` 与 Node
+  `Unexpected token '}'` 的 parser-message 边界，未做 test-specific rewrite。
+- 相邻 VM property/context probe 未需新构建即再确认 10 个文件全 exit 0：
+  `test-vm-global-get-own.js`、`test-vm-ownkeys.js`、`test-vm-ownpropertynames.js`、
+  `test-vm-ownpropertysymbols.js`、`test-vm-getters.js`，以及
+  `test-vm-cross-context.js`、`test-vm-create-and-run-in-context.js`、
+  `test-vm-run-in-new-context.js`、`test-vm-new-script-new-context.js`、
+  `test-vm-new-script-this-context.js`。同波次观察到的独立 RED 是 global setter
+  wording、global property enumeration/prototype ownership，以及 sandbox self-reference
+  accessor identity；这些属于 global proxy/interceptor 边界，暂不扩大 mirror rewrite。
+  本 checkpoint 共记录 15 个 named VM 文件 exit 0、6 个 distinct RED boundary，仍不替代
+  full-corpus score，未跑全量。
+- `aafba81` 修复 `bun_corpus_runner.py` 在 symlinked `compat/bun` worktree 下的发现路径：
+  保留 lexical corpus path，避免 `relative_to(--root)` 在真实共享语料目录上越界；新增
+  symlink regression，修复前 RED、修复后 runner self-test 全绿。真实 Bun `test/js/node`
+  五文件 bounded probe（4 jobs）重复结果为 **2 green / 3 test-failure**，共
+  **198/206 passed tests、8 failed tests**；`net/blocklist-gc` 与 `tls/node-tls-upgrade`
+  green，crypto 为 **196/202**，readline 为可复现的 pause/resume 时序差异，trace-events
+  为 proxy network error wording。未跑 Bun 全量。
+- Bun 第二波保持 4 个并行 runner、每个 1 job，继续获得一个稳定 green：
+  `events/event-emitter.test.ts` **67/67**。相邻 `console-table-iterators` 为单一 snapshot
+  对齐差异，`url-parse-format` 为 invalid-port diagnostic 差异，`process-stdin` 为
+  **11/14** 且另有一个 stale-HUP stdin timeout；`assert/deep-equal` 分类为
+  **ahead-of-reference**（229/251，22 个 Bun `test.failing` case 在 mbun 通过），不计 runtime
+  green。未跑 Bun 全量。
+- Bun 小型 micro-wave 再获两个稳定 green：`os/os.test.js` **52/52**、
+  `stream/node-stream-uint8array.test.ts` **5/5**。`async_hooks/AsyncLocalStorage` 为
+  **32/45**，失败集中在 async-context propagation、HTTP/HTTP2 cleanup 和 plugin loading；
+  `string_decoder` 为 **93/95**，剩余是大 buffer range 与 output shape。该波次未构建，
+  临时日志很小，无需清理；async-context 与 large-buffer 边界继续独立停车。
+- 标准模块 Bun wave 的四个一文件样本全部 green：`path/dirname` **3/3**、
+  `zlib/deflate-streaming` **1/1**、`dns/dns-lookup-keepalive` **1/1**、
+  `diagnostics_channel` **6/6**（9 tests ran）。扩展样本中 path **3/4 files、9/10 tests**，
+  zlib **2/4 files、9/39 tests**；剩余分别归因于 Windows `toNamespacedPath` 尾斜杠和
+  zlib native handle lifecycle/API gaps。swap 紧张期间未启动新构建，未跑全量。
+- 后续小型 Bun standard-module wave 再获 3 个 green：`timers.promises` **4/4**、
+  `perf_hooks` **8/8**、`promise/reject-tostring` **1/1**。`timers/node-timers` 为
+  **18/20**，剩余是 UTF-16 timer label 与 immediate exception/microtask ordering；
+  未启动新构建，未跑全量。
+- 新一组 Bun native probe 中，`dgram/node-dgram` **3/3** 与
+  `module/module-children-concurrent-gc` **1/1** green；`v8/v8-date-parser` 为
+  **2/5**，失败集中在 JSC date parser semantics；`test_runner/node-test` 为
+  **1/18**，涉及 `t.assert`、hooks/async scheduling、nested test errors 与 mock APIs，
+  作为 multi-owner test-runner boundary 停车。未构建、未跑全量。
+- `163a0a3` 将本地敏感信息过滤规则加入 `hagent/agents.md` 及中文同步页；该受保护面
+  需要维护者签字，不由 agent 自行合并。PR #36 已同步两轮候选实测和本节点策略。
+
+下一步继续按 Node/Bun actionable rows 做单文件评估；callbackify stack-shape、util.format
+constructor-name、test-runner assertion source-position 与 test-v8 profiler/queryObjects
+继续按独立 blocker 管理，不做无证据的跨域扩展。
+
 ## 2026-07-29
 
 ### 推进策略加速：减少全量冻结，切 Node 12-file 长尾吞吐

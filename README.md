@@ -126,6 +126,18 @@ Source-snapshot measurements against the upstream corpora pinned as submodules u
 | Both corpora combined | 4,149 / 6,335 files | 65.5% |
 | Elysia test suite | 1,522 pass / 3 fail | 99.8% |
 
+### Latest PR #36 Linux checkpoint
+
+The full-corpus rows above remain the last frozen whole-corpus measurement. The
+latest incremental checkpoint is deliberately reported separately: W423 ran
+five independent Linux processes against `bun-serve-file.test.ts` and passed
+**9 active conditional-request checks, 0 failed, 0 timed out**. It covers
+`If-None-Match`, custom `ETag`, `If-Modified-Since` precedence over `Range`,
+and the non-GET/HEAD guard. W422 immediately before it passed **13 active
+range checks, 0 failed, 0 timed out**. The two checkpoints changed source and
+were verified against a serial release build; they are not a new full-corpus
+percentage.
+
 File-level "green" means every executed test in the file passed and the file reported no error outside a test; it is stricter than an API checklist and lower than test-level pass rates. Files that declare no runnable test, files whose every test is skipped, and files needing a service this environment lacks (MySQL, Redis, the npm registry) are separate buckets and never count as passes. Node.js files run directly through mbun (exit 0 = pass) without Node's own harness services, so that figure is honest file-level coverage, not API completion.
 
 **How these were measured.** Both rows are one full run over every file on a single frozen binary, at `--jobs 4`. Between full runs, day-to-day work is gated by increments: a change is run against the subset of the corpus it can reach, every file the gate reports as newly passing is re-run **serially** on the same frozen binary, and only files green under that serial re-run are counted. The parallel gate is a screen, never a verdict — the same binary has been measured passing a file idle and failing it under load, and this session produced eight such phantoms in both directions. Each round is gated at zero green-file regressions, verified per file rather than by bucket totals, and on shared surfaces additionally on per-file assertion counts, since a change can leave every file's bucket unchanged while moving assertions underneath it.

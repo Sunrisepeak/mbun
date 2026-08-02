@@ -521,7 +521,7 @@
             opts.kind =
                 esm ? mbun::resolver::ResolveKind::Import : mbun::resolver::ResolveKind::Require;
             opts.tsconfig = find_tsconfig_(fromDir);
-            opts.node_paths = node_paths_from_env();
+            opts.node_paths = node_paths_for_(spec, fromDir);
             opts.preserve_symlinks = preserve_symlinks_();
             mbun::jsc::module_loader::ModuleLoader loader{os_fs(), std::move(opts), /*cjs=*/true};
             loaded = loader.load(rspec, fromDir, effTypeAttr);
@@ -960,9 +960,34 @@
                 ? std::string{"\nif (typeof module === \"object\" && module.exports && globalThis.__mbunFsInternals) {"
                               " module.exports.FileHandle = globalThis.__mbunFsInternals.FileHandle; }\n"}
                 : std::string{}};
+        // The public util implementation is bootstrap-owned, while Node's
+        // customPromisifyArgs symbol is exported by this vendored module. Keep
+        // one identity across the two implementations without modifying the
+        // upstream compatibility source.
+        const std::string internalUtilSuffix{
+            spec == "internal/util"
+                ? std::string{"\nif (typeof module === \"object\" && module.exports && "
+                              "module.exports.customPromisifyArgs !== undefined) { "
+                              "module.exports.customPromisifyArgs = "
+                              "Symbol.for(\"nodejs.util.promisify.customArgs\"); }\n"}
+                : std::string{}};
+        // The public WebCrypto interfaces are installed by mbun's runtime
+        // before node's internal module graph is loaded. Node's vendored
+        // internal/crypto/webcrypto file declares a second set of interface
+        // constructors, which breaks the documented identity checks between
+        // globalThis and the internal export. Keep its helper implementation,
+        // but publish the one runtime-owned constructor/object set.
+        const std::string webcryptoIdentitySuffix{
+            spec == "internal/crypto/webcrypto"
+                ? std::string{"\nif (typeof module === \"object\" && module.exports) { "
+                              "module.exports.Crypto = globalThis.Crypto; "
+                              "module.exports.CryptoKey = globalThis.CryptoKey; "
+                              "module.exports.SubtleCrypto = globalThis.SubtleCrypto; "
+                              "module.exports.crypto = globalThis.crypto; }\n"}
+                : std::string{}};
         std::string wrapper{std::string{tla ? "(async function (" : "(function ("} + params +
                             ") {\n" + strictPrefix + metaPrefix + source + debugEnvSuffix +
-                            fsIdentitySuffix + "\n})"};
+                            fsIdentitySuffix + internalUtilSuffix + webcryptoIdentitySuffix + "\n})"};
         // User CommonJS modules run through the mutable Module.wrapper hook.
         // Keep the extended native wrapper for Node internals (which receive
         // primordials/internalBinding parameters), but honour changed user

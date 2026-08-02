@@ -33,8 +33,11 @@
 export module mbun.glob;
 
 import std;
+import mbun.platform.path;
 
 namespace mbun::glob {
+
+export inline constexpr std::size_t MAX_PATH_BYTES{mbun::platform::path::HOST_POLICY.maxPathLength};
 
 namespace detail {
 
@@ -717,13 +720,15 @@ private:
     std::filesystem::path root_;
     std::vector<std::string>& results_;
     std::unordered_set<std::string>& seen_;
+    std::error_code& error_;
     std::vector<std::filesystem::path> ancestors_;  // canonical dirs on the stack
 
 public:
     Walker(const std::vector<Component>& comps, const ScanOptions& opts,
            std::filesystem::path root, std::vector<std::string>& results,
-           std::unordered_set<std::string>& seen)
-        : comps_{comps}, opts_{opts}, root_{std::move(root)}, results_{results}, seen_{seen} {}
+           std::unordered_set<std::string>& seen, std::error_code& error)
+        : comps_{comps}, opts_{opts}, root_{std::move(root)}, results_{results}, seen_{seen},
+          error_{error} {}
 
     void run() {
         if (comps_.empty()) {
@@ -731,6 +736,14 @@ public:
         }
         std::vector<std::uint32_t> active{normalize_idx_(0)};
         walk_(root_, "", active);
+    }
+
+    void path_too_long_() { error_ = std::make_error_code(std::errc::filename_too_long); }
+
+    [[nodiscard]] auto exceeds_path_limit_(std::string_view rel) const -> bool {
+        const std::string root{root_.generic_string()};
+        const std::size_t separator{(!root.empty() && root.back() == '/') ? 0U : 1U};
+        return root.size() + separator + rel.size() > MAX_PATH_BYTES;
     }
 
 private:
@@ -874,14 +887,24 @@ private:
 
     void walk_(const std::filesystem::path& dirAbs, const std::string& rel,
                const std::vector<std::uint32_t>& active) {
+        if (dirAbs.generic_string().size() > MAX_PATH_BYTES) {
+            path_too_long_();
+            return;
+        }
         std::error_code ec;
         std::filesystem::directory_iterator it{dirAbs, ec};
         if (ec) {
+            if (ec == std::errc::filename_too_long) {
+                path_too_long_();
+            }
             return;  // unreadable dir: skip (bun logs + continues)
         }
         const std::filesystem::directory_iterator end{};
         for (; it != end; it.increment(ec)) {
-            if (ec) {
+            if (ec || error_) {
+                if (ec == std::errc::filename_too_long) {
+                    path_too_long_();
+                }
                 break;
             }
             const std::filesystem::directory_entry& entry{*it};
@@ -891,6 +914,10 @@ private:
             std::error_code sec;
             const std::filesystem::file_status lst{entry.symlink_status(sec)};
             if (sec) {
+                if (sec == std::errc::filename_too_long) {
+                    path_too_long_();
+                    break;
+                }
                 continue;
             }
             const bool isSymlink{std::filesystem::is_symlink(lst)};
@@ -907,6 +934,10 @@ private:
             const std::string childRel{rel.empty() ? name : rel + "/" + name};
 
             if (isDir) {
+                if (exceeds_path_limit_(childRel)) {
+                    path_too_long_();
+                    break;
+                }
                 bool add{false};
                 const std::vector<std::uint32_t> child{eval_dir_(active, name, hidden, add)};
                 if (add && !opts_.onlyFiles) {
@@ -956,8 +987,18 @@ private:
 // the detail::Walker header for supported syntax and documented deviations).
 // Paths use '/' separators and are relative to cwd unless `opts.absolute`.
 export [[nodiscard]] inline auto scan(std::string_view pattern, const ScanOptions& opts = {})
-    -> std::vector<std::string> {
+    -> std::vector<std::string>;
+
+export [[nodiscard]] inline auto scan(std::string_view pattern, const ScanOptions& opts,
+                                     std::error_code* error) -> std::vector<std::string> {
     std::vector<std::string> results;
+    std::error_code ignored;
+    std::error_code& scanError{error != nullptr ? *error : ignored};
+    scanError.clear();
+    if (pattern.size() > MAX_PATH_BYTES) {
+        scanError = std::make_error_code(std::errc::filename_too_long);
+        return results;
+    }
     const std::vector<detail::Component> comps{detail::split_components(pattern)};
     if (comps.empty()) {
         return results;
@@ -971,9 +1012,14 @@ export [[nodiscard]] inline auto scan(std::string_view pattern, const ScanOption
     }
 
     std::unordered_set<std::string> seen;
-    detail::Walker walker{comps, opts, std::move(root), results, seen};
+    detail::Walker walker{comps, opts, std::move(root), results, seen, scanError};
     walker.run();
     return results;
+}
+
+export [[nodiscard]] inline auto scan(std::string_view pattern, const ScanOptions& opts)
+    -> std::vector<std::string> {
+    return scan(pattern, opts, nullptr);
 }
 
 }  // namespace mbun::glob

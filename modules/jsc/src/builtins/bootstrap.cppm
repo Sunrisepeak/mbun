@@ -60,9 +60,11 @@ inline constexpr char kBootstrapJS_[] = R"JS(
   // still rejected; message reports typeof for the simplified template.
   const validatePathObject = (o) => {
     if (o === null || typeof o !== "object") {
-      // node path._format calls validateObject(pathObject, 'pathObject') ->
-      // ERR_INVALID_ARG_TYPE(name, 'Object', value).
-      const e = nodeArgTypeError("pathObject", "Object", o);
+      // Bun's node:path compatibility surface keeps its historical property /
+      // typeof wording, while the Node dialect follows internal/errors.js.
+      const e = G.__mbunDialect === "node"
+        ? nodeArgTypeError("pathObject", "Object", o)
+        : new TypeError('The "pathObject" property must be of type object, got ' + typeof o);
       e.code = "ERR_INVALID_ARG_TYPE";
       throw e;
     }
@@ -535,7 +537,28 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       if (toOrig.charCodeAt(toStart) === 92) ++toStart;
       return toOrig.slice(toStart, toEnd);
     },
-    toNamespacedPath(p) { if (typeof p !== "string" || p.length === 0) return p; const resolvedPath = win32.resolve(p); if (resolvedPath.length <= 2) return p; if (resolvedPath.charCodeAt(0) === 92) { if (resolvedPath.charCodeAt(1) === 92) { const c = resolvedPath.charCodeAt(2); if (c !== 63 && c !== 46) return "\\\\?\\UNC\\" + resolvedPath.slice(2); } } else if (isWinDevRoot(resolvedPath.charCodeAt(0)) && resolvedPath.charCodeAt(1) === 58 && resolvedPath.charCodeAt(2) === 92) { return "\\\\?\\" + resolvedPath; } return resolvedPath; },
+    toNamespacedPath(p) {
+      if (typeof p !== "string" || p.length === 0) return p;
+      const resolvedPath = win32.resolve(p);
+      if (resolvedPath.length <= 2) return p;
+      if (resolvedPath.charCodeAt(0) === 92) {
+        if (resolvedPath.charCodeAt(1) === 92) {
+          const c = resolvedPath.charCodeAt(2);
+          if (c !== 63 && c !== 46) return "\\\\?\\UNC\\" + resolvedPath.slice(2);
+          // Bun treats a bare `\\\\?\\name` namespace root as having a
+          // trailing separator. JSC's win32 resolver preserves the prefix but
+          // drops that separator. Node keeps the resolver's no-separator
+          // result, so this is selected by the process dialect rather than by
+          // the caller or the test name.
+          const tail = resolvedPath.slice(4);
+          if (G.__mbunDialect !== "node" && c === 63 && tail.length > 0 && tail.indexOf("\\") === -1 && tail.indexOf(":") === -1)
+            return resolvedPath + "\\";
+        }
+      } else if (isWinDevRoot(resolvedPath.charCodeAt(0)) && resolvedPath.charCodeAt(1) === 58 && resolvedPath.charCodeAt(2) === 92) {
+        return "\\\\?\\" + resolvedPath;
+      }
+      return resolvedPath;
+    },
   };
   path.toNamespacedPath = (p) => p;
   path._makeLong = path.toNamespacedPath;
@@ -857,6 +880,7 @@ inline constexpr char kBootstrapJS_[] = R"JS(
   // directly (test-util-primordial-monkeypatching replaces Object.keys with a
   // throwing stub). These aliases are captured at image build time.
   const PObjectKeys = Object.keys;
+  const PObjectGetOwnPropertyNames = Object.getOwnPropertyNames;
   const PObjectGetOwnPropertySymbols = Object.getOwnPropertySymbols;
   const PObjectGetOwnPropertyDescriptor = Object.getOwnPropertyDescriptor;
   const PObjectGetPrototypeOf = Object.getPrototypeOf;
@@ -1048,7 +1072,10 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       // Same `special` colour as the class branch above.
       return col(36, 39, base);
     }
-    if (seen.has(v)) return "[Circular *1]";
+    if (seen.has(v)) {
+      if (seen.__mbunRefTarget === undefined) seen.__mbunRefTarget = v;
+      return "[Circular *1]";
+    }
     // nodejs.util.inspect.custom dispatch: an object exposing a callable custom
     // symbol formats itself. Passed (depth, options{stylize,depth}, inspect).
     // ref node lib/internal/util/inspect.js formatValue custom-inspect branch.
@@ -1199,6 +1226,8 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     // line and the closing delimiter its own line too (util.inspect's
     // reduceToSingleString "compact === false" branch).
     const noCompact = opts.compact === false;
+    const breakLength = opts.breakLength === null ? Infinity
+      : (typeof opts.breakLength === "number" ? opts.breakLength : gInspectDefaultsStore.breakLength);
     // mbun rendered EVERY element, so a 1000-element array printed 1000 entries
     // where node and bun both stop at 100 — and inspecting a huge array cost
     // O(n) formatting instead of O(maxArrayLength).
@@ -1206,8 +1235,16 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     const remainingText = inspectRemainingText;
     const nodeBlock = (label, items, open, close) => {
       if (!items.length) return label + open + close;
-      if (noCompact) return label + open + "\n" + items.map((it) => inner + it).join(",\n") + "\n" + outer + close;
-      return label + open + " " + items.join(", ") + " " + close;
+      const oneLine = label + open + " " + items.join(", ") + " " + close;
+      // PORT-SOURCE: compat/node/lib/internal/util/inspect.js
+      // reduceToSingleString — the default compact mode still breaks an object
+      // when its rendered entries exceed breakLength. The previous mbun path
+      // only honored compact:false, keeping deep getter output on one line.
+      // Node reserves a small fixed margin for the surrounding formatter state
+      // before applying its entry-length check; preserve that boundary here so
+      // a 127-character block with the default 128 breakLength is multiline.
+      if (!noCompact && oneLine.length + 10 <= breakLength) return oneLine;
+      return label + open + "\n" + items.map((it) => inner + it).join(",\n") + "\n" + outer + close;
     };
     if (PArrayIsArray(v)) {
       // formatArray: slice first, THEN format — the slice keeps holes (so a
@@ -1297,12 +1334,42 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       const syms = PObjectGetOwnPropertySymbols(v).filter((s) => { const d = PObjectGetOwnPropertyDescriptor(v, s); return d && d.enumerable; });
       // node's formatProperty reads desc.value, not value[key] — one property
       // get per key instead of two, and it is the descriptor's own view.
-      const descVal = (d, key) => (d && (d.get || d.set)) ? (d.get && d.set ? "[Getter/Setter]" : d.get ? "[Getter]" : "[Setter]") : inspectValue(d ? d.value : v[key], opts, seen, depth + 1);
+      const descVal = (d, key, receiver = v) => {
+        if (!d || (!d.get && !d.set)) return inspectValue(d ? d.value : receiver[key], opts, seen, depth + 1);
+        const label = d.get && d.set ? "Getter/Setter" : d.get ? "Getter" : "Setter";
+        const getterMode = opts.getters === true ||
+          (opts.getters === "get" && d.set === undefined) ||
+          (opts.getters === "set" && d.set !== undefined);
+        if (!d.get || !getterMode) return "[" + label + "]";
+        try {
+          const got = d.get.call(receiver);
+          if (got !== null && typeof got === "object") return "[" + label + "] " + inspectValue(got, opts, seen, depth + 1);
+          return "[" + label + ": " + inspectValue(got, opts, seen, depth + 1) + "]";
+        } catch (e) {
+          return "[" + label + ": <Inspection threw (" + inspectValue(e, opts, seen, depth + 1) + ")>]";
+        }
+      };
+      const protoGetters = [];
+      if (opts.showHidden) {
+        const known = new Set(keys);
+        let proto = PObjectGetPrototypeOf(v), layers = 0;
+        while (proto !== null && layers++ < 3) {
+          const pd = PObjectGetOwnPropertyDescriptor(proto, "constructor");
+          if (pd && typeof pd.value === "function" && pd.value.name === "Object") break;
+          for (const key of PObjectGetOwnPropertyNames(proto)) {
+            if (key === "constructor" || known.has(key)) continue;
+            const d = PObjectGetOwnPropertyDescriptor(proto, key);
+            if (d && (d.get || d.set)) { protoGetters.push([key, d]); known.add(key); }
+          }
+          proto = PObjectGetPrototypeOf(proto);
+        }
+      }
       if (bun) {
         const items = keys.map((k) => bunKey(k) + ": " + descVal(PObjectGetOwnPropertyDescriptor(v, k), k));
         // Index loop, not `for (const s of syms)`: for-of over a plain array
         // reads Array.prototype[Symbol.iterator] at call time.
         for (let i = 0; i < syms.length; i++) { const s = syms[i]; items.push("[" + s.toString() + "]: " + descVal(PObjectGetOwnPropertyDescriptor(v, s), s)); }
+        for (const [key, d] of protoGetters) items.push("[" + key + "]: " + descVal(d, key, v));
         result = bunBlock(ctor, items);
       } else {
         // PORT-SOURCE: compat/node/lib/internal/util/inspect.js formatProperty —
@@ -1313,8 +1380,13 @@ inline constexpr char kBootstrapJS_[] = R"JS(
         // label. The bun layout already went through descVal.
         const items = keys.map((k) => { const kk = /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(k) ? k : "'" + k + "'"; return kk + ": " + descVal(PObjectGetOwnPropertyDescriptor(v, k), k); });
         for (let i = 0; i < syms.length; i++) { const s = syms[i]; items.push(s.toString() + ": " + descVal(PObjectGetOwnPropertyDescriptor(v, s), s)); }
+        for (const [key, d] of protoGetters) items.push("[" + key + "]: " + descVal(d, key, v));
         result = nodeBlock(ctor, items, "{", "}");
       }
+    }
+    if (!bun && seen.__mbunRefTarget === v) {
+      result = "<ref *1> " + result;
+      delete seen.__mbunRefTarget;
     }
     seen.delete(v);
     return result;
@@ -1649,7 +1721,28 @@ inline constexpr char kBootstrapJS_[] = R"JS(
         Object.defineProperty(c, kCustom, { value: c, enumerable: false, writable: false, configurable: true });
         return c;
       }
-      const p = function (...a) { return new Promise((res, rej) => { fn.call(this, ...a, (e, v) => (e ? rej(e) : res(v))); }); };
+      // The vendored internal/util module is loaded separately from this
+      // bootstrap-owned public module. Its private symbol is normalized at the
+      // loader boundary to this process-wide key before callers can observe it.
+      const argumentNames = fn[Symbol.for("nodejs.util.promisify.customArgs")];
+      const p = function (...a) {
+        return new Promise((res, rej) => {
+          const result = fn.call(this, ...a, (e, ...values) => {
+            if (e) return rej(e);
+            if (argumentNames !== undefined && values.length > 1) {
+              const obj = {};
+              for (let i = 0; i < argumentNames.length; ++i)
+                obj[argumentNames[i]] = values[i];
+              return res(obj);
+            }
+            return res(values[0]);
+          });
+          if (util.types.isPromise(result)) {
+            process.emitWarning("Calling promisify on a function that returns a Promise is likely a mistake.",
+                                "DeprecationWarning", "DEP0174");
+          }
+        });
+      };
       Object.defineProperty(p, kCustom, { value: p, enumerable: false, writable: false, configurable: true });
       // node promisify() copies `original`'s prototype and own descriptors onto
       // the wrapper, so `name` / `length` and any decoration survive.
@@ -2408,7 +2501,7 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     // Node's NodeError bakes the code into toString(): "TypeError [ERR_x]: msg".
     // assert.throws(fn, /ERR_x/) matches on String(err), so it must appear there.
     const addCodeToName = (e, code) => { const base = e.name; Object.defineProperty(e, "toString", { value() { return `${base} [${code}]${this.message ? ": " + this.message : ""}`; }, configurable: true, writable: true }); return e; };
-    const ERR_INVALID_ARG_TYPE = (name, type, value) => { const e = new TypeError(`The "${name}" argument must be of type ${type}. Received ${value}`); e.code = "ERR_INVALID_ARG_TYPE"; return addCodeToName(e, "ERR_INVALID_ARG_TYPE"); };
+    const ERR_INVALID_ARG_TYPE = (name, type, value) => { const label = name.includes(".") ? "property" : "argument"; const requirement = type === "Error" ? "an instance of Error" : `of type ${type}`; const e = new TypeError(`The "${name}" ${label} must be ${requirement}. Received ${String(value)}`); e.code = "ERR_INVALID_ARG_TYPE"; return addCodeToName(e, "ERR_INVALID_ARG_TYPE"); };
     const ERR_OUT_OF_RANGE = (name, range, value) => { const e = new RangeError(`The "${name}" argument is out of range. It must be ${range}. Received ${value}`); e.code = "ERR_OUT_OF_RANGE"; return addCodeToName(e, "ERR_OUT_OF_RANGE"); };
     const ERR_UNHANDLED_ERROR = (rendered, context) => { const e = new Error(`Unhandled error. (${rendered})`); e.code = "ERR_UNHANDLED_ERROR"; e.context = context; return addCodeToName(e, "ERR_UNHANDLED_ERROR"); };
     const checkListener = (l) => { if (typeof l !== "function") throw ERR_INVALID_ARG_TYPE("listener", "function", l); };
@@ -2445,6 +2538,11 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     EventEmitterPrototype._events = undefined;
     EventEmitterPrototype._eventsCount = 0;
     EventEmitterPrototype._maxListeners = undefined;
+    for (const name of ["_events", "_eventsCount", "_maxListeners"]) {
+      const descriptor = Object.getOwnPropertyDescriptor(EventEmitterPrototype, name);
+      descriptor.enumerable = false;
+      Object.defineProperty(EventEmitterPrototype, name, descriptor);
+    }
     EventEmitterPrototype[kCapture] = false;
     EventEmitterPrototype.constructor = EventEmitter;
 
@@ -2628,7 +2726,7 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     EventEmitterPrototype.eventNames = function eventNames() { return this._eventsCount > 0 ? Reflect.ownKeys(this._events) : []; };
 
     function eventTargetAgnosticRemoveListener(emitter, name, listener, flags) { if (typeof emitter.removeListener === "function") emitter.removeListener(name, listener); else emitter.removeEventListener(name, listener, flags); }
-    function eventTargetAgnosticAddListener(emitter, name, listener, flags) { if (typeof emitter.on === "function") { if (flags?.once) emitter.once(name, listener); else emitter.on(name, listener); } else emitter.addEventListener(name, listener, flags); }
+    function eventTargetAgnosticAddListener(emitter, name, listener, flags) { if (typeof emitter.on === "function") { if (flags?.once) emitter.once(name, listener); else emitter.on(name, listener); } else if (typeof emitter.addEventListener === "function") emitter.addEventListener(name, listener, flags); else throw ERR_INVALID_ARG_TYPE("emitter", "EventEmitter", emitter); }
 
     function addAbortListener(signal, listener) {
       if (signal === undefined) throw ERR_INVALID_ARG_TYPE("signal", "AbortSignal", signal);
@@ -2659,7 +2757,7 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     const AsyncIteratorPrototype = Object.getPrototypeOf(Object.getPrototypeOf(async function* () {}).prototype);
     const createIterResult = (value, done) => ({ value, done });
     function on(emitter, event, options) {
-      options = options ?? {};
+      options = options === undefined ? {} : options;
       validateObject(options, "options");
       const signal = options.signal;
       validateAbortSignal(signal, "options.signal");
@@ -2680,6 +2778,12 @@ inline constexpr char kBootstrapJS_[] = R"JS(
         return() { return closeHandler(); },
         throw(err) { if (!err || !(err instanceof Error)) throw ERR_INVALID_ARG_TYPE("EventEmitter.AsyncIterator", "Error", err); errorHandler(err); },
         [Symbol.asyncIterator]() { return this; },
+        [Symbol.for("nodejs.watermarkData")]: {
+          get size() { return size; },
+          get low() { return lowWatermark; },
+          get high() { return highWatermark; },
+          get isPaused() { return paused; },
+        },
       }, AsyncIteratorPrototype);
       const { addEventListener, removeAll } = listenersController();
       addEventListener(emitter, event, options[kFirstEventParam] ? eventHandler : function (...args) { return eventHandler(args); });
@@ -2892,7 +2996,16 @@ inline constexpr char kBootstrapJS_[] = R"JS(
         return stdin;
       };
     }
-    stdin.ref = () => stdin; stdin.unref = () => stdin;
+    const stdinIsRegularFile = () => {
+      const F = G.__mbunFsNative;
+      try {
+        const stat = F && typeof F.fstat === "function" ? F.fstat(0) : null;
+        return !!(stat && typeof stat.isFile === "function" && stat.isFile());
+      } catch (e) { return false; }
+    };
+    if (!stdinIsRegularFile()) {
+      stdin.ref = () => stdin; stdin.unref = () => stdin;
+    }
     stdin.read = (size) => {
       if (size !== undefined && size !== null) {
         size = Number(size);
@@ -2911,7 +3024,10 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       const buf = G.Buffer.from(all.subarray(0, count));
       rbuf = count < all.length ? [G.Buffer.from(all.subarray(count))] : [];
       syncReadableLength();
-      if (eof && !rbuf.length) emitEnd();
+      // Return the final bytes before publishing `end`. Callers record the
+      // value returned by read() after this function returns; emitting here
+      // would let the end listener observe an incomplete consumer buffer.
+      if (eof && !rbuf.length) G.process.nextTick(emitEnd);
       return stdin._enc ? buf.toString(stdin._enc) : buf;
     };
     stdin.destroy = () => { detach(); ended = true; eof = true; stdin.destroyed = true; stdin.readable = false; stdin.emit("close"); return stdin; };
@@ -3428,7 +3544,14 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     try { Object.defineProperty(G, "__bunResolveObjectURL", { value: __resolveObjectURL, enumerable: false, configurable: true, writable: true }); } catch (e) {}
     G.URL = class URL {
       get [Symbol.toStringTag]() { return "URL"; }
-      static canParse(input, ...rest) { try { new G.URL(input, ...rest); return true; } catch (e) { return false; } }
+      static canParse(input, ...rest) {
+        if (arguments.length < 1) {
+          const e = new TypeError('The "url" argument must be specified');
+          e.code = "ERR_MISSING_ARGS";
+          throw e;
+        }
+        try { new G.URL(input, ...rest); return true; } catch (e) { return false; }
+      }
       static parse(input, ...rest) { try { return new G.URL(input, ...rest); } catch (e) { return null; } }
       static createObjectURL(blob) {
         if (arguments.length < 1) { const e = new TypeError("Not enough arguments"); e.code = "ERR_MISSING_ARGS"; throw e; }
@@ -5911,12 +6034,115 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     // 32793 pins the clock from `bun -e`. The Date patch is installed lazily on
     // the first call so an ordinary run keeps the untouched native Date.
     let sysTime = null;
+    // Run-mode fake timers use the same queue contract as the bun:test runner,
+    // but cannot borrow test_runner.cppm: `bun -e`/`Bun.jest()` does not load the
+    // runner partition. Keep the implementation here real rather than exposing
+    // methods that only make a child process exit successfully.
+    const runModeFT = { on: false, now: 0, dateOffset: 0, seq: 0, queue: [], saved: null };
+    const runModeTimerId = (t) => (t !== null && typeof t === "object") ? t._id : t;
+    const runModeRemove = (id) => {
+      for (let i = 0; i < runModeFT.queue.length; i++) {
+        if (runModeFT.queue[i].id === id) { runModeFT.queue.splice(i, 1); return; }
+      }
+    };
+    const runModeHandle = (rec) => ({
+      _id: rec.id,
+      [Symbol.toPrimitive]() { return rec.id; },
+      ref() { return this; },
+      unref() { return this; },
+      hasRef() { return true; },
+      refresh() { rec.fireAt = runModeFT.now + (rec.interval || rec.delay); return this; },
+      close() { runModeRemove(rec.id); return this; },
+      [Symbol.dispose]() { runModeRemove(rec.id); },
+    });
+    const runModeSchedule = (fn, delay, args, interval) => {
+      let d = Number(delay); if (!isFinite(d) || d < 0) d = 0;
+      const rec = { id: ++runModeFT.seq, fireAt: runModeFT.now + d,
+        fn, args, interval, delay: d };
+      runModeFT.queue.push(rec);
+      return runModeHandle(rec);
+    };
+    const runModeSyncClock = () => { sysTime = runModeFT.dateOffset + runModeFT.now; };
+    const runModeFire = (rec) => {
+      runModeFT.now = rec.fireAt;
+      runModeSyncClock();
+      if (rec.interval > 0) rec.fireAt += rec.interval;
+      else runModeRemove(rec.id);
+      if (typeof rec.fn === "function") rec.fn.apply(undefined, rec.args);
+    };
+    const runModeAdvance = (ms) => {
+      let n = Number(ms); if (!isFinite(n) || n < 0) n = 0;
+      const target = runModeFT.now + (n === 0 ? 1 : n);
+      let guard = 0;
+      for (;;) {
+        let next = null;
+        for (const rec of runModeFT.queue) {
+          if (rec.fireAt <= target && (!next || rec.fireAt < next.fireAt ||
+              (rec.fireAt === next.fireAt && rec.id < next.id))) next = rec;
+        }
+        if (!next || ++guard > 100000) break;
+        runModeFire(next);
+      }
+      if (runModeFT.now < target) { runModeFT.now = target; runModeSyncClock(); }
+    };
+    const runModeInstall = (opts) => {
+      const RD = G.__mbunRunRealDate || G.Date;
+      let base = RD.now();
+      if (opts !== undefined && opts !== null) {
+        if (typeof opts !== "object") throw new TypeError("useFakeTimers() expects an options object");
+        const n = opts.now;
+        if (n !== undefined && n !== null) {
+          if (typeof n === "number") base = n;
+          else if (typeof n === "object" && typeof n.getTime === "function") base = n.getTime();
+          else throw new TypeError("'now' must be a number or Date");
+        }
+      }
+      runModeFT.now = 0; runModeFT.seq = 0; runModeFT.queue = [];
+      runModeFT.dateOffset = Math.floor(base); runModeSyncClock();
+      setSystemTime(runModeFT.dateOffset);
+      if (runModeFT.on) return;
+      runModeFT.on = true;
+      runModeFT.saved = { setTimeout: G.setTimeout, clearTimeout: G.clearTimeout,
+        setInterval: G.setInterval, clearInterval: G.clearInterval };
+      const fakeSetTimeout = function (fn, delay) {
+        return runModeSchedule(fn, delay, Array.prototype.slice.call(arguments, 2), 0);
+      };
+      fakeSetTimeout.clock = true;
+      const fakeSetInterval = function (fn, delay) {
+        let iv = Number(delay); if (!isFinite(iv) || iv <= 0) iv = 1;
+        return runModeSchedule(fn, delay, Array.prototype.slice.call(arguments, 2), iv);
+      };
+      G.setTimeout = fakeSetTimeout;
+      G.setInterval = fakeSetInterval;
+      G.clearTimeout = (t) => { if (t != null) runModeRemove(runModeTimerId(t)); };
+      G.clearInterval = (t) => { if (t != null) runModeRemove(runModeTimerId(t)); };
+    };
+    const runModeUninstall = () => {
+      if (!runModeFT.on) return;
+      runModeFT.on = false;
+      if (runModeFT.saved) {
+        G.setTimeout = runModeFT.saved.setTimeout; G.clearTimeout = runModeFT.saved.clearTimeout;
+        G.setInterval = runModeFT.saved.setInterval; G.clearInterval = runModeFT.saved.clearInterval;
+        runModeFT.saved = null;
+      }
+      runModeFT.queue = [];
+    };
+    const runModeJest = { fn: (i) => i || (() => {}),
+      useFakeTimers: (o) => { runModeInstall(o); return runModeJest; },
+      useRealTimers: () => { runModeUninstall(); setSystemTime(); return runModeJest; },
+      setSystemTime: (v) => { setSystemTime(v); if (runModeFT.on && v !== undefined && v !== null) { runModeFT.dateOffset = sysTime - runModeFT.now; } return runModeJest; },
+      advanceTimersByTime: (ms) => { runModeAdvance(ms); return runModeJest; },
+      runAllTimers: () => { while (runModeFT.queue.length) { const next = runModeFT.queue.reduce((a, b) => !a || b.fireAt < a.fireAt ? b : a, null); if (!next) break; runModeFire(next); } return runModeJest; },
+      clearAllTimers: () => { runModeFT.queue = []; return runModeJest; },
+      getTimerCount: () => runModeFT.queue.length,
+      isFakeTimers: () => runModeFT.on };
     const setSystemTime = (v) => {
       if (v === undefined || v === null) { sysTime = null; return; }
       sysTime = (typeof v === "number") ? v : Number(v.valueOf());
       if (G.__mbunRunDatePatched) return;
       G.__mbunRunDatePatched = true;
       const RD = G.Date;
+      G.__mbunRunRealDate = RD;
       const MbunDate = function Date(...args) {
         if (!new.target) return RD();                       // Date() → string
         const a = (args.length === 0 && sysTime !== null) ? [sysTime] : args;
@@ -5930,7 +6156,7 @@ inline constexpr char kBootstrapJS_[] = R"JS(
     Object.defineProperty(M, "bun:test", { enumerable: true, configurable: true,
       get() { return G.__mbunBT || { test: noop, it: noop, xit: noop.skip, xtest: noop.skip,
         describe: desc, xdescribe: desc, expect: expectStub,
-        jest: { fn: (i) => i || (() => {}), setSystemTime: (v) => { setSystemTime(v); } },
+        jest: runModeJest,
         // `vi` is bun:test's vitest-compat surface and, like `mock`, exists
         // outside the runner — vi.mock IS mock.module, so a run-mode script gets
         // the same validation and the same module override.
@@ -8133,7 +8359,7 @@ inline constexpr char kBootstrapJS_[] = R"JS(
   // an aborted signal rejects with an AbortError carrying signal.reason as
   // `cause`, checked before the first byte and between chunks.
   const fsAbortErr = (signal) => {
-    const e = new Error("The operation was aborted");
+    const e = new Error("The operation was aborted.");
     e.name = "AbortError"; e.code = "ABORT_ERR";
     if (signal && signal.reason !== undefined) e.cause = signal.reason;
     return e;

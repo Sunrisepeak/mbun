@@ -264,8 +264,11 @@ inline constexpr std::string_view kNodeProcessLifecycleJS = R"JS(
     // (runCallChecks ends in `process.exit(1)` from its 'exit' handler). Doing
     // the assignment only on the first pass silently discarded that 1, so a
     // detected mustCall mismatch still left with status 0.
-    if (code !== undefined && code !== null) { try { p.exitCode = code; } catch (e) {} }
-    let final = intOr(p.exitCode, 0);
+    let invalidCode = false;
+    if (code !== undefined && code !== null) {
+      try { p.exitCode = code; } catch (e) { invalidCode = true; }
+    }
+    let final = invalidCode ? 1 : intOr(p.exitCode, 0);
     if (!p._exiting) {
       p._exiting = true;
       try {

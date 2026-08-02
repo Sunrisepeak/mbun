@@ -62,6 +62,55 @@ inline constexpr std::string_view kNodeTimersJS = R"JS(
     const activeTimeouts = new Set();
     const activeImmediates = new Set();
 
+    // Node's internal Timeout links point at a TimersList sentinel. The host
+    // timer object has no such links, but http2's session.socket proxy exposes
+    // the handle through internal/timers and Node tests inspect those links.
+    // Keep the compatibility shape on the stable host handle; scheduling and
+    // lifecycle remain owned by the native timer underneath.
+    const INSPECT = Symbol.for("nodejs.util.inspect.custom");
+    const timerLists = new WeakMap();
+    const inspectIndent = (depth) => {
+      const d = typeof depth === "number" && depth >= 0 ? depth : 2;
+      return "  ".repeat(Math.max(1, 3 - d));
+    };
+    function TimersList() {
+      this._idleNext = null;
+      this._idlePrev = null;
+    }
+    Object.defineProperty(TimersList.prototype, INSPECT, {
+      value: function (depth) {
+        const pad = inspectIndent(depth);
+        const close = pad.slice(0, Math.max(0, pad.length - 2));
+        return "TimersList {\n" + pad + "_idleNext: [Timeout],\n" +
+          pad + "_idlePrev: [Timeout]\n" + close + "}";
+      },
+      configurable: true,
+    });
+    const installTimerShape = (timer) => {
+      let list = timerLists.get(timer);
+      if (!list) { list = new TimersList(); timerLists.set(timer, list); }
+      list._idleNext = timer;
+      list._idlePrev = timer;
+      try {
+        Object.defineProperty(timer, "_idlePrev", { value: list, writable: true, enumerable: true, configurable: true });
+        Object.defineProperty(timer, "_idleNext", { value: list, writable: true, enumerable: true, configurable: true });
+        Object.defineProperty(timer, INSPECT, {
+          value: function (depth) {
+            const pad = inspectIndent(depth);
+            const close = pad.slice(0, Math.max(0, pad.length - 2));
+            return "Timeout {\n" + pad + "_idlePrev: [TimersList],\n" +
+              pad + "_idleNext: [TimersList]\n" + close + "}";
+          },
+          configurable: true,
+        });
+      } catch (_) {}
+    };
+    const removeTimerShape = (timer) => {
+      const list = timerLists.get(timer);
+      if (list) { list._idleNext = null; list._idlePrev = null; }
+      try { timer._idlePrev = null; timer._idleNext = null; } catch (_) {}
+    };
+
     const idOf = (t) => { try { const n = +t; return Number.isSafeInteger(n) ? n : null; } catch (_) { return null; } };
 
     // node lib/internal/timers.js Timeout: `_idleTimeout` is the *enrolled*
@@ -95,7 +144,7 @@ inline constexpr std::string_view kNodeTimersJS = R"JS(
       if (t === null || typeof t !== "object") return t;
       t[KIND] = kind;
       t[STATE] = state;
-      if (kind !== "immediate") setIdle(t, state.ms);
+      if (kind !== "immediate") { setIdle(t, state.ms); installTimerShape(t); }
       // node's Timeout holds its callback on `_onTimeout`, and listOnTimeout
       // DROPS a timer whose `_onTimeout` was nulled instead of running it
       // (lib/internal/timers.js). timers-fixture-unref.js cancels an interval
@@ -128,8 +177,18 @@ inline constexpr std::string_view kNodeTimersJS = R"JS(
       }
       // unref()/ref() must chain (node returns the timer).
       const oUnref = t.unref, oRef = t.ref;
-      if (typeof oUnref === "function") t.unref = function unref() { const r = oUnref.call(state.native); return r === undefined ? t : r; };
-      if (typeof oRef === "function") t.ref = function ref() { const r = oRef.call(state.native); return r === undefined ? t : r; };
+      if (state.refed === undefined) state.refed = !(typeof t.hasRef === "function") || t.hasRef();
+      if (typeof oUnref === "function") t.unref = function unref() {
+        state.refed = false;
+        const r = oUnref.call(state.native);
+        return r === undefined ? t : r;
+      };
+      if (typeof oRef === "function") t.ref = function ref() {
+        state.refed = true;
+        const r = oRef.call(state.native);
+        return r === undefined ? t : r;
+      };
+      t.hasRef = function hasRef() { return state.refed; };
       if (kind === "timeout") {
         // node Timeout.refresh(): re-arms even from inside (or after) the
         // callback. The native refresh cannot re-arm a fired timer, so always
@@ -145,10 +204,13 @@ inline constexpr std::string_view kNodeTimersJS = R"JS(
           try { oClearTimeout(state.native); } catch (_) {}
           state.native = __applySchedule(oSetTimeout, [state.run, state.ms],
                                         state.args || []);
+          if (state.refed) { try { if (state.native && state.native.ref) state.native.ref(); } catch (_) {} }
+          else { try { if (state.native && state.native.unref) state.native.unref(); } catch (_) {} }
           // node Timeout.refresh() re-enrols the handle: _idleStart advances
           // (test-tls-wrap-timeout asserts the later start is strictly greater)
           // and a previously unenrolled timer gets its duration back.
           setIdle(t, state.ms);
+          installTimerShape(t);
           t._destroyed = false;
           const id = idOf(t);
           if (id !== null) registry.set(id, t);
@@ -164,8 +226,19 @@ inline constexpr std::string_view kNodeTimersJS = R"JS(
           t.refresh = function refresh() {
             if (!t._destroyed && t._idleTimeout < 0) return t;
             state.rearmed = true;
-            const r = oRefresh.call(t);
-            return r === undefined ? t : r;
+            state.gen++;
+            try { oClearInterval(state.native); } catch (_) {}
+            try { oClearTimeout(state.native); } catch (_) {}
+            state.native = __applySchedule(oSetInterval, [state.run, state.ms], state.args || []);
+            if (state.refed) { try { if (state.native && state.native.ref) state.native.ref(); } catch (_) {} }
+            else { try { if (state.native && state.native.unref) state.native.unref(); } catch (_) {} }
+            setIdle(t, state.ms);
+            installTimerShape(t);
+            t._destroyed = false;
+            const id = idOf(t);
+            if (id !== null) registry.set(id, t);
+            activeTimeouts.add(t);
+            return t;
           };
         }
       }
@@ -192,6 +265,7 @@ inline constexpr std::string_view kNodeTimersJS = R"JS(
       t._destroyed = true;
       // node unenroll(): a cleared or fired Timeout reports _idleTimeout = -1.
       if (t[KIND] !== "immediate") { try { t._idleTimeout = -1; } catch (_) {} }
+      if (t[KIND] !== "immediate") removeTimerShape(t);
       const id = idOf(t);
       if (id !== null) registry.delete(id);
       activeTimeouts.delete(t);

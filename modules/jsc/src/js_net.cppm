@@ -508,6 +508,7 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
     }
     ref() { const o = this.owner; if (o && typeof o.ref === "function") o.ref(); }
     unref() { const o = this.owner; if (o && typeof o.unref === "function") o.unref(); }
+    hasRef() { const o = this.owner; return !!(o && typeof o.hasRef === "function" && o.hasRef()); }
     readStart() { this.reading = true; return 0; }
     readStop() { this.reading = false; return 0; }
     // node's handle.close() closes the descriptor WITHOUT destroying the
@@ -542,6 +543,7 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
     listen() { return 0; }
     ref() { const o = this.owner; if (o && typeof o.ref === "function") o.ref(); }
     unref() { const o = this.owner; if (o && typeof o.unref === "function") o.unref(); }
+    hasRef() { const o = this.owner; return !!(o && typeof o.hasRef === "function" && o.hasRef()); }
     close(cb) {
       if (!this._closed) { this._closed = true; const o = this.owner; if (o && typeof o.close === "function") o.close(); this.fd = -1; }
       if (typeof cb === "function") G.queueMicrotask(cb);
@@ -602,7 +604,7 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
         // that receives bytes before anything reads used to DROP them.
         this._dataSink = null;
         this._rq = null; this._rqLen = 0; this._rqPaused = false; this._rqEnd = false;
-        this._flowing = null; this._holdForReader = false;
+        this._flowing = null; this._holdForReader = false; this._readablePending = false;
       // node net.Socket({ onread }): the socket reads INTO the caller's buffer
       // and hands that exact object back, so `buf === sockBuf` holds and no
       // per-chunk allocation happens (test-net-onread-static-buffer). `buffer`
@@ -688,6 +690,10 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
       // node's Readable.on('data') resumes the stream unless it was explicitly
       // paused (`if (state.flowing !== false) this.resume()`).
       this.on("newListener", (ev) => {
+        if (ev === "readable") {
+          if (this._rq && this._rq.length) this._scheduleReadable();
+          return;
+        }
         if (ev !== "data") return;
         if (this._flowing !== false) this._flowing = true;
         if (this._rq && this._rq.length) G.queueMicrotask(() => this._flushRq());
@@ -965,6 +971,11 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
       // loopback/wildcard (as reported by an IPv6-defaulted server.address())
       // dials the v4 loopback, which the v4-mapped INADDR_ANY listener accepts.
       const dialHost = (host === "::1" || host === "::" || host === "::0") ? "127.0.0.1" : host;
+      // The transport remains IPv4-backed for this legacy fast path, but an
+      // explicit IPv6 family still has a logical peer address that callers must
+      // observe. Keep the wire path stable while preserving Node's address
+      // family contract for net.Socket and the TLS wrapper above it.
+      const logicalDialHost = host === "localhost" && optArg && optArg.family === 6 ? "::1" : host;
       // node's lookupAndConnect announces EVERY name resolution it performs on
       // 'lookup', and "localhost" is a resolution like any other. It is the one
       // non-literal host kept on the synchronous fast path above (net.inc
@@ -1029,7 +1040,7 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
         }
         if (this.destroyed) { this.connecting = false; return; }
         this.pending = false; this.connecting = false;
-        adoptClientPeer(this, fd, host, isIPv6(host) ? "IPv6" : "IPv4", port, unixPath, dialHost !== host);
+        adoptClientPeer(this, fd, logicalDialHost, isIPv6(logicalDialHost) ? "IPv6" : "IPv4", port, unixPath, dialHost !== logicalDialHost);
         this._flushPreConnect(null); this._applyDeferredSockOpts();
         // Bytes held back by the `connecting` guard in _flush go out now.
         this._flush();
@@ -1196,13 +1207,32 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
     ref() { this._refd = true; NET.hold(this); return this; }
     unref() { this._refd = false; NET.release(this); return this; }
     hasRef() { return this._refd !== false; }
-    // stream.Readable#read: nothing is buffered by this transport (chunks go
-    // straight out as 'data'), except bytes handed back through unshift().
+    // stream.Readable#read: consume the unshift and parked queues in order.
+    // `read(0)` is a probe used by Readable's readable-listener setup and must
+    // never consume the bytes that cause the later 'readable' notification.
     read(n) {
+      if (n === 0) return null;
       const q = this._unshiftQ;
-      if (q && q.length) { this._unshiftQ = null; return q.length === 1 ? q[0] : (G.Buffer ? G.Buffer.concat(q) : q[0]); }
+      if (q && q.length) {
+        const all = q.length === 1 ? q[0] : (G.Buffer ? G.Buffer.concat(q) : q[0]);
+        const take = n === undefined || n === null || n < 0 ? all.length : Math.min(n, all.length);
+        if (take < all.length) {
+          this._unshiftQ = [all.subarray(take)];
+          return all.subarray(0, take);
+        }
+        this._unshiftQ = null;
+        return all;
+      }
       const r = this._rq;
       if (r && r.length) {
+        const all = r.length === 1 ? r[0] : (G.Buffer ? G.Buffer.concat(r) : r[0]);
+        const take = n === undefined || n === null || n < 0 ? all.length : Math.min(n, all.length);
+        if (take < all.length) {
+          this._rq = [all.subarray(take)];
+          this._rqLen = all.length - take;
+          this._readableState.length = this._rqLen;
+          return all.subarray(0, take);
+        }
         this._rq = null; this._rqLen = 0; this._readableState.length = 0;
         this._holdForReader = false;
         if (this._rqPaused) { this._rqPaused = false; this._paused = false; }
@@ -1215,7 +1245,7 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
             this.emit("end");
           });
         }
-        return r.length === 1 ? r[0] : (G.Buffer ? G.Buffer.concat(r) : r[0]);
+        return all;
       }
       return null;
     }
@@ -1420,6 +1450,15 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
       return ((NET.gen - this._rqGen) | 0) <= 1;
     }
     _hasReader() { return !!(this._onread || this._dataSink || this._flowing === true || this.listenerCount("data") > 0); }
+    _scheduleReadable() {
+      if (this._readablePending || !this._rq || !this._rq.length) return;
+      this._readablePending = true;
+      G.queueMicrotask(() => {
+        this._readablePending = false;
+        if (this.destroyed || !this._rq || !this._rq.length || this.listenerCount("readable") === 0) return;
+        this.emit("readable");
+      });
+    }
     _deliver(chunk) {
       if (this._onread) { this._onreadPush(chunk); return; }
       if (this._dataSink) { this._dataSink(chunk); return; }
@@ -1431,6 +1470,7 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
         // Readable stops pulling once the buffer passes the high-water mark;
         // without this an unread socket would buffer the peer without bound.
         if (this._rqLen >= this._hwm && !this._paused) { this._paused = true; this._rqPaused = true; }
+        this._scheduleReadable();
         return;
       }
       this._emitData(chunk);
@@ -1684,7 +1724,11 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
       // `socket.listenerCount('close') === 0` on the detached socket
       // (test-http-connect). It also runs synchronously here, as node's does,
       // rather than a microtask later.
-      if (this._server && this._server._conns) { try { this._server._conns.delete(this); } catch (e) {} }
+      if (this._server && this._server._conns) {
+        try {
+          if (this._server._conns.delete(this)) this._server._connections--;
+        } catch (e) {}
+      }
       // Emission goes through EE.prototype (emitOn, line ~1609) rather than
       // `this.emit`: http2 hands out a Proxy over the session for
       // `session.socket`, and node's proxy THROWS on reading `emit` at all
@@ -1711,7 +1755,13 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
           emitOn("close", !!err);
         };
         if (deferErr && G.process && typeof G.process.nextTick === "function") G.process.nextTick(emitErrClose);
-        else G.queueMicrotask(emitErrClose);
+        else if (!err && this._tls && typeof G.setImmediate === "function") {
+          // Node emits TLS/socket close callbacks after the current check
+          // phase. Two immediates model that boundary: the first lets user
+          // setImmediate callbacks already queued in this turn run, and the
+          // second emits close in the following phase.
+          G.setImmediate(() => G.setImmediate(emitErrClose));
+        } else G.queueMicrotask(emitErrClose);
       }
       return this;
     }
@@ -1987,6 +2037,22 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
           // the engine, so the session it produces has to be picked up here —
           // the EOF branch below can destroy this socket before the next poll.
           if (this._sessionWanted) this._drainSessions();
+          // TLS 1.3 can finish the client's side of the handshake before the
+          // server validates a requested client certificate. A fatal alert may
+          // therefore arrive after `_tls` became established; tlsRead reports
+          // that alert as an empty read/EOF, so probe tlsStep once more to
+          // surface the native ERR_SSL_* instead of silently clean-closing.
+          if ((r === "" || r === null) && this._tls === 2 && NN.tlsStep && NN.tlsError) {
+            let hs = 1;
+            try { hs = NN.tlsStep(this._fd); } catch (e) { hs = -1; }
+            if (hs < 0) {
+              let info = null;
+              try { info = NN.tlsError(this._fd); } catch (e) {}
+              this._fail(mkErr((info && info.message) || "TLS handshake failed",
+                               (info && info.code) || "ERR_TLS_HANDSHAKE"));
+              return 1;
+            }
+          }
           if (r === "") break;
           progress++;
           if (r === null) {
@@ -2066,6 +2132,15 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
         e.code = "ERR_INVALID_ARG_TYPE"; throw e;
       }
       this._opts = opts || {};
+      // Node publishes these compatibility fields in addition to the live Set
+      // and sticky ref state used by mbun's reactor. Keep the public shape
+      // observable without making the reactor depend on the aliases.
+      this._connections = 0;
+      this._unref = false;
+      this._usingWorkers = false;
+      this.highWaterMark = typeof this._opts.highWaterMark === "number"
+        ? this._opts.highWaterMark
+        : (G.process && G.process.platform === "win32" ? 16 * 1024 : HWM);
       // node net.Server publishes both construction options as own properties;
       // tls.Server inherits them through net.Server.call(this, options, …), and
       // test-tls-server-parent-constructor-options reads them directly.
@@ -2197,6 +2272,7 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
       // first byte is read (it may pass the fd elsewhere first).
       if (this._opts.pauseOnConnect) sock.pause();
       this._conns.add(sock);
+      this._connections++;
       this.emit("connection", sock);
       // node onconnection() publishes 'net.server.socket' right after the
       // 'connection' event.
@@ -2399,10 +2475,10 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
       // the Bun.serve ":: default" convention already used above.
       if (host == null) host = "::";
       const isV6 = host.indexOf(":") !== -1;
-      const bindHost = host === "::1" ? "127.0.0.1" : host;  // v6 loopback → v4 bind
+      const bindHost = host === "::1" && !this._ipv6Only ? "127.0.0.1" : host;  // v6 loopback → v4 bind
       if (cb) this.once("listening", cb);
       let lh;
-      try { lh = NN.listen(bindHost, port, !!this._reusePort); }
+      try { lh = NN.listen(bindHost, port, !!this._reusePort, !!this._ipv6Only); }
       catch (e) {
         if (isAccessDenied(e)) throw e;
         const err = listenError(e, host, port);
@@ -2487,6 +2563,7 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
             // when the first byte is read (it may pass the fd elsewhere first).
             if (this._opts.pauseOnConnect) sock.pause();
             this._conns.add(sock);
+            this._connections++;
             this.emit("connection", sock);
             if (netServerSocketChannel.hasSubscribers) netServerSocketChannel.publish({ socket: sock });
           };
@@ -2567,6 +2644,7 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
     }
     ref() {
       this._refd = true;
+      this._unref = false;
       // A round-robin server has no descriptor of its own: the faux handle's
       // ref()/unref() (a keep-alive interval) is what holds the worker's loop.
       if (this._clusterHandle && typeof this._clusterHandle.ref === "function") this._clusterHandle.ref();
@@ -2575,6 +2653,7 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
     }
     unref() {
       this._refd = false;
+      this._unref = true;
       if (this._clusterHandle && typeof this._clusterHandle.unref === "function") this._clusterHandle.unref();
       NET.release(this);
       return this;
@@ -2616,6 +2695,17 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
     if (event === "connection" && sock && typeof sock.destroy === "function") sock.destroy(err);
     else this.emit("error", err);
   };
+
+  // Bun's net.Server surface publishes its public prototype methods as
+  // enumerable assignments. Keep the class implementation while matching
+  // that observable shape for prototype-object assertions.
+  for (const name of ["ref", "unref", "close", "address", "getConnections", "listen"]) {
+    const descriptor = Object.getOwnPropertyDescriptor(Server.prototype, name);
+    if (descriptor && typeof descriptor.value === "function") {
+      descriptor.enumerable = true;
+      Object.defineProperty(Server.prototype, name, descriptor);
+    }
+  }
 
   // ref: bun src/runtime/node/net/BlockList.rs and src/js/node/net.ts. Keep
   // addresses in network-order bytes so subnet checks do not depend on host
@@ -2904,7 +2994,11 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
       return Reflect.construct(Cls, args);
     };
     try {
-      Object.setPrototypeOf(wrapper, Cls);
+      // The exported callable constructor must inherit from the same parent
+      // as the implementation class. Pointing it at Cls made
+      // net.Server.__proto__ equal the private implementation class instead
+      // of EventEmitter, which Node exposes as the constructor parent.
+      Object.setPrototypeOf(wrapper, Object.getPrototypeOf(Cls));
       wrapper.prototype = Cls.prototype;
       Object.defineProperty(wrapper, "name", { value: Cls.name, configurable: true });
       Object.defineProperty(wrapper, "length", { value: Cls.length, configurable: true });
@@ -2912,6 +3006,16 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
     } catch (e) { return Cls; }
     return wrapper;
   };
+  // node's net.Socket is a stream.Duplex. This implementation keeps its
+  // reactor-specific constructor and methods, but must still expose the
+  // standard Duplex prototype for consumers such as http2's unknownProtocol
+  // event (which checks `socket instanceof stream.Duplex`). Keep the custom
+  // methods ahead of Duplex while inheriting the stream brand and fallbacks.
+  const streamModule = M["stream"] || M["node:stream"];
+  const StreamDuplex = streamModule && streamModule.Duplex;
+  if (typeof StreamDuplex === "function" && StreamDuplex.prototype) {
+    try { Object.setPrototypeOf(Socket.prototype, StreamDuplex.prototype); } catch (e) {}
+  }
   const ServerW = callable(Server);
   const SocketW = callable(Socket);
 
@@ -3782,7 +3886,7 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
   G.__mbunHttpParser = HttpParser;
 
   // ---- HTTP response serialization (shared by Bun.serve and node:http) -------
-  const STATUS_TEXT = { 100: "Continue", 101: "Switching Protocols", 200: "OK", 201: "Created", 202: "Accepted", 204: "No Content", 206: "Partial Content", 301: "Moved Permanently", 302: "Found", 303: "See Other", 304: "Not Modified", 307: "Temporary Redirect", 308: "Permanent Redirect", 400: "Bad Request", 401: "Unauthorized", 403: "Forbidden", 404: "Not Found", 405: "Method Not Allowed", 408: "Request Timeout", 409: "Conflict", 413: "Payload Too Large", 418: "I'm a Teapot", 422: "Unprocessable Entity", 429: "Too Many Requests", 500: "Internal Server Error", 501: "Not Implemented", 502: "Bad Gateway", 503: "Service Unavailable" };
+  const STATUS_TEXT = { 100: "Continue", 101: "Switching Protocols", 200: "OK", 201: "Created", 202: "Accepted", 204: "No Content", 206: "Partial Content", 301: "Moved Permanently", 302: "Found", 303: "See Other", 304: "Not Modified", 307: "Temporary Redirect", 308: "Permanent Redirect", 400: "Bad Request", 401: "Unauthorized", 403: "Forbidden", 404: "Not Found", 405: "Method Not Allowed", 408: "Request Timeout", 409: "Conflict", 413: "Payload Too Large", 416: "Range Not Satisfiable", 418: "I'm a Teapot", 422: "Unprocessable Entity", 429: "Too Many Requests", 500: "Internal Server Error", 501: "Not Implemented", 502: "Bad Gateway", 503: "Service Unavailable" };
   const statusText = (code) => STATUS_TEXT[code] || "";
   // The reason phrase actually written to the status line.
   //
@@ -3841,7 +3945,17 @@ export constexpr std::string_view kNetJS_part1 = R"JS(
 
   // Build the response head lines (minus framing) shared by the buffered and
   // streaming paths. framing = { chunked } or { contentLength }.
+  const ensureFileLastModifiedHeader = (res) => {
+    const b = res && res._b;
+    if (!b || !b.__isBunFile || !res.headers || typeof res.headers.has !== "function" || typeof res.headers.set !== "function") return;
+    try {
+      if (res.headers.has("last-modified")) return;
+      const ms = Number(b.__lastModified);
+      if (Number.isFinite(ms) && ms > 0) res.headers.set("last-modified", new Date(ms).toUTCString());
+    } catch (e) {}
+  };
   const responseHeadLines = (res, status, framing, keepAlive) => {
+    ensureFileLastModifiedHeader(res);
     const lines = ["HTTP/1.1 " + status + " " + reasonPhrase(res, status)];
     let haveCT = false, haveDate = false;
     if (res.headers && typeof res.headers.forEach === "function") {

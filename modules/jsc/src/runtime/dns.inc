@@ -1028,8 +1028,9 @@ JSValueRef dnsn_resolve_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size
     if (callback == nullptr) return JSValueMakeUndefined(ctx);
     const int rawType{argc > 1 ? static_cast<int>(JSValueToNumber(ctx, args[1], nullptr)) : 1};
     const auto recordType{static_cast<mbun::dns::RecordType>(rawType)};
-    // args[3..5] (optional): a dns.Resolver's own nameservers ("IP[:PORT]" /
-    // "[IPv6]:PORT" strings), per-query timeout in ms, and try count. Absent for
+    // args[3..6] (optional): a dns.Resolver's own nameservers ("IP[:PORT]" /
+    // "[IPv6]:PORT" strings), per-query timeout in ms, try count, and maximum
+    // retry timeout. Absent for
     // the module-level dns.resolve*, which uses /etc/resolv.conf + the defaults.
     std::vector<DnsServerAddress> servers;
     if (argc > 3 && JSValueIsObject(ctx, args[3])) {
@@ -1052,6 +1053,10 @@ JSValueRef dnsn_resolve_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size
     if (argc > 5 && JSValueIsNumber(ctx, args[5])) {
         const double tries{JSValueToNumber(ctx, args[5], nullptr)};
         if (tries >= 1) queryOptions.attempts = static_cast<std::size_t>(tries);
+    }
+    if (argc > 6 && JSValueIsNumber(ctx, args[6])) {
+        const double maxTimeout{JSValueToNumber(ctx, args[6], nullptr)};
+        if (maxTimeout > 0) queryOptions.maxTimeoutMs = static_cast<std::uint64_t>(maxTimeout);
     }
     gDnsAsyncState->submit_resolve(arg_string(ctx, argc, args, 0), recordType, callback,
                                    std::move(servers), queryOptions);

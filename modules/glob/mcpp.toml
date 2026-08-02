@@ -5,6 +5,9 @@ description = "mbun.glob — glob matcher"
 license     = "MIT"
 standard    = "c++26"
 
+[dependencies]
+platform = { path = "../platform" }
+
 
 
 [targets.bench-glob]

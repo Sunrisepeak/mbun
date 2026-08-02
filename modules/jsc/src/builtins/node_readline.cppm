@@ -535,7 +535,7 @@ var kEmptyObject = ObjectFreeze(ObjectCreate(null));
 var kHistorySize = 30;
 var kMaxUndoRedoStackSize = 2048;
 var kMincrlfDelay = 100;
-var lineEnding = /\r?\n|\r(?!\n)/g;
+var lineEnding = /\r?\n|\r(?!\n)|\u2028|\u2029/g;
 // node lib/internal/readline/utils.js reverseString: split on `from`, emit the
 // parts in reverse order joined by `to`. Round-trips, so ("\n","\r") on the way
 // into the history array and ("\r","\n") on the way back out.

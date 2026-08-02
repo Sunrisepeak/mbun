@@ -5,6 +5,7 @@ import std;
 
 export namespace mbun::jsc::builtins::detail {
 
+// Keep Node timer metadata precise while using integer millisecond queue buckets.
 inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (real: spawnSync/execSync + async spawn/exec/execFile/fork)
   // Async children run over __mbunProcNative.spawnEx (fork/exec with live pipe
   // fds) and are driven by __mbun_io_tick(), which the event-loop pump calls each
@@ -239,6 +240,11 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     if (typeof h.bind === "function" && typeof h.send === "function") return { fd, type: "dgram.Native" };
     return { fd, type: "net.Native" };
   };
+  const isUnlistenedNetServer = (h) => {
+    if (h === null || typeof h !== "object" || typeof h._fd !== "number" || h._fd >= 0) return false;
+    const netmod = M["net"] || M["node:net"];
+    return !!(netmod && typeof netmod.Server === "function" && h instanceof netmod.Server);
+  };
   const ipcRecvHandle = (type, fd) => {
     if (typeof fd !== "number" || fd < 0) return null;
     const netmod = M["net"] || M["node:net"];
@@ -370,12 +376,14 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
       let sendFd = -1;
       if (handle !== undefined && handle !== null) {
         const info = canPassFd() ? ipcHandleInfo(handle) : null;
-        if (info === null) {
+        if (info === null && !isUnlistenedNetServer(handle)) {
           const e = new TypeError("This handle type cannot be sent"); e.code = "ERR_INVALID_HANDLE_TYPE"; throw e;
         }
-        sendFd = info.fd;
-        message = { cmd: "NODE_HANDLE", type: info.type, msg: message };
-        ch.sent.push({ handle, keepOpen: !!(options && options.keepOpen) });
+        if (info !== null) {
+          sendFd = info.fd;
+          message = { cmd: "NODE_HANDLE", type: info.type, msg: message };
+          ch.sent.push({ handle, keepOpen: !!(options && options.keepOpen) });
+        }
       }
       if (!this.connected || ch.closed) {
         const e = new Error("Channel closed"); e.code = "ERR_IPC_CHANNEL_CLOSED";
@@ -1470,10 +1478,9 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
   // follows the target stream's isTTY. ref bun src/js/node/console.ts formatWithOptions.
   // ---- Console#table (https://console.spec.whatwg.org/#table) --------------
   // Blueprint: bun src/js/builtins/ConsoleObject.ts:180-250 (tableChars +
-  // renderRow/table, itself node's lib/internal/cli_table.js) and :645-739 (the
-  // `table` method, itself node lib/internal/cli_table.js). Cells are LEFT-aligned:
-  // node pads each cell on the RIGHT to the column's display width (the leading/
-  // trailing single space come from tableChars.left/middle/right).
+  // renderRow/table) and :645-739 (the `table` method). Bun centers each cell
+  // within its display-width column; Node's cli_table keeps cells left-aligned.
+  // The process dialect selects the native contract without inspecting tests.
   const tableChars = { middleMiddle: "─", rowMiddle: "┼", topRight: "┐", topLeft: "┌", leftMiddle: "├",
                        topMiddle: "┬", bottomRight: "┘", bottomLeft: "└", bottomMiddle: "┴",
                        rightMiddle: "┤", left: "│ ", right: " │", middle: " │ " };
@@ -1483,7 +1490,9 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     let out = tableChars.left;
     for (let i = 0; i < row.length; i++) {
       const cell = row[i];
-      out += cell + " ".repeat(Math.max(0, widths[i] - tableCellWidth(measure[i])));
+      const needed = Math.max(0, (widths[i] - tableCellWidth(measure[i])) / 2);
+      if (G.__mbunDialect === "node") out += cell + " ".repeat(Math.max(0, widths[i] - tableCellWidth(measure[i])));
+      else out += " ".repeat(needed) + cell + " ".repeat(Math.ceil(needed));
       if (i !== row.length - 1) out += tableChars.middle;
     }
     return out + tableChars.right;
@@ -2463,21 +2472,12 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     refresh() { const it = findT(id); if (it) it.at = Date.now() + (it.iv || it.d || 0); return this; },
     close() { G.clearTimeout(id); return this; }, [Symbol.dispose]() { G.clearTimeout(id); } });
   const timerId = (t) => (t && typeof t === "object" ? t._id : t);
-  G.setTimeout = function (fn, delay) { const a = Array.prototype.slice.call(arguments, 2); const id = T.id++; const d = +delay || 0; T.q.push({ id: id, fn: fn, at: Date.now() + d, d: d, a: a, iv: 0, refd: true }); return mkTimer(id); };
-  G.setInterval = function (fn, delay) { const a = Array.prototype.slice.call(arguments, 2); const id = T.id++; const d = +delay || 1; T.q.push({ id: id, fn: fn, at: Date.now() + d, d: d, a: a, iv: d, refd: true }); return mkTimer(id); };
+  // Node timer buckets use integer milliseconds.
+  G.setTimeout = function (fn, delay) { const a = Array.prototype.slice.call(arguments, 2); const id = T.id++; const d = +delay >= 1 ? Math.trunc(+delay) : 1; T.q.push({ id: id, fn: fn, at: Date.now() + d, d: d, a: a, iv: 0, refd: true }); return mkTimer(id); };
+  G.setInterval = function (fn, delay) { const a = Array.prototype.slice.call(arguments, 2); const id = T.id++; const d = +delay >= 1 ? Math.trunc(+delay) : 1; T.q.push({ id: id, fn: fn, at: Date.now() + d, d: d, a: a, iv: d, refd: true }); return mkTimer(id); };
   G.clearTimeout = function (t) { const id = timerId(t); for (let i = 0; i < T.q.length; i++) if (T.q[i].id === id) { T.q.splice(i, 1); return; } };
   G.clearInterval = G.clearTimeout;
-  // `imm` marks an Immediate; `b` stamps the drain batch it was queued in, so a
-  // setImmediate scheduled FROM an immediate callback waits for the next batch
-  // (node: the check phase runs the immediates present when the phase began,
-  // newly queued ones go to the next loop iteration). Without that stamp a
-  // self-reposting .on('message')/postMessage pair re-queued into the batch it
-  // was running in and starved every timer forever
-  // (test-worker-message-port-infinite-message-loop), and a chained setImmediate
-  // walked all its links inside ONE drain call, so the microtask checkpoint the
-  // pump performs between calls never landed in the middle of the chain
-  // (test-worker-message-port-transfer-self: a port closed from a message
-  // handler stayed "active" for all 10 ticks of common/tick.js).
+  // `b` keeps Immediates queued from a callback in the next drain batch.
   G.setImmediate = function (fn) { const a = Array.prototype.slice.call(arguments, 1); const id = T.id++; T.q.push({ id: id, fn: fn, at: 0, d: 0, a: a, iv: 0, refd: true, imm: true, b: T.batch }); return mkTimer(id); };
   G.clearImmediate = G.clearTimeout;
   // Fire up to `budget` DUE timers (earliest deadline first); returns the count
@@ -3465,6 +3465,17 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
       const s = spawnArgs(a, b);
       validateSignalOpt(s.opts.signal);
       if (s.opts.terminal && PN && PN.spawnPty && PN.openPty) return spawnTerminal(s.cmd, s.opts);
+      const stdinStream = s.opts.stdin != null && G.__mbunStreams &&
+        typeof G.__mbunStreams.isReadableStream === "function" &&
+        G.__mbunStreams.isReadableStream(s.opts.stdin);
+      const stdinAsyncIterable = s.opts.stdin != null && typeof Symbol !== "undefined" &&
+        Symbol.asyncIterator && typeof s.opts.stdin[Symbol.asyncIterator] === "function";
+      if (PN && PN.spawnEx && (stdinStream || stdinAsyncIterable)) {
+        if (stdinStream) validateBunReadableStdin(s.opts.stdin);
+        const proc = spawnAsyncBun(s.cmd, { ...s.opts, stdin: "pipe" });
+        pumpBunReadableStdin(proc, s.opts.stdin, stdinStream);
+        return proc;
+      }
       // A byte stdin payload must use the live pipe path. The synchronous
       // fallback only forwards string input, so Bun.spawn({ stdin: Buffer })
       // used to close the child's fd 0 without writing the bytes first.

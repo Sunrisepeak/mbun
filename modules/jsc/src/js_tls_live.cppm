@@ -35,6 +35,24 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
   const NN = G.__mbunNetNative;                 // tlsInfo(fd): negotiated params + peer cert
   const asym = G.__mbunCryptoAsymNative;        // x509parse: X509 field bridge (crypto_asym.inc)
 
+  // A server-side client-certificate chain rejection is reported by node's
+  // `tlsClientError` as a peer reset. Protocol failures retain their ERR_*
+  // codes, and client-side certificate failures retain their X509 code.
+  const isClientCertificateVerifyError = (code) => typeof code === "string" && [
+    "UNABLE_TO_GET_ISSUER_CERT", "UNABLE_TO_GET_CRL",
+    "UNABLE_TO_DECRYPT_CERT_SIGNATURE", "UNABLE_TO_DECRYPT_CRL_SIGNATURE",
+    "UNABLE_TO_DECODE_ISSUER_PUBLIC_KEY", "CERT_SIGNATURE_FAILURE",
+    "CERT_NOT_YET_VALID", "CERT_HAS_EXPIRED", "CRL_NOT_YET_VALID",
+    "CRL_HAS_EXPIRED", "ERROR_IN_CERT_NOT_BEFORE_FIELD",
+    "ERROR_IN_CERT_NOT_AFTER_FIELD", "ERROR_IN_CRL_LAST_UPDATE_FIELD",
+    "ERROR_IN_CRL_NEXT_UPDATE_FIELD", "OUT_OF_MEM",
+    "DEPTH_ZERO_SELF_SIGNED_CERT", "SELF_SIGNED_CERT_IN_CHAIN",
+    "UNABLE_TO_GET_ISSUER_CERT_LOCALLY", "UNABLE_TO_VERIFY_LEAF_SIGNATURE",
+    "CERT_CHAIN_TOO_LONG", "CERT_REVOKED", "INVALID_CA",
+    "PATH_LENGTH_EXCEEDED", "INVALID_PURPOSE", "CERT_UNTRUSTED",
+    "CERT_REJECTED"
+  ].includes(code);
+
   // ---- peer certificate: native PEM → node getPeerCertificate() object shape --
   // x509parse returns subject/issuer as newline-joined "SN=value" DN strings
   // (crypto_asym.inc asym_x509_name); node lib/_tls_common.js / bun tls.ts expose
@@ -408,7 +426,9 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
       this.authorized = false;
       this.authorizationError = null;
       this.alpnProtocol = null;
-      this.servername = options.servername || undefined;
+      // Node exposes false on a server-side TLSSocket when the ClientHello
+      // carries no SNI; an unset client-side option remains undefined.
+      this.servername = options.isServer ? false : (options.servername || undefined);
       this._secureEstablished = false;
       this._securePending = true;
       this.secureConnecting = !options.isServer;
@@ -524,7 +544,14 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
       // point JS can observe: nothing cached before the first event (so
       // getSession() is still the live handshake session, the TLS 1.3 dummy
       // included), then the session that event carried.
-      transport.on("session", (session) => { self._lastSession = session; self.emit("session", session); });
+      transport.on("session", (session) => {
+        // Node emits `session` only for a newly established session. OpenSSL
+        // may issue a post-handshake ticket after a resumed connection too,
+        // but forwarding that ticket makes every resumed socket look new.
+        if (self._sessionReused) return;
+        self._lastSession = session;
+        self.emit("session", session);
+      });
       if (self._sessionWanted) transport._sessionWanted = true;
       // node's TLSSocket is a net.Socket over a real connection, so it emits
       // 'connect' when the TCP leg lands (before the handshake) and 'ready'
@@ -1129,7 +1156,7 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
     // The plaintext edge delegates every read/write to the transport, so the
     // caller's highWaterMark has to reach the transport too — the TLSSocket
     // aliases readableHighWaterMark/writableHighWaterMark onto it.
-    const transport = new NetSocket({ allowHalfOpen: false, highWaterMark: opts.highWaterMark });
+    const transport = new NetSocket({ allowHalfOpen: !!opts.allowHalfOpen, highWaterMark: opts.highWaterMark });
     const tlsOptsHwm = Object.assign({ highWaterMark: opts.highWaterMark }, tlsOpts);
     const tlsSock = new TLSSocket(transport, tlsOptsHwm);
     // node stores the resolved connect options on the socket (kConnectOptions);
@@ -1321,6 +1348,10 @@ export constexpr std::string_view kTlsLiveJS = R"JS(
         if (!tlsSock._secureEstablished) {
           if (tlsSock._errorEmitted) return;
           tlsSock._errorEmitted = true;
+          if (tlsSock._isServer && e && isClientCertificateVerifyError(e.code)) {
+            e = new Error("socket hang up");
+            e.code = "ECONNRESET";
+          }
           // node reports a peer that vanished mid-handshake through
           // onSocketClose, i.e. as ConnResetException('socket hang up') — never
           // as the raw transport's "read ECONNRESET" (test-tls-econnreset

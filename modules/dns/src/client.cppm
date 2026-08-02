@@ -21,6 +21,7 @@ export struct WireDatagram {
 export struct RecordQueryOptions {
     std::uint64_t timeoutMs{2'000};
     std::size_t attempts{2};
+    std::uint64_t maxTimeoutMs{0};
 };
 
 namespace client_detail {
@@ -50,8 +51,20 @@ WireParseResult query_record(std::string_view name, RecordType type, std::size_t
             const std::uint16_t id{transport.random_id()};
             auto query{make_wire_query(name, type, id)};
             if (!query) return std::unexpected(query.error());
+            std::uint64_t attemptTimeout{options.timeoutMs};
+            for (std::size_t backoff{0}; backoff < attempt; ++backoff) {
+                constexpr auto max{std::numeric_limits<std::uint64_t>::max()};
+                if (attemptTimeout > max / 2) {
+                    attemptTimeout = max;
+                    break;
+                }
+                attemptTimeout *= 2;
+            }
+            if (options.maxTimeoutMs != 0) {
+                attemptTimeout = std::min(attemptTimeout, options.maxTimeoutMs);
+            }
             const std::uint64_t deadline{
-                client_detail::deadline_after(transport.now_ms(), options.timeoutMs)};
+                client_detail::deadline_after(transport.now_ms(), attemptTimeout)};
             if (!transport.send_udp(server, *query, deadline)) continue;
 
             while (transport.now_ms() < deadline) {

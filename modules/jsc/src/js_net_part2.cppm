@@ -44,8 +44,88 @@ export constexpr std::string_view kNetJS_part2 = R"JS(
   // Serialize a Response onto a socket. `type: "direct"` ReadableStream bodies
   // stream chunked (writeDirectStreamResponse); other streams are drained first
   // and sent with Content-Length.
+  const applyFileConditionalResponse = (req, res) => {
+    if (!req || !res || typeof res !== "object" || res.status !== 200) return res;
+    const method = String(req.method || "").toUpperCase();
+    if (method !== "GET" && method !== "HEAD") return res;
+    const b = res._b;
+    if (!b || !b.__isBunFile || !res.headers || typeof res.headers.get !== "function") return res;
+    ensureFileLastModifiedHeader(res);
+    const getRequestHeader = (name) => req.headers && typeof req.headers.get === "function"
+      ? req.headers.get(name) : null;
+    const inm = getRequestHeader("if-none-match");
+    if (inm !== null) {
+      const etag = res.headers.get("etag");
+      const weakTag = (tag) => String(tag).trim().replace(/^W\//i, "");
+      const matches = String(inm).trim() === "*" ||
+        (etag && String(inm).split(",").some((tag) => weakTag(tag) === weakTag(etag)));
+      if (matches) {
+        const headers = new G.Headers(res.headers);
+        headers.delete("content-length");
+        headers.delete("content-range");
+        return new G.Response(null, { status: 304, statusText: "Not Modified", headers });
+      }
+      // If-None-Match is present, a non-matching value suppresses the
+      // If-Modified-Since check (RFC 9110 §13.2.2).
+      return res;
+    }
+    const ims = getRequestHeader("if-modified-since");
+    if (ims === null || ims === "") return res;
+    const requestMs = Date.parse(String(ims));
+    const modifiedMs = Date.parse(String(res.headers.get("last-modified") || ""));
+    if (!Number.isFinite(requestMs) || !Number.isFinite(modifiedMs) || requestMs < modifiedMs) return res;
+    const headers = new G.Headers(res.headers);
+    headers.delete("content-length");
+    headers.delete("content-range");
+    return new G.Response(null, { status: 304, statusText: "Not Modified", headers });
+  };
+  const applyFileRangeResponse = (req, res) => {
+    if (!req || !res || typeof res !== "object" || res.status !== 200) return res;
+    const method = String(req.method || "").toUpperCase();
+    if (method !== "GET" && method !== "HEAD") return res;
+    const b = res._b;
+    if (!b || !b.__isBunFile || !res.headers || typeof res.headers.get !== "function") return res;
+    ensureFileLastModifiedHeader(res);
+    const range = req.headers && typeof req.headers.get === "function" ? req.headers.get("range") : null;
+    if (!range || res.headers.has("content-range") || String(range).indexOf(",") !== -1) return res;
+    const m = /^bytes\s*=\s*(\d*)\s*-\s*(\d*)\s*$/i.exec(String(range));
+    if (!m || (m[1] === "" && m[2] === "")) return res;
+    const size = Number(b.size);
+    if (!Number.isSafeInteger(size) || size < 0) return res;
+    let start = 0;
+    let end = size - 1;
+    if (m[1] === "") {
+      const suffix = Number(m[2]);
+      if (!Number.isSafeInteger(suffix) || suffix <= 0) return res;
+      start = Math.max(size - suffix, 0);
+    } else {
+      start = Number(m[1]);
+      if (!Number.isSafeInteger(start) || start < 0) return res;
+      if (m[2] !== "") {
+        end = Number(m[2]);
+        if (!Number.isSafeInteger(end) || end < 0) return res;
+      }
+      end = Math.min(end, size - 1);
+    }
+    const headers = new G.Headers(res.headers);
+    headers.set("accept-ranges", "bytes");
+    if (start >= size || end < start || size === 0) {
+      headers.delete("content-length");
+      headers.set("content-range", "bytes */" + size);
+      return new G.Response(null, { status: 416, statusText: "Range Not Satisfiable", headers });
+    }
+    try {
+      const body = b.slice(start, end + 1);
+      headers.set("content-range", "bytes " + start + "-" + end + "/" + size);
+      headers.set("content-length", String(end - start + 1));
+      return new G.Response(body, { status: 206, statusText: "Partial Content", headers });
+    } catch (e) {
+      return res;
+    }
+  };
   function writeHttpResponse(sock, res, reqMethod, keepAlive, onFinished) {
     if (!res || typeof res !== "object") res = new G.Response("", { status: 500 });
+    ensureFileLastModifiedHeader(res);
     const status = res.status || 200;
     // RFC 9112 §9.6: a server that sends "Connection: close" MUST close the
     // connection after that response. `Connection` is hop-by-hop, so the header
@@ -176,6 +256,25 @@ export constexpr std::string_view kNetJS_part2 = R"JS(
   ].join("\n");
 
   const isResponseLike = (v) => v instanceof G.Response;
+  // Bun.serve accepts a BunFile/Blob directly as a static route value. Keep the
+  // transport boundary uniform by materializing that body as a Response once
+  // during route compilation; dispatch can then use the same clone/framing
+  // path as an explicitly constructed Response.
+  const isStaticBody = (v) => isResponseLike(v) || (typeof G.Blob === "function" && v instanceof G.Blob);
+  const asStaticResponse = (v) => isResponseLike(v) ? v : new G.Response(v);
+  // A missing BunFile is a route miss, not an empty successful response. Keep
+  // function routes untouched: only a static response selected by compilation
+  // can fall through to the server's fetch handler this way.
+  const isMissingStaticResponse = (v) => {
+    const b = v && v._b;
+    if (!b || !b.__isBunFile) return false;
+    if (b.__mbunIoErr) return true;
+    const p = b.__mbunPath;
+    if (!p) return false; // fd/FIFO-backed handles are not path-missing routes.
+    try { (M["fs"] || M["node:fs"]).statSync(p); return false; }
+    catch (e) { return true; }
+  };
+  const usableRouteMatch = (m) => m && (typeof m.handler === "function" || !isMissingStaticResponse(m.handler)) ? m : null;
   const hexVal = (c) => (c >= 48 && c <= 57) ? c - 48 : (c >= 97 && c <= 102) ? c - 87 : (c >= 65 && c <= 70) ? c - 55 : -1;
   // Decode a raw (latin1) path segment: percent-decode, then lossy UTF-8 decode.
   const decodeParam = (seg) => {
@@ -251,12 +350,14 @@ export constexpr std::string_view kNetJS_part2 = R"JS(
       if (value === false) continue;                   // `false` skips the route (falls through to fetch)
       if (value === null || value === undefined) continue;
       let handlers;
-      if (typeof value === "function" || isResponseLike(value)) handlers = { ANY: value };
+      if (typeof value === "function") handlers = { ANY: value };
+      else if (isStaticBody(value)) handlers = { ANY: asStaticResponse(value) };
       else if (typeof value === "object") {
         handlers = {}; let any = false;
         for (const mk of Object.keys(value)) {
           const mv = value[mk];
-          if (typeof mv === "function" || isResponseLike(mv)) { handlers[String(mk).toUpperCase()] = mv; any = true; }
+          if (typeof mv === "function") { handlers[String(mk).toUpperCase()] = mv; any = true; }
+          else if (isStaticBody(mv)) { handlers[String(mk).toUpperCase()] = asStaticResponse(mv); any = true; }
           else throw new Error(ROUTES_RECORD_ERR);
         }
         if (!any) throw new Error(ROUTES_RECORD_ERR);
@@ -600,12 +701,13 @@ export constexpr std::string_view kNetJS_part2 = R"JS(
       for (let i = 0; i + 1 < hdrs.length; i += 2) req.headers.append(hdrs[i], hdrs[i + 1]);
       serverObj.pendingRequests++;
       const matched = handlerRef.routes ? handlerRef.routes.match(tgt.path, ev.method) : null;
-      req.params = matched ? matched.params : {};
+      const route = usableRouteMatch(matched);
+      req.params = route ? route.params : {};
       let out;
       if (tooLarge) {
         out = new G.Response(null, { status: 413 });
-      } else if (matched) {
-        const h = matched.handler;
+      } else if (route) {
+        const h = route.handler;
         if (typeof h === "function") { try { out = h.call(serverObj, req, serverObj); } catch (e) { out = handleError(e); } }
         else out = (h && typeof h.clone === "function") ? h.clone() : h;   // static Response (clone per request)
       } else if (typeof handlerRef.fetch === "function") {
@@ -625,7 +727,9 @@ export constexpr std::string_view kNetJS_part2 = R"JS(
             for (const c of _cd.value.toSetCookieHeaders()) res.headers.append("Set-Cookie", c);
           }
         } catch (e) {}
-        writeHttpResponse(sock, res, ev.method, keepAlive && !sock.destroyed, () => {
+        const conditional = applyFileConditionalResponse(req, res);
+        const ranged = applyFileRangeResponse(req, conditional);
+        writeHttpResponse(sock, ranged, ev.method, keepAlive && !sock.destroyed, () => {
           serverObj.pendingRequests--;
           conns.delete(ev.id);
           // Responded before the body finished: the native side closes the
@@ -896,10 +1000,11 @@ export constexpr std::string_view kNetJS_part2 = R"JS(
             serverObj.pendingRequests++;
             sock._httpBusy = true;
             const matched = handlerRef.routes ? handlerRef.routes.match(tgt.path, parser.method) : null;
-            req.params = matched ? matched.params : {};
+            const route = usableRouteMatch(matched);
+            req.params = route ? route.params : {};
             let out;
-            if (matched) {
-              const h = matched.handler;
+            if (route) {
+              const h = route.handler;
               if (typeof h === "function") { try { out = h.call(serverObj, req, serverObj); } catch (e) { out = handleError(e); } }
               else out = (h && typeof h.clone === "function") ? h.clone() : h;   // static Response (clone per request)
             } else if (typeof handlerRef.fetch === "function") {
@@ -909,7 +1014,9 @@ export constexpr std::string_view kNetJS_part2 = R"JS(
               out = new G.Response("", { status: 404 });   // routes-only server, no match
             }
             const finish = (res) => {
-              writeHttpResponse(sock, res, parser.method, keepAlive && !sock.destroyed, () => {
+              const conditional = applyFileConditionalResponse(req, res);
+              const ranged = applyFileRangeResponse(req, conditional);
+              writeHttpResponse(sock, ranged, parser.method, keepAlive && !sock.destroyed, () => {
                 serverObj.pendingRequests--;
                 sock._httpBusy = false;
                 if (keepAlive && !sock.destroyed) { startParser(); pump(); }
@@ -2558,7 +2665,15 @@ export constexpr std::string_view kNetJS_part2 = R"JS(
         }
         headResolved = true;
         const h = new G.Headers();
-        for (let i = 0; i < parser.rawHeaders.length; i += 2) h.append(parser.rawHeaders[i], parser.rawHeaders[i + 1]);
+        // Fetch exposes representation headers, not the HTTP/1.1 connection
+        // management header. Keep `Connection: Upgrade` on a 101 response for
+        // the WebSocket/upgrade hand-off; ordinary responses must not leak the
+        // hop-by-hop field into Response.headers (bun-serve-file snapshots).
+        const preserveConnectionHeader = parser.status === 101;
+        for (let i = 0; i < parser.rawHeaders.length; i += 2) {
+          if (!preserveConnectionHeader && String(parser.rawHeaders[i]).toLowerCase() === "connection") continue;
+          h.append(parser.rawHeaders[i], parser.rawHeaders[i + 1]);
+        }
         // bun strips content-encoding/content-length after decoding the body.
         const ceHdr = String(parser.headers["content-encoding"] || "").trim().toLowerCase();
         if (ceHdr && ceHdr !== "identity" && (!init || init.decompress !== false)) { h.delete("content-encoding"); h.delete("content-length"); }

@@ -98,16 +98,18 @@ inline constexpr std::string_view kNodeBufferExtraJS = R"JS(
       e.code = "ERR_UNKNOWN_ENCODING";
       return e;
     };
+    const typedArrayLengthGetter = Object.getOwnPropertyDescriptor(
+      Object.getPrototypeOf(Uint8Array.prototype), "length").get;
+    const typedArrayLength = (value) => typedArrayLengthGetter.call(value);
     // WTF::String::MaxLength (== INT32_MAX). Decoding a buffer whose output
     // would exceed it must throw ERR_STRING_TOO_LONG *before* any allocation
     // (jsc/bindings/JSBuffer.cpp:jsBufferToStringFromBytes); otherwise a 2 GiB
     // buffer drags the process into an OOM instead of a catchable error.
-    // node lib/buffer.js: kStringMaxLength (V8 String::kMaxLength on 64-bit) is
-    // strictly below kMaxLength, so a Buffer larger than a string is allocatable
-    // yet un-stringifiable (ERR_STRING_TOO_LONG). Our engine's real string max is
-    // INT32_MAX, but exposing the node value keeps toString's cap below the
-    // buffer cap so test-buffer-tostring-rangeerror can allocate-then-fail.
-    const MAX_STRING_LENGTH = 536870888;
+    // Bun's 64-bit node:buffer surface keeps the engine's INT32_MAX string cap
+    // and permits a full uint32 buffer. Node's wrapper retains its published
+    // V8-compatible string cap and the existing compatibility buffer value.
+    const bunDialect = G.__mbunDialect !== "node";
+    const MAX_STRING_LENGTH = bunDialect ? 0x7fffffff : 536870888;
     const errStringTooLong = () => {
       const e = new Error("Cannot create a string longer than " + MAX_STRING_LENGTH + " characters");
       e.code = "ERR_STRING_TOO_LONG";
@@ -115,7 +117,7 @@ inline constexpr std::string_view kNodeBufferExtraJS = R"JS(
     };
     // node's assertSize (lib/buffer.js): non-number -> ERR_INVALID_ARG_TYPE;
     // negative / NaN / Infinity / > kMaxLength -> ERR_OUT_OF_RANGE.
-    const K_MAX_LENGTH = 0x7fffffff;
+    const K_MAX_LENGTH = bunDialect ? 0x100000000 : 0x7fffffff;
     const assertSize = (size) => {
       if (typeof size !== "number") throw errArgType("size", "number", size);
       if (!(size >= 0 && size <= K_MAX_LENGTH))
@@ -600,6 +602,7 @@ inline constexpr std::string_view kNodeBufferExtraJS = R"JS(
       // write extent. The real write range is re-clamped against a single
       // post-coercion length read right before the fill (TOCTOU guard).
       const limit = buf.length;
+      if (limit !== typedArrayLength(buf)) throw errBufferOOB();
 
       // Node only reinterprets a string offset/end as the encoding when the
       // fill value is itself a string; the offset-slot branch also drops end.
@@ -614,15 +617,15 @@ inline constexpr std::string_view kNodeBufferExtraJS = R"JS(
         }
       }
 
-      // 1. Encoding parse FIRST (string value only). Coercing an object
-      // encoding runs its toString — the first user-JS-visible call, which
-      // may detach/resize buf; the post-coercion clamp below catches that.
+      // 1. Encoding parse FIRST (string value only). Node rejects non-string
+      // encoding values rather than coercing them; the post-coercion clamp
+      // below still catches user-visible effects from the fill value itself.
       let normalized = "utf8";
       if (typeof value === "string") {
         let encStr;
         if (encoding === undefined || encoding === null) encStr = undefined;
         else if (typeof encoding === "string") encStr = encoding.length ? encoding : undefined;
-        else encStr = String(encoding);
+        else throw errArgType("encoding", "string", encoding);
         if (encStr !== undefined) {
           normalized = normalizeEncoding(encStr);
           if (normalized === undefined) throw errUnknownEncoding(encStr);
@@ -649,6 +652,17 @@ inline constexpr std::string_view kNodeBufferExtraJS = R"JS(
       // 4. Value coercion per branch (may detach/resize via valueOf/toString).
       let pattern;
       if (typeof value === "string") {
+        if (normalized === "hex") {
+          const invalidHex = () => {
+            const err = new TypeError("The argument 'value' is invalid");
+            err.code = "ERR_INVALID_ARG_VALUE";
+            return err;
+          };
+          if ((value.length & 1) !== 0) throw invalidHex();
+          for (let i = 0; i < value.length; i++) {
+            if (hexVal(value.charCodeAt(i)) < 0) throw invalidHex();
+          }
+        }
         if (value.length === 0) pattern = 0;
         else if (value.length === 1 && (normalized === "utf8" || normalized === "latin1" || normalized === "binary" || normalized === "ascii")) {
           const code = value.charCodeAt(0);
@@ -675,6 +689,7 @@ inline constexpr std::string_view kNodeBufferExtraJS = R"JS(
       // 5. Post-coercion clamp: re-read length once, after every side effect,
       // and fold a detach (length 0) or shrink into the range.
       const postLimit = buf.length;
+      if (postLimit !== typedArrayLength(buf)) throw errBufferOOB();
       if (off > postLimit) off = postLimit;
       if (e > postLimit) e = postLimit;
       if (off >= e) return buf;
@@ -1362,6 +1377,35 @@ inline constexpr std::string_view kNodeBufferExtraJS = R"JS(
     // given byte values. ref: node lib/buffer.js Buffer.of.
     BufferW.of = function of(...items) { return newFrom(items); };
 
+    // node:buffer.transcode: the ICU-backed Node export is deliberately
+    // module-only. Bun keeps its existing not-implemented surface, while Node
+    // needs the four text encodings exercised by test-icu-transcode.
+    const transcodeEncoding = (encoding) => {
+      if (typeof encoding !== "string") return undefined;
+      switch (encoding.toLowerCase()) {
+        case "utf8": case "utf-8": return "utf8";
+        case "latin1": case "binary": return "latin1";
+        case "ascii": return "ascii";
+        case "utf16le": case "utf-16le": case "ucs2": case "ucs-2": return "utf16le";
+        default: return undefined;
+      }
+    };
+    const transcodeError = () => new Error("Unable to transcode Buffer [U_ILLEGAL_ARGUMENT_ERROR]");
+    const bufferTranscode = function transcode(source, fromEncoding, toEncoding) {
+      if (!isU8(source)) throw errArgInstance("source", "Buffer or Uint8Array", source);
+      const from = transcodeEncoding(fromEncoding);
+      const to = transcodeEncoding(toEncoding);
+      if (from === undefined || to === undefined) throw transcodeError();
+      let text = BufferW.from(source).toString(from);
+      if (to === "latin1" || to === "ascii") {
+        const max = to === "ascii" ? 0x7f : 0xff;
+        let replaced = "";
+        for (const ch of text) replaced += ch.codePointAt(0) <= max ? ch : "?";
+        text = replaced;
+      }
+      return BufferW.from(text, to);
+    };
+
     // Buffer.compare(buf1, buf2): node type-checks both args (process_web's
     // static coerced a non-Buffer via Buffer.from and never threw).
     BufferW.compare = function compare(buf1, buf2) {
@@ -1374,7 +1418,7 @@ inline constexpr std::string_view kNodeBufferExtraJS = R"JS(
     // entry a Buffer/Uint8Array; totalLength must be a non-negative integer.
     // Sizes/copies use byteLength so a spoofed `.length` getter cannot expose
     // uninitialized memory (test-buffer-concat).
-    const kMaxLength = 0x7fffffff;
+    const kMaxLength = K_MAX_LENGTH;
     BufferW.concat = function concat(list, length) {
       if (!Array.isArray(list)) throw errArgInstance("list", "Array", list);
       if (list.length === 0) return OrigBuffer.alloc(0);
@@ -1427,6 +1471,7 @@ inline constexpr std::string_view kNodeBufferExtraJS = R"JS(
       const mod = M["buffer"] || M["node:buffer"];
       if (mod) {
         mod.Buffer = BufferW;
+        if (G.__mbunDialect === "node") mod.transcode = bufferTranscode;
         mod.isAscii = isAscii;
         mod.isUtf8 = isUtf8;
         mod.SlowBuffer = SlowBuffer;
@@ -1454,9 +1499,13 @@ inline constexpr std::string_view kNodeBufferExtraJS = R"JS(
         // node buffer.constants.MAX_STRING_LENGTH / kStringMaxLength: the V8
         // string cap, strictly below kMaxLength (test-buffer-constants /
         // test-buffer-tostring-rangeerror). process_web seeds MAX_LENGTH only.
-        if (mod.kStringMaxLength === undefined) mod.kStringMaxLength = MAX_STRING_LENGTH;
-        if (mod.constants && typeof mod.constants === "object" && mod.constants.MAX_STRING_LENGTH === undefined) {
-          try { mod.constants.MAX_STRING_LENGTH = MAX_STRING_LENGTH; } catch (_) {}
+        if (mod.kMaxLength !== K_MAX_LENGTH) mod.kMaxLength = K_MAX_LENGTH;
+        if (mod.kStringMaxLength !== MAX_STRING_LENGTH) mod.kStringMaxLength = MAX_STRING_LENGTH;
+        if (mod.constants && typeof mod.constants === "object") {
+          try {
+            mod.constants.MAX_LENGTH = K_MAX_LENGTH;
+            mod.constants.MAX_STRING_LENGTH = MAX_STRING_LENGTH;
+          } catch (_) {}
         }
         M["buffer"] = M["node:buffer"] = mod;
       }

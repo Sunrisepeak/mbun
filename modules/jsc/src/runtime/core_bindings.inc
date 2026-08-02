@@ -1,3 +1,7 @@
+// io_bindings.inc is included after this file, but glob scan needs the shared
+// Node-shaped filesystem error helper while its callback is defined here.
+JSValueRef fs_throw(JSContextRef ctx, JSValueRef* exc, const std::string& msg);
+
 // ── Bun.semver ──────────────────────────────────────────────────────────────
 
 // ref: bun src/semver_jsc/SemverObject.rs. Both host functions front-load the
@@ -1158,6 +1162,7 @@ JSValueRef glob_scan_sync_cb(JSContextRef ctx, JSObjectRef, JSObjectRef thisObj,
     if (pat == nullptr) return JSObjectMakeArray(ctx, 0, nullptr, nullptr);
     std::string cwd;
     bool followSymlinks{false};
+    bool absolute{false};
     // bun Glob.scan option onlyFiles (glob walker only_files, default true) —
     // omit directories from results. node's fs.glob yields directories too, so
     // the fs.glob wrappers pass { onlyFiles: false }.
@@ -1186,6 +1191,9 @@ JSValueRef glob_scan_sync_cb(JSContextRef ctx, JSObjectRef, JSObjectRef thisObj,
                     JSC::JSValue onlyF{jsObj->getDirect(
                         vm, JSC::Identifier::fromString(vm, "onlyFiles"_s))};
                     if (onlyF && onlyF.isBoolean()) onlyFiles = onlyF.asBoolean();
+                    JSC::JSValue abs{jsObj->getDirect(
+                        vm, JSC::Identifier::fromString(vm, "absolute"_s))};
+                    if (abs && abs.isBoolean()) absolute = abs.asBoolean();
                 }
             }
         }
@@ -1208,9 +1216,14 @@ JSValueRef glob_scan_sync_cb(JSContextRef ctx, JSObjectRef, JSObjectRef thisObj,
     if (!onlyFiles) {
         mbun::glob::ScanOptions sopts;
         sopts.cwd = cwd;
+        sopts.absolute = absolute;
         sopts.followSymlinks = followSymlinks;
         sopts.onlyFiles = false;
-        const std::vector<std::string> rels{mbun::glob::scan(*pat, sopts)};
+        std::error_code scanError;
+        const std::vector<std::string> rels{mbun::glob::scan(*pat, sopts, &scanError)};
+        if (scanError == std::errc::filename_too_long) {
+            return fs_throw(ctx, exc, "ENAMETOOLONG: name too long, glob '" + cwd + "'");
+        }
         std::vector<JSValueRef> matches;
         matches.reserve(rels.size());
         for (const std::string& rel : rels) matches.push_back(make_string(ctx, rel));
@@ -1235,7 +1248,7 @@ JSValueRef glob_scan_sync_cb(JSContextRef ctx, JSObjectRef, JSObjectRef thisObj,
         // (bun reports the logical walk path).
         const std::string rel{it->path().lexically_relative(base).generic_string()};
         if (!rel.empty() && mbun::glob::match(*pat, rel)) {
-            matches.push_back(make_string(ctx, rel));
+            matches.push_back(make_string(ctx, absolute ? it->path().generic_string() : rel));
         }
     }
     return JSObjectMakeArray(ctx, matches.size(), matches.empty() ? nullptr : matches.data(),

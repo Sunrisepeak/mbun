@@ -31,6 +31,97 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
 (function () {
   const G = globalThis;
 
+  // `internal/event_target` and the engine's native Web Event can be separate
+  // realms during builtin initialization. NodeEventTarget's dispatch path is
+  // strict about its own Event brand, so install a post-loader bridge that
+  // converts a native Web Event into the matching internal event only at that
+  // boundary. The hook is invoked after the top-level require is installed.
+  try {
+    Object.defineProperty(G, "__mbunPatchNodeEventTarget", {
+      value: function patchNodeEventTarget(req) {
+        if (typeof req !== "function" || G.__mbunNodeEventTargetPatched) return;
+        let internal;
+        try { internal = req("internal/event_target"); } catch (e) { return; }
+        const NativeEvent = G.Event;
+        const InternalEvent = internal && internal.Event;
+        const NodeEventTarget = internal && internal.NodeEventTarget;
+        if (typeof NativeEvent !== "function" || typeof InternalEvent !== "function" ||
+            !NodeEventTarget || !NodeEventTarget.prototype) return;
+        const dispatchEvent = NodeEventTarget.prototype.dispatchEvent;
+        if (typeof dispatchEvent !== "function") return;
+        Object.defineProperty(NodeEventTarget.prototype, "dispatchEvent", {
+          value: function dispatchEventCompat(event) {
+            if (event instanceof NativeEvent && !(event instanceof InternalEvent)) {
+              event = new InternalEvent(event.type, {
+                bubbles: event.bubbles,
+                cancelable: event.cancelable,
+                composed: event.composed,
+              });
+            }
+            return Reflect.apply(dispatchEvent, this, [event]);
+          },
+          writable: true, configurable: true, enumerable: true,
+        });
+        Object.defineProperty(G, "__mbunNodeEventTargetPatched", {
+          value: true, writable: false, configurable: true, enumerable: false,
+        });
+        let abortController;
+        try { abortController = req("internal/abort_controller"); } catch (e) { return; }
+        if (abortController && typeof abortController.AbortController === "function" &&
+            typeof abortController.AbortSignal === "function") {
+          Object.defineProperty(G, "AbortController", {
+            value: abortController.AbortController, writable: true, configurable: true, enumerable: false,
+          });
+          Object.defineProperty(G, "AbortSignal", {
+            value: abortController.AbortSignal, writable: true, configurable: true, enumerable: false,
+          });
+        }
+      },
+      writable: false, configurable: true, enumerable: false,
+    });
+  } catch (e) {}
+
+  // JSC's RegExp constructor omits the offending flags from its SyntaxError,
+  // while node includes them (for example, `Invalid flags supplied to RegExp
+  // constructor 'gg'.`). Keep the native constructor and call semantics, but
+  // normalize only that diagnostic at the node compatibility boundary. This
+  // is consumed by node's internal/test_runner/utils convertStringToRegExp()
+  // and by other Node APIs that surface the same constructor error.
+  try {
+    const NativeRegExp = G.RegExp;
+    if (typeof NativeRegExp === "function" && !G.__mbunRegExpErrorCompat) {
+      const normalizeRegExpError = (error, args) => {
+        if (!error || error.name !== "SyntaxError" ||
+            error.message !== "Invalid flags supplied to RegExp constructor." ||
+            typeof args[1] !== "string") return;
+        // ERR_INVALID_ARG_VALUE appends the sentence terminator after the
+        // reason, so this inner diagnostic deliberately has no final period.
+        try { error.message = "Invalid flags supplied to RegExp constructor '" + args[1] + "'"; } catch (e) {}
+      };
+      const CompatRegExp = new Proxy(NativeRegExp, {
+        apply(target, receiver, args) {
+          try { return Reflect.apply(target, receiver, args); }
+          catch (error) { normalizeRegExpError(error, args); throw error; }
+        },
+        construct(target, args, newTarget) {
+          try { return Reflect.construct(target, args, newTarget); }
+          catch (error) { normalizeRegExpError(error, args); throw error; }
+        },
+      });
+      Object.defineProperty(G, "RegExp", {
+        value: CompatRegExp, writable: true, configurable: true, enumerable: false,
+      });
+      // The native prototype is intentionally shared by the proxy target and
+      // wrapper, so keep the standard constructor identity observable too.
+      Object.defineProperty(NativeRegExp.prototype, "constructor", {
+        value: CompatRegExp, writable: true, configurable: true, enumerable: false,
+      });
+      Object.defineProperty(G, "__mbunRegExpErrorCompat", {
+        value: true, writable: false, configurable: true, enumerable: false,
+      });
+    }
+  } catch (e) {}
+
   // ------------------------------------------------ EventTarget / Event shim
   try {
     if (typeof G.EventTarget !== "function") {
@@ -316,6 +407,26 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
   try {
     const proc = G.process;
     if (!proc) return;
+
+    // JSC has no V8 optimizer controls. When the Node corpus explicitly asks
+    // for --allow-natives-syntax, accept the two optimization-only intrinsics
+    // used by fast-call tests as no-ops; ordinary processes keep the native
+    // eval path untouched.
+    if (Array.isArray(proc.execArgv) && proc.execArgv.includes("--allow-natives-syntax") &&
+        typeof G.eval === "function" && !G.__mbunNativeSyntaxEvalCompat) {
+      const nativeEval = G.eval;
+      const optimizationIntrinsic = /^\s*%(?:PrepareFunctionForOptimization|OptimizeFunctionOnNextCall)\([^)]*\)\s*$/;
+      const compatEval = function eval(source) {
+        if (typeof source === "string" && optimizationIntrinsic.test(source)) return undefined;
+        return nativeEval(source);
+      };
+      Object.defineProperty(G, "eval", {
+        value: compatEval, writable: true, configurable: true, enumerable: false,
+      });
+      Object.defineProperty(G, "__mbunNativeSyntaxEvalCompat", {
+        value: true, writable: false, configurable: true, enumerable: false,
+      });
+    }
 
     // node's determineSpecificType() rendering, used by arg-type errors.
     const specificType = (v) => {
@@ -693,7 +804,7 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
         const rawGet = desc.get ? desc.get.bind(proc) : () => store;
         const rawSet = desc.set ? desc.set.bind(proc) : (v) => { store = v; };
         Object.defineProperty(proc, "exitCode", {
-          configurable: true,
+          configurable: false,
           enumerable: true,
           get() { return rawGet(); },
           set(code) {
@@ -1113,6 +1224,15 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
             const fs = G.__mbunNativeModules && G.__mbunNativeModules["fs"];
             if (fs && typeof fs.appendFileSync === "function") { fs.appendFileSync(file, msg + "\n"); return; }
           } catch (e) {}
+        }
+        // Node's global console writes warnings through the live stderr
+        // stream. Keep that observable seam here so replacing
+        // process.stderr.write remains visible to the default warning
+        // printer; use the console only when no writable stderr exists.
+        const stderr = proc.stderr;
+        if (stderr && typeof stderr.write === "function") {
+          try { stderr.write(msg + "\n"); } catch (e) {}
+          return;
         }
         try { G.console.error(msg); } catch (e) {}
       };
@@ -2059,7 +2179,13 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
     try {
       if (!("gc" in G)) {
         const collect = (full) => {
-          try { if (G.Bun && typeof G.Bun.gc === "function") return G.Bun.gc(full !== false); } catch (e) {}
+          try {
+            if (G.Bun && typeof G.Bun.gc === "function") {
+              const result = G.Bun.gc(full !== false);
+              try { if (typeof G.__mbunPerfGc === "function") G.__mbunPerfGc(); } catch (e) {}
+              return result;
+            }
+          } catch (e) {}
           return undefined;
         };
         Object.defineProperty(G, "gc", {
@@ -2139,6 +2265,27 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
   // there would have been undone by the process.send that __mbunSetupIpcChild
   // has only just assigned.
   try { if (typeof globalThis.__mbunWorkerDisableProcessOps === "function") globalThis.__mbunWorkerDisableProcessOps(); } catch (e) {}
+
+  // JSC's generic non-configurable-property error omits the property and
+  // receiver. Node exposes the process object with a stable diagnostic for
+  // deleting exitCode, so keep the native descriptor invariant above while
+  // formatting only this process-specific delete through a proxy.
+  try {
+    if (G.__mbunDialect === "node" && G.process && !G.__mbunProcessDeleteCompat) {
+      const processTarget = G.process;
+      G.process = new Proxy(processTarget, {
+        deleteProperty(target, property) {
+          if (property === "exitCode") {
+            throw new TypeError("Cannot delete property 'exitCode' of #<process>");
+          }
+          return Reflect.deleteProperty(target, property);
+        },
+      });
+      Object.defineProperty(G, "__mbunProcessDeleteCompat", {
+        value: true, writable: false, configurable: true, enumerable: false,
+      });
+    }
+  } catch (e) {}
 })();
 )JS";
 

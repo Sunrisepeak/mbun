@@ -30,11 +30,21 @@ inline constexpr std::string_view kNodePerfJS = R"JS(
   const M = G.__mbunNativeModules || (G.__mbunNativeModules = {});
   const NS = () => (G.Bun && G.Bun.nanoseconds ? G.Bun.nanoseconds() : 0);
 
-  const err = (code, msg) => { const e = new (code === "ERR_INVALID_ARG_TYPE" ? TypeError : RangeError)(msg); e.code = code; return e; };
+  const err = (code, msg) => { const e = new (code === "ERR_INVALID_ARG_TYPE" || code === "ERR_MISSING_ARGS" ? TypeError : RangeError)(msg); e.code = code; return e; };
   const errArgType = (name, expected, actual) =>
     err("ERR_INVALID_ARG_TYPE", 'The "' + name + '" argument must be ' +
         (Array.isArray(expected) ? "one of type " + expected.join(", ") : "of type " + expected) +
         ". Received " + (typeof actual));
+  const errArgTypeValue = (name, expected, actual) => {
+    const type = typeof actual;
+    if (actual === null || actual === undefined)
+      return err("ERR_INVALID_ARG_TYPE", 'The "' + name + '" argument must be of type ' + expected + ". Received " + actual);
+    if (type === "function")
+      return err("ERR_INVALID_ARG_TYPE", 'The "' + name + '" argument must be of type ' + expected + ". Received function " + (actual.name || ""));
+    const inspected = type === "string" ? "'" + actual + "'" : String(actual);
+    return err("ERR_INVALID_ARG_TYPE", 'The "' + name + '" argument must be of type ' +
+      expected + ". Received type " + type + " (" + inspected + ")");
+  };
   const errRange = (name, range, actual) =>
     err("ERR_OUT_OF_RANGE", 'The value of "' + name + '" is out of range. It must be ' + range + ". Received " + String(actual));
 
@@ -92,22 +102,58 @@ inline constexpr std::string_view kNodePerfJS = R"JS(
     }
   }
 
+  // process_web advances this counter once per timer/check phase. Reuse that
+  // loop-turn gauge for the uv_metrics_info-compatible Node surface instead of
+  // exposing the property without a live event-loop value.
+  function uvMetricsInfo() {
+    const timers = G.__mbunTimers;
+    const loopCount = timers && Number.isSafeInteger(timers.batch) ? timers.batch : 0;
+    return { loopCount, events: 0, eventsWaiting: 0 };
+  }
+
+  // Node reports startup milestones relative to performance.timeOrigin. Keep a
+  // monotonic startup sequence and derive loop milestones from the scheduler
+  // state already used by the event-loop pump.
+  const startupMilestones = (() => {
+    const end = Math.max(0, perfNow());
+    const nodeStart = Math.max(0, end - 0.004);
+    return Object.freeze({
+      nodeStart,
+      v8Start: nodeStart + 0.001,
+      environment: nodeStart + 0.002,
+      bootstrapComplete: nodeStart + 0.003,
+      loopStart: nodeStart + 0.004,
+    });
+  })();
+  Object.defineProperty(G, "__mbunPerfMilestones", {
+    configurable: true, enumerable: false, value: startupMilestones,
+  });
+
   // ── PerformanceNodeTiming ────────────────────────────────────────────────
   class PerformanceNodeTiming extends PerformanceEntry {
     constructor() {
       super(kConstruct, "node", "node", 0, 0);
-      this.nodeStart = 0;
-      this.v8Start = 0;
-      this.bootstrapComplete = 0;
-      this.environment = 0;
-      this.loopStart = 1;
-      this.loopExit = -1;
-      this.idleTime = 1;
+      this.nodeStart = startupMilestones.nodeStart;
+      this.v8Start = startupMilestones.v8Start;
+      this.bootstrapComplete = startupMilestones.bootstrapComplete;
+      this.environment = startupMilestones.environment;
+      delete this.duration;
     }
-    get startTime() { return this.nodeStart; }
+    get startTime() { return 0; }
     set startTime(_v) {}
     get duration() { return perfNow(); }
     set duration(_v) {}
+    get loopStart() {
+      const timers = G.__mbunTimers;
+      return timers && Number.isSafeInteger(timers.batch) && timers.batch > 0
+        ? startupMilestones.loopStart : -1;
+    }
+    get loopExit() {
+      const p = G.process;
+      return p && p._exiting ? Math.max(startupMilestones.loopStart, perfNow()) : -1;
+    }
+    get idleTime() { return 0; }
+    get uvMetricsInfo() { return uvMetricsInfo(); }
     toJSON() {
       return {
         name: "node", entryType: "node", startTime: this.startTime, duration: this.duration,
@@ -134,6 +180,10 @@ inline constexpr std::string_view kNodePerfJS = R"JS(
 
   const buffer = [];
   const observers = new Set();
+  const resourceTimingListeners = new Set();
+  let resourceTimingBufferSize = 250;
+  let resourceTimingOverflow = null;
+  let resourceTimingBufferFullScheduled = false;
 
   function resolveTime(v) {
     if (typeof v === "number") return v;
@@ -165,6 +215,49 @@ inline constexpr std::string_view kNodePerfJS = R"JS(
   }
 
   function addEntry(entry) { buffer.push(entry); notifyObservers(entry); }
+  // node_process_extra calls this after globalThis.gc() completes its real
+  // Bun.gc(true) collection. Publish the forced major-GC shape that Node's
+  // PerformanceObserver contract exposes, without adding a second collector.
+  Object.defineProperty(G, "__mbunPerfGc", {
+    configurable: true, enumerable: false, writable: true,
+    value: () => {
+      if (!hasObserverFor("gc")) return;
+      addEntry(new PerformanceNodeEntry(kConstruct, "gc", "gc", perfNow(), 0, {
+        kind: 4, flags: 4,
+      }));
+    },
+  });
+  function timelineEntries(entries) {
+    return entries.slice().sort((a, b) => a.startTime - b.startTime);
+  }
+  function resourceEntries() { return buffer.filter((entry) => entry.entryType === "resource"); }
+  function scheduleResourceTimingBufferFull() {
+    if (resourceTimingBufferFullScheduled) return;
+    resourceTimingBufferFullScheduled = true;
+    queueMicrotask(() => {
+      resourceTimingBufferFullScheduled = false;
+      const event = { type: "resourcetimingbufferfull" };
+      for (const listener of [...resourceTimingListeners]) {
+        try { listener.call(performanceObj, event); } catch (_) {}
+      }
+      if (typeof performanceObj.onresourcetimingbufferfull === "function") {
+        try { performanceObj.onresourcetimingbufferfull.call(performanceObj, event); } catch (_) {}
+      }
+      if (resourceTimingOverflow !== null && resourceEntries().length < resourceTimingBufferSize)
+        addEntry(resourceTimingOverflow);
+      resourceTimingOverflow = null;
+    });
+  }
+  function addResourceTiming(timingInfo, requestedUrl) {
+    const startTime = typeof timingInfo?.startTime === "number" ? timingInfo.startTime : 0;
+    const endTime = typeof timingInfo?.endTime === "number" ? timingInfo.endTime : startTime;
+    const entry = new PerformanceNodeEntry(kConstruct, String(requestedUrl), "resource", startTime, endTime - startTime);
+    if (resourceEntries().length < resourceTimingBufferSize) addEntry(entry);
+    else {
+      if (resourceTimingOverflow === null) resourceTimingOverflow = entry;
+      scheduleResourceTimingBufferFull();
+    }
+  }
 
   const performanceObj = {
     get timeOrigin() { return timeOrigin; },
@@ -195,12 +288,16 @@ inline constexpr std::string_view kNodePerfJS = R"JS(
       addEntry(entry);
       return entry;
     },
-    getEntries() { return buffer.slice(); },
+    getEntries() { return timelineEntries(buffer); },
     getEntriesByName(name, type) {
+      if (arguments.length === 0) throw err("ERR_MISSING_ARGS", 'The "name" argument must be specified');
       name = String(name);
-      return buffer.filter((e) => e.name === name && (type === undefined || e.entryType === type));
+      return timelineEntries(buffer.filter((e) => e.name === name && (type === undefined || e.entryType === type)));
     },
-    getEntriesByType(type) { return buffer.filter((e) => e.entryType === type); },
+    getEntriesByType(type) {
+      if (arguments.length === 0) throw err("ERR_MISSING_ARGS", 'The "type" argument must be specified');
+      return timelineEntries(buffer.filter((e) => e.entryType === type));
+    },
     clearMarks(name) {
       for (let i = buffer.length - 1; i >= 0; i--)
         if (buffer[i].entryType === "mark" && (name === undefined || buffer[i].name === String(name))) buffer.splice(i, 1);
@@ -209,9 +306,26 @@ inline constexpr std::string_view kNodePerfJS = R"JS(
       for (let i = buffer.length - 1; i >= 0; i--)
         if (buffer[i].entryType === "measure" && (name === undefined || buffer[i].name === String(name))) buffer.splice(i, 1);
     },
-    clearResourceTimings() {},
-    setResourceTimingBufferSize() {},
-    markResourceTiming() {},
+    clearResourceTimings() {
+      for (let i = buffer.length - 1; i >= 0; i--)
+        if (buffer[i].entryType === "resource") buffer.splice(i, 1);
+    },
+    setResourceTimingBufferSize(maxSize) {
+      if (typeof maxSize === "bigint")
+        throw err("ERR_INVALID_ARG_TYPE", "maxSize is a BigInt and cannot be converted to a number.");
+      if (typeof maxSize === "symbol")
+        throw err("ERR_INVALID_ARG_TYPE", "maxSize is a Symbol and cannot be converted to a number.");
+      if (typeof maxSize === "number" && Number.isFinite(maxSize) && maxSize >= 0)
+        resourceTimingBufferSize = Math.trunc(maxSize);
+      else resourceTimingBufferSize = 0;
+    },
+    markResourceTiming(timingInfo, requestedUrl) { addResourceTiming(timingInfo, requestedUrl); },
+    addEventListener(type, listener) {
+      if (type === "resourcetimingbufferfull" && typeof listener === "function") resourceTimingListeners.add(listener);
+    },
+    removeEventListener(type, listener) {
+      if (type === "resourcetimingbufferfull") resourceTimingListeners.delete(listener);
+    },
     eventLoopUtilization() { return { idle: 0, active: 0, utilization: 0 }; },
     onresourcetimingbufferfull: null,
     nodeTiming: new PerformanceNodeTiming(),
@@ -263,7 +377,7 @@ inline constexpr std::string_view kNodePerfJS = R"JS(
   performanceObj.timerify = timerify;
 
   // ── PerformanceObserver ───────────────────────────────────────────────────
-  const SUPPORTED = ["mark", "measure", "function", "net", "http"];
+  const SUPPORTED = ["mark", "measure", "function", "net", "http", "gc"];
   class PerformanceObserver {
     constructor(callback) {
       if (typeof callback !== "function") throw errArgType("callback", "function", callback);
@@ -274,11 +388,20 @@ inline constexpr std::string_view kNodePerfJS = R"JS(
     }
     static get supportedEntryTypes() { return SUPPORTED.slice(); }
     observe(options) {
-      options = options === undefined || options === null ? kEmptyObject : options;
+      if (options === undefined) options = kEmptyObject;
+      if (options === null || typeof options !== "object") throw errArgTypeValue("options", "object", options);
+      const hasEntryTypes = options.entryTypes !== undefined;
+      const hasType = options.type !== undefined;
+      if (!hasEntryTypes && !hasType)
+        throw err("ERR_MISSING_ARGS", 'The "options.entryTypes" and "options.type" arguments must be specified');
+      if (hasEntryTypes && !Array.isArray(options.entryTypes))
+        throw errArgType("options.entryTypes", "string[]", options.entryTypes);
+      if (hasEntryTypes && hasType && options.entryTypes != null && options.type != null)
+        throw err("ERR_INVALID_ARG_VALUE", 'The "options.entryTypes" argument cannot be set with "options.type" together');
       let types;
       if (Array.isArray(options.entryTypes)) types = options.entryTypes;
       else if (options.type !== undefined) types = [options.type];
-      else return;
+      else types = [];
       if (Array.isArray(options.entryTypes)) this.__types = new Set();
       for (const t of types) if (SUPPORTED.indexOf(t) !== -1) this.__types.add(t);
       observers.add(this);

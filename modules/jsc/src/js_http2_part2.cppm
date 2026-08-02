@@ -342,6 +342,20 @@ export constexpr std::string_view kHttp2JS_part2 = R"JS(
         this.session._sendData(this, Buffer.alloc(0), true);
       } else {
         const block = encodeHeaders(list, sensitive);
+        // node's nghttp2 session rejects a serialized trailer block above
+        // maxSendHeaderBlockLength (64 KiB by default) before it splits the
+        // block into legal wire frames. Report the local frame failure and
+        // reset the stream with FRAME_SIZE_ERROR; treating this as ordinary
+        // HEADERS + CONTINUATION delivery makes the peer wait forever for the
+        // error events asserted by test-http2-exceeds-server-trailer-size.
+        const maxBlock = this.session._options && this.session._options.maxSendHeaderBlockLength !== undefined
+          ? this.session._options.maxSendHeaderBlockLength : 64 * 1024;
+        if (block.length > maxBlock) {
+          this.emit("frameError", FRAME.HEADERS, constants.NGHTTP2_FRAME_SIZE_ERROR, this.id);
+          this.close(constants.NGHTTP2_FRAME_SIZE_ERROR);
+          this.session.close();
+          return;
+        }
         writeHeaderBlock(this.session, this.id, block, FLAG.END_STREAM);
       }
       this._endStreamSent = true;
@@ -639,6 +653,15 @@ export constexpr std::string_view kHttp2JS_part2 = R"JS(
         _srvSettings && "enablePush" in _srvSettings
           ? Object.assign({}, _srvSettings, { enablePush: false })
           : _srvSettings));
+      // node counts the server's initial SETTINGS frame toward
+      // maxOutstandingSettings until the peer ACKs it. Without this entry the
+      // first application settings() call starts at zero, so a limit of two
+      // never trips on the second call (test-http2-too-many-settings).
+      this._pendingSettingsAcks = [{
+        settings: _srvSettings ? Object.assign({}, _srvSettings) : {},
+        cb: null,
+        start: Date.now(),
+      }];
       socket.on("data", (d) => self._onData(d));
       socket.on("error", (e) => self._onSocketError(e));
       socket.on("close", () => self._onSocketClose());
@@ -651,7 +674,11 @@ export constexpr std::string_view kHttp2JS_part2 = R"JS(
       // 'error' listener on that path and "write after end" surfaced as an
       // uncaught exception. nghttp2 simply drops frames once the transport is
       // gone, so drop them here too.
-      if (this._rawSocket.destroyed || this._rawSocket.writable === false) return;
+      // The public socket proxy deliberately permits callers to assign
+      // `writable`/`readable` for Node parity. Those properties are not the
+      // protocol transport state: only the internal shutdown marker or actual
+      // destruction may suppress an HTTP/2 frame.
+      if (this._rawSocket.destroyed || this._rawSocket._shutW === true) return;
       payload = payload || Buffer.alloc(0);
       try { this._rawSocket.write(Buffer.concat([frameHeader(payload.length, type, flags, streamId), payload])); } catch (e) {}
     }
@@ -787,7 +814,18 @@ export constexpr std::string_view kHttp2JS_part2 = R"JS(
             stream.rstCode = code; stream.aborted = true;
             if (code !== 0) G.queueMicrotask(() => stream.emit("aborted"));
             stream._closed = true;
-            http2StreamFinish(stream);
+            if (code !== constants.NGHTTP2_NO_ERROR && code !== constants.NGHTTP2_CANCEL) {
+              // A non-zero peer reset is a stream error, not only a close.
+              // Keep the session alive while routing it through _destroy so
+              // the server stream publishes ERR_HTTP2_STREAM_ERROR.
+              const err = streamErr(code);
+              G.queueMicrotask(() => {
+                if (!stream.destroyed) stream.destroy(err);
+                else stream.emit("error", err);
+              });
+            } else if (code === constants.NGHTTP2_CANCEL) {
+              G.queueMicrotask(() => { if (!stream.destroyed) stream.destroy(); });
+            } else http2StreamFinish(stream);
           }
           else if ((streamId & 1) === 1 && streamId > this._lastStreamId) { this._connError(constants.NGHTTP2_PROTOCOL_ERROR); return false; }  // RST on an idle stream (§5.1)
           else if ((streamId & 1) === 0 && streamId > (this._lastPushId || 0)) { this._connError(constants.NGHTTP2_PROTOCOL_ERROR); return false; }
@@ -1052,7 +1090,7 @@ export constexpr std::string_view kHttp2JS_part2 = R"JS(
     ref() { if (this._rawSocket && this._rawSocket.ref) this._rawSocket.ref(); return this; }
     unref() { if (this._rawSocket && this._rawSocket.unref) this._rawSocket.unref(); return this; }
     // PORT-SOURCE: compat/node/lib/internal/http2/core.js Http2Session `get socket()`
-    get socket() { return sessionSocketProxy(this); }
+    get socket() { return this._rawSocket === undefined ? undefined : sessionSocketProxy(this); }
     set socket(v) { this._rawSocket = v; }
     // node Http2Session#setTimeout is on BOTH halves (it lives on the shared
     // Http2Session prototype); this one was a no-op stub, so an http2 SERVER
@@ -1985,9 +2023,10 @@ export constexpr std::string_view kHttp2JS_part2 = R"JS(
   // C++ halves. mbun's http2 is implemented in JS and does not drive them, so
   // they are plain typed arrays of the right length and stay zero: that is what
   // `updateSettingsBuffer` / `updateOptionsBuffer` write into and read back,
-  // which is all the util-level tests observe. Nothing here makes mbun's own
-  // sessions route through the binding — a test that monkey-patches
-  // `Http2Stream.prototype` still does not affect them (see DEFERRED).
+  // which is all the util-level tests observe. The live JS framing path still
+  // honors the replaceable Http2Session request and Http2Stream submit seams
+  // below, so internal tests can exercise native error ownership without
+  // pretending the typed-array state is native-backed.
   const kNghttp2Strerror = {
     0: "Success",
     "-501": "Invalid argument",
@@ -2141,6 +2180,7 @@ export constexpr std::string_view kHttp2JS_part2 = R"JS(
       class Http2Stream {}
       class Http2Ping {}
       class Http2Settings {}
+      nativeHttp2SessionPrototype = Http2Session.prototype;
       nativeHttp2StreamPrototype = Http2Stream.prototype;
       return {
         constants: bindingConstants,
