@@ -59,11 +59,16 @@ int main() {
   // after validation and before the public API returns.
   for (const name of ["access", "chown", "lchown"]) {
     const order = ["before"];
-    const callback = (error) => order.push("callback:" + String(error && error.code));
-    if (name === "access") fs[name](path, 0, callback);
-    else fs[name](path, 0, 0, callback);
+    const callback = (error) => {
+      order.push("callback:" + String(error && error.code));
+      return 42;
+    };
+    const returned = name === "access"
+      ? fs[name](path, 0, callback)
+      : fs[name](path, 0, 0, callback);
     order.push("after");
     check(order.join(",") === "before,callback:ERR_ACCESS_DENIED,after", name + " ordering");
+    check(returned === undefined, name + " ignores callback return");
   }
 
   // These entries use node's synchronous permission macro even in callback
@@ -80,8 +85,8 @@ int main() {
         fail(result.error());
         return 1;
     }
-    if (*result != "22") {
-        fail(std::format("expected 22 checks, got {}", *result));
+    if (*result != "25") {
+        fail(std::format("expected 25 checks, got {}", *result));
         return 1;
     }
     std::println("test_runtime_permission_fs_validation: ok");

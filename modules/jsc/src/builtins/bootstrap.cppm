@@ -9218,8 +9218,10 @@ inline constexpr char kBootstrapJS_[] = R"JS(
       // Node's binding permission rejection invokes FSReqCallback immediately.
       // Keep ordinary fs completions on this queue, but do not move a native-
       // boundary denial behind nextTick or promise jobs.
-      if (out && out[0] && out[0].code === "ERR_ACCESS_DENIED")
-        return real.apply(undefined, out);
+      if (out && out[0] && out[0].code === "ERR_ACCESS_DENIED") {
+        real.apply(undefined, out);
+        return ret;
+      }
       // The completion carries the async context of the CALL, captured here at
       // push time — node's rule, and the same thing process.nextTick does a few
       // hundred lines away in runtime/bindings_install.inc. A batched drain runs
