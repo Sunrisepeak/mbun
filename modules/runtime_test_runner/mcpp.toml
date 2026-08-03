@@ -1,0 +1,14 @@
+[package]
+name        = "runtime_test_runner"
+version     = "0.1.0"
+description = "mbun runtime test runner JS harness, assertions, and timer backend seams"
+license     = "MIT"
+standard    = "c++26"
+
+
+
+[dependencies]
+runtime_timer = { path = "../runtime_timer" }
+
+[indices]
+mbun = { path = "../../mcpp" }

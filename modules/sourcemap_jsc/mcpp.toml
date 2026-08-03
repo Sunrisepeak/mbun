@@ -1,0 +1,14 @@
+[package]
+name        = "sourcemap_jsc"
+version     = "0.1.0"
+description = "mbun.sourcemap_jsc — JSC-facing source-map conversion seams"
+license     = "MIT"
+standard    = "c++26"
+
+
+
+[dependencies]
+sourcemap = { path = "../sourcemap" }
+
+[indices]
+mbun = { path = "../../mcpp" }

@@ -1,0 +1,11 @@
+[package]
+name        = "codegen"
+version     = "0.1.0"
+description = "mbun.codegen — output, symbols, source maps, and backend seam"
+license     = "MIT"
+standard    = "c++26"
+
+
+
+[indices]
+mbun = { path = "../../mcpp" }

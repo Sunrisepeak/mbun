@@ -1,0 +1,11 @@
+[package]
+name        = "webcore"
+version     = "0.1.0"
+description = "mbun.webcore — DOM, event, stream, and backend seams"
+license     = "MIT"
+standard    = "c++26"
+
+
+
+[indices]
+mbun = { path = "../../mcpp" }

@@ -1,0 +1,15 @@
+[package]
+name        = "patch_jsc"
+version     = "0.1.0"
+description = "mbun.patch_jsc — patch JSC binding and native backend seams"
+license     = "MIT"
+standard    = "c++26"
+
+
+
+
+[dependencies]
+patch = { path = "../patch" }
+
+[indices]
+mbun = { path = "../../mcpp" }

@@ -1,0 +1,11 @@
+[package]
+name        = "spawn"
+version     = "0.1.0"
+description = "mbun.spawn — platform-neutral child-process options and backend seam"
+license     = "MIT"
+standard    = "c++26"
+
+
+
+[indices]
+mbun = { path = "../../mcpp" }

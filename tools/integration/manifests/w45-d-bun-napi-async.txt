@@ -1,0 +1,11 @@
+compat/bun/test/napi/node-napi-tests/test/js-native-api/test_finalizer/do.test.ts
+compat/bun/test/napi/node-napi-tests/test/js-native-api/test_general/do.test.ts
+compat/bun/test/napi/node-napi-tests/test/js-native-api/test_new_target/do.test.ts
+compat/bun/test/napi/node-napi-tests/test/js-native-api/test_reference/do.test.ts
+compat/bun/test/napi/node-napi-tests/test/js-native-api/test_string/do.test.ts
+compat/bun/test/napi/node-napi-tests/test/node-api/test_async/do.test.ts
+compat/bun/test/napi/node-napi-tests/test/node-api/test_callback_scope/do.test.ts
+compat/bun/test/napi/node-napi-tests/test/node-api/test_fatal_exception/do.test.ts
+compat/bun/test/napi/node-napi-tests/test/node-api/test_general/do.test.ts
+compat/bun/test/napi/node-napi-tests/test/node-api/test_make_callback/do.test.ts
+compat/bun/test/napi/node-napi-tests/test/node-api/test_threadsafe_function/do.test.ts

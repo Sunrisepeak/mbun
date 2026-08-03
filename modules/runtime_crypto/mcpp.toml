@@ -1,0 +1,14 @@
+[package]
+name        = "runtime_crypto"
+version     = "0.1.0"
+description = "mbun runtime crypto hash, digest, binding, and backend seams"
+license     = "MIT"
+standard    = "c++26"
+
+
+
+[dependencies]
+crypto = { path = "../crypto" }
+
+[indices]
+mbun = { path = "../../mcpp" }

@@ -1,0 +1,9 @@
+compat/node/test/parallel/test-console-group.js
+compat/node/test/parallel/test-console-issue-43095.js
+compat/node/test/parallel/test-console-table.js
+compat/node/test/parallel/test-console.js
+compat/node/test/parallel/test-timers-immediate-promisified.js
+compat/node/test/parallel/test-timers-immediate-queue-throw.js
+compat/node/test/parallel/test-timers-interval-promisified.js
+compat/node/test/parallel/test-timers-timeout-promisified.js
+compat/node/test/parallel/test-timers.js

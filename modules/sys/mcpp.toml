@@ -1,0 +1,11 @@
+[package]
+name        = "sys"
+version     = "0.1.0"
+description = "mbun.sys — platform-neutral fd, errno, and syscall seams"
+license     = "MIT"
+standard    = "c++26"
+
+
+
+[indices]
+mbun = { path = "../../mcpp" }

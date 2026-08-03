@@ -1,0 +1,11 @@
+[package]
+name = "logger"
+version = "0.1.0"
+description = "mbun.logger diagnostic level/event sink/provider seams"
+license = "MIT"
+standard = "c++26"
+
+
+
+[indices]
+mbun = { path = "../../mcpp" }

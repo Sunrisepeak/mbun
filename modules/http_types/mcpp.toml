@@ -1,0 +1,11 @@
+[package]
+name        = "http_types"
+version     = "0.1.0"
+description = "mbun.http_types — low-level Bun HTTP enums and entity-tag logic"
+license     = "MIT"
+standard    = "c++26"
+
+
+
+[indices]
+mbun = { path = "../../mcpp" }

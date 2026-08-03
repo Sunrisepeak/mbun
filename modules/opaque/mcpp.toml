@@ -1,0 +1,11 @@
+[package]
+name        = "opaque"
+version     = "0.1.0"
+description = "mbun.opaque — type-erased FFI handle and layout seams"
+license     = "MIT"
+standard    = "c++26"
+
+
+
+[indices]
+mbun = { path = "../../mcpp" }

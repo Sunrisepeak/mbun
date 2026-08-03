@@ -1,0 +1,938 @@
+{
+ "generated_at": "2026-07-25",
+ "purpose": "Per-task estimate-vs-actual for compat rounds, so targets stop being guesses. Each entry records what a task was predicted to deliver, what it delivered, how long it took, and — when the estimate missed badly — the identified cause. Read compat/README.md#estimating-a-round-target before setting a new target.",
+ "units": {
+  "delta_pass": "net change in real `pass` files (node runner; `skipped` excluded)",
+  "wall_clock_min": "agent wall-clock minutes, dispatch to final report"
+ },
+ "rounds": [
+  {
+   "round": 9,
+   "corpus": "compat/node/test/parallel",
+   "baseline_binary": "round-8 HEAD (23217dd)",
+   "tasks": [
+    {
+     "id": "r9/agent-1",
+     "cluster": "node harness flag re-spawn (process.execArgv, spawnSync stdio)",
+     "worklist_files": 611,
+     "cluster_homogeneity": "low",
+     "target_delta_pass": 150,
+     "actual_delta_pass": 76,
+     "hit_rate": 0.51,
+     "wall_clock_min": 57,
+     "estimate_miss_cause": "Target extrapolated from an 80-file NODE_SKIP_FLAG_CHECK probe measuring 27.5% conversion; true population rate was 17% exit-0 of which only 12.4% real passes. Half the gap was skips counted as passes in the probe, half a ~2.5-sigma lucky sample. A one-line unblock exposes a long tail of unrelated second failures."
+    },
+    {
+     "id": "r9/agent-2",
+     "cluster": "node:fs validation + fs.promises/FileHandle",
+     "worklist_files": 74,
+     "cluster_homogeneity": "high",
+     "target_delta_pass": 30,
+     "actual_delta_pass": 56,
+     "hit_rate": 1.87,
+     "wall_clock_min": 114
+    },
+    {
+     "id": "r9/agent-3",
+     "cluster": "buffer/zlib/whatwg-url/net argument validation",
+     "worklist_files": 78,
+     "cluster_homogeneity": "high",
+     "target_delta_pass": 25,
+     "actual_delta_pass": 33,
+     "hit_rate": 1.32,
+     "wall_clock_min": 119,
+     "note": "Dispatched work-list was stale (derived from a pre-round-8 binary): 38 of 78 were already green. Delta is against a re-measured baseline."
+    },
+    {
+     "id": "r9/agent-4",
+     "cluster": "WebCrypto + node:crypto",
+     "worklist_files": 70,
+     "cluster_homogeneity": "high",
+     "target_delta_pass": 22,
+     "actual_delta_pass": 30,
+     "hit_rate": 1.36,
+     "wall_clock_min": 83
+    },
+    {
+     "id": "r9/agent-5",
+     "cluster": "process exit events + handle unref (the 580 timeouts)",
+     "worklist_files": 580,
+     "cluster_homogeneity": "low",
+     "target_delta_pass": 120,
+     "actual_delta_pass": 15,
+     "hit_rate": 0.13,
+     "wall_clock_min": 74,
+     "estimate_miss_cause": "The stated root cause was wrong. The hangs were not handle ref-counting but every event-pump phase swallowing thrown exceptions (`catch (e) {}`), leaving handles registered forever. Fixing it moved 429 files from a 15s hang to a sub-second diagnosable failure — real progress, but failures are not passes. A target was set on an unverified causal hypothesis."
+    },
+    {
+     "id": "r9/agent-6",
+     "cluster": "vm / repl / module / require",
+     "worklist_files": 161,
+     "cluster_homogeneity": "high",
+     "target_delta_pass": 45,
+     "actual_delta_pass": 59,
+     "hit_rate": 1.31,
+     "wall_clock_min": 97,
+     "note": "Baseline was 19, not the 0 the brief assumed: two inherited commits (execArgv, spawnSync stdio) had already unblocked them. Delta measured from the re-taken baseline."
+    },
+    {
+     "id": "r9/agent-7",
+     "cluster": "worker_threads + child_process",
+     "worklist_files": 138,
+     "cluster_homogeneity": "high",
+     "target_delta_pass": 40,
+     "actual_delta_pass": 53,
+     "hit_rate": 1.33,
+     "wall_clock_min": 108
+    },
+    {
+     "id": "r9/agent-8",
+     "cluster": "streams / web streams / domain",
+     "worklist_files": 102,
+     "cluster_homogeneity": "medium",
+     "target_delta_pass": 30,
+     "actual_delta_pass": 17,
+     "hit_rate": 0.57,
+     "wall_clock_min": 72,
+     "estimate_miss_cause": "Only 33 of the 102 files were reachable at all; the other 69 carry a `// Flags:` header and were gated behind a fix living on a branch this one was not based on. Of the 33 reachable, 17 passed (52%). The work-list was built without checking reachability, so the target was set against a file count two-thirds of which no agent on that base could move."
+    }
+   ],
+   "calibration": {
+    "high_homogeneity_hit_rate_range": [
+     1.31,
+     1.87
+    ],
+    "low_homogeneity_hit_rate_range": [
+     0.13,
+     0.57
+    ],
+    "wall_clock_min_range": [
+     57,
+     119
+    ],
+    "wall_clock_median_min": 90,
+    "conclusions": [
+     "Cluster homogeneity predicts hit rate; cluster SIZE does not. The two largest work-lists (611, 580) delivered 51% and 13% of target; the three smallest (70-78) delivered 132-187%.",
+     "A target derived from a causal hypothesis that has not itself been verified is not an estimate. Verify the cause on a handful of files first, then extrapolate.",
+     "A probe used for extrapolation must be scored the same way as the target metric. The agent-1 probe counted self-skips as conversions; the target did not.",
+     "One agent task takes 57-119 min (median 83). A 60-minute coordination tick is SHORTER than a single task, so a tick cannot be a round boundary.",
+     "Check REACHABILITY before setting a target, not just file count. agent-8's list was 102 files of which only 33 could be moved from its base; the rest were gated behind a fix on a sibling branch. Target per reachable file, and say which files are excluded and why."
+    ]
+   },
+   "outcome": {
+    "full_corpus_before": {
+     "binary": "round-8 HEAD (23217dd)",
+     "pass": 1695,
+     "skipped": 279,
+     "fail": 1862,
+     "timeout": 583,
+     "oom_kill": 14,
+     "files": 4433,
+     "pass_rate": 0.382
+    },
+    "full_corpus_after": {
+     "binary": "r9/integration (pre globals fix)",
+     "pass": 1463,
+     "skipped": 296,
+     "fail": 2499,
+     "timeout": 169,
+     "oom_kill": 6,
+     "files": 4433,
+     "pass_rate": 0.33
+    },
+    "sum_of_isolated_task_deltas": 339,
+    "actual_net_delta_pass": -232,
+    "why_the_sum_does_not_match": "Task deltas were each measured in isolation against that task's own cluster. Composed, one change (process.on('exit') firing, which makes common.mustCall enforceable, plus the event pump no longer swallowing thrown exceptions) invalidated passes across the WHOLE corpus, not just its own work-list. 496 files went green->non-green; all 496 were classified from their logs and 495 are files that had been passing without verifying anything. Isolated per-cluster deltas are not additive when a task changes a global verification mechanism.",
+    "confirmed_real_regressions": 1,
+    "confirmed_real_regression_files": [
+     "compat/node/test/parallel/test-http-write-empty-string.js"
+    ],
+    "timeout_reduction": 414,
+    "note": "The published 44.5% headline was never real: it counted ~300 self-skips as passes on top of unenforced mustCall. 38.2% is the honest round-8 figure measured with the corrected runner."
+   }
+  },
+  {
+   "round": 10,
+   "corpus": "compat/node/test/parallel",
+   "baseline_binary": "r9/integration @ 1b8745e (globals fix included)",
+   "in_progress": true,
+   "tasks": [
+    {
+     "id": "r10/agent-1",
+     "cluster": "repl restoration + global-replacement root cause",
+     "worklist_files": 94,
+     "cluster_homogeneity": "high",
+     "target_delta_pass": 55,
+     "actual_delta_pass": 55,
+     "hit_rate": 1.0,
+     "wall_clock_min": 50,
+     "note": "Target hit exactly. The brief's stated root cause was directionally right but wrong about the agent: node:domain (eagerly required by node:repl) replaced globalThis.setTimeout/setInterval/setImmediate/queueMicrotask on first require, standing in for the async_hooks init hook mbun lacks; node's common pins those four by value at load. 43 of 94 files died on that one line. Naming a suspected cause in the brief did not mislead the agent — it re-derived it."
+    },
+    {
+     "id": "r10/agent-3",
+     "cluster": "http2 + tls",
+     "worklist_files": 400,
+     "cluster_homogeneity": "medium",
+     "target_delta_pass": 50,
+     "actual_delta_pass": 75,
+     "hit_rate": 1.5,
+     "wall_clock_min": 77,
+     "note": "Delivered 1.5x target on a 400-file MEDIUM-homogeneity list, which the round-9 calibration would not have predicted. Cause: the agent ran 8 build->measure cycles with a zero-regression gate at each, re-clustering after every one, instead of one large blind change. Method, not cluster shape, drove the result — the calibration should account for iteration count, not only homogeneity.",
+     "self_reported_wall_clock_min": 195,
+     "self_report_discrepancy": "The agent reported ~3h15m end to end; dispatch-to-completion was ~77-80 min by wall clock and by the harness timer. Agent self-estimates of elapsed time are unreliable and are not used as the recorded value."
+    },
+    {
+     "id": "r10/agent-2",
+     "cluster": "node:http",
+     "worklist_files": 295,
+     "cluster_homogeneity": "looked heterogeneous, was one missing layer",
+     "target_delta_pass": 60,
+     "actual_delta_pass": 170,
+     "hit_rate": 2.83,
+     "wall_clock_min": 111,
+     "note": "Largest single-task result recorded. test-http-* 102 -> 272 pass; 0 regressions on all three guard sets. Also closed round 9's only confirmed real regression (test-http-write-empty-string) and the deeper bug behind it: net.Socket._flush stopped at the first zero-byte write, so an empty chunk parked every byte behind it forever — which silently lost the SECOND response on every keep-alive connection. Separately, pipelined intake dropped bytes because push() runs the handler synchronously and the parser could be replaced mid-loop; a 10,000-request pipeline stalled at exactly 1771 and now completes in 1.9s.",
+     "estimate_miss_cause": "Under-estimated by 2.8x. The 76 bare `AssertionError` files in this cluster were not 76 causes, they were mostly ONE: node:http was a shape-only stand-in with a second, incompatible ServerResponse living in the transport layer. Translating node's five _http_*.js files instead of extending the stand-in converted 148 files in a single change. cluster_finder's signature view cannot see this, because a missing LAYER surfaces as many unrelated assertion texts rather than one repeated signature."
+    },
+    {
+     "id": "r10/agent-4",
+     "cluster": "primordials + internalBinding",
+     "worklist_files": 305,
+     "cluster_homogeneity": "high (one named wall, iterated)",
+     "target_delta_pass": 45,
+     "actual_delta_pass": 45,
+     "hit_rate": 1.0,
+     "wall_clock_min": 45,
+     "probe_result": {
+      "primordials_alone": "8/305 = 2.6%",
+      "primordials_plus_internalBinding": "45/305 = 14.8%",
+      "verdict": "Closes a question deferred twice. primordials alone reproduces the prior 2/60 (~3%) at 5x the sample; internalBinding does ~90% of the work (primordials contributes ~5 of the 45). The gate (>=10%) cleared on cycle 3 of 7."
+     },
+     "iterative_evidence": {
+      "per_cycle_delta": [
+       8,
+       13,
+       14,
+       4,
+       3,
+       1,
+       2
+      ],
+      "cycles": 7,
+      "single_blind_change_would_have_reached": 21,
+      "actual": 45,
+      "what_made_it_iterable": "internalBinding was stubbed to THROW with the missing binding's name, so each cycle's log histogram named the next densest wall exactly. The instrumentation, not the guesswork, drove the targeting."
+     },
+     "security_verified_independently": "primordials / internalBinding / getInternalBinding are wrapper parameters, never globals, gated on TWO independent conditions (bare `internal/...` specifier AND resolved path under a lib/internal/ directory). Coordinator re-verified on the composed binary: ordinary user code sees all three undefined; a package shipping node_modules/internal/foo.js resolves normally but receives undefined for both; a relative ./lib/internal/bar.js receives undefined; enumerable globals remain exactly 15 with no leak (checked deliberately against round 9's 265-file enumerable-globals incident).",
+     "fragility_found": "require('internal/x') resolves ONLY because node's own compat/node/tsconfig.json maps internal/* -> ./lib/internal/*, and mbun's resolver honours tsconfig `paths`. Nobody wired this deliberately. It works solely inside the node checkout — which is also what makes the gate safe — but the capability silently depends on a file in the read-only upstream corpus."
+    },
+    {
+     "id": "r10/agent-6",
+     "cluster": "node:cluster + node:test runner",
+     "worklist_files": 136,
+     "cluster_homogeneity": "selected by the green-ratio heuristic, not by signature",
+     "target_delta_pass": 45,
+     "actual_delta_pass": 73,
+     "hit_rate": 1.62,
+     "wall_clock_min": 105,
+     "split": {
+      "cluster": "11/83 -> 76/83 green (+65), timeouts 3 -> 0",
+      "runner": "10/77 -> 18/77 green (+8)"
+     },
+     "note": "Second validation of the green-ratio heuristic: cluster was 13.3% green and node:cluster turned out to be a STUB whose fork() returned a bare EventEmitter. Translating node's lib/cluster.js + lib/internal/cluster/* was +38 on its own, then NODE_HANDLE/SCM_RIGHTS descriptor passing +17. Signature clustering had shown these 45 files as a `global code@...` bucket, i.e. just 'a top-level throw' — no usable signal.",
+     "iterative_evidence": {
+      "per_cycle_delta": [
+       38,
+       17,
+       9,
+       6,
+       3,
+       0
+      ],
+      "cycles": 6,
+      "note": "Cycle 5's +3 came from finding that the last three hangs were ONE runtime bug, not a cluster bug — visible only after cycles 1-4 cleared."
+     },
+     "runtime_bug_found": "A descriptor received over SCM_RIGHTS never went through accept()/connect(), so it was absent from the net reactor's poll set: netn_wait_cb never watched it and the pump parked up to 60s with a FIN sitting unnoticed. Non-deterministic, so it had been reading as flakiness rather than a bug. Also NODE_HANDLE_ACK was missing, so a parent that handed over a socket never exited.",
+     "stop_condition": "Met: re-clustering showed no remaining cause above 2 files. 7 named survivors.",
+     "ceiling_identified": "node:test runner, 55 files, is subsystem-scale not cleanup. Two causes hold 23: node's --test CLI (18) and run() returning a TestsStream of test:pass/test:fail events with per-file child processes (5+). Neither is reachable by patching the current in-process runner; both need lib/internal/test_runner/* ported."
+    },
+    {
+     "id": "r10/agent-7",
+     "cluster": "node:https + node:dgram",
+     "worklist_files": 106,
+     "cluster_homogeneity": "selected by the green-ratio heuristic",
+     "target_delta_pass": 50,
+     "actual_delta_pass": 63,
+     "hit_rate": 1.26,
+     "wall_clock_min": 90,
+     "split": {
+      "dgram": "29/76 -> 69/76 green (+40)",
+      "https": "4/63 -> 27/63 green (+23)",
+      "tls_side_effect": "46 -> 56 (+10)",
+      "guard_total": "432/904 -> 509/904 (+77)"
+     },
+     "note": "THIRD confirmation of the green-ratio heuristic in one round. Both were stand-ins: node:https did not exist at all (node_http.cppm built the https module from the SAME makeExports() as http, so https.createServer() returned http's shape-only EventEmitter with no listen() and no TLS - 21 files died on `server.listen is not a function` alone), and node:dgram was a ~120-line stand-in whose Socket owned the fd directly instead of node's UDP-handle/Socket split.",
+     "iterative_evidence": {
+      "cycles": 9,
+      "note": "Cycle 2 REGRESSED dgram 63->48 and that regression is what found the real bug. Routing the handle's default lookup through dns.lookup (node parity) exposed that an in-flight resolver request held nothing in the loop, so the pump took a 60s poll() park. Chasing that revealed dgram fds were never in net_fds() at all - the set the pump parks on - so EVERY dgram receive had been riding luck about pump ordering, completing only when an unrelated timer cut a park short. Registering them was +18 in one change. Without the regression forcing the question, that latent bug would have shipped."
+     },
+     "refused_on_security_grounds": "NODE_TLS_REJECT_UNAUTHORIZED=0 deliberately NOT implemented. It is the sole cause for 3 files (test-https-{client-get-url,client-override-global-agent,strict}) and is documented node behaviour, but it is an env-var TLS verification bypass and the agent declined to add one unilaterally. Needs a maintainer decision; one-line change if green-lit.",
+     "merge_debt": {
+      "files": 6,
+      "cost": "cluster 76/83 -> 73/83",
+      "names": [
+       "test-cluster-dgram-1.js",
+       "test-cluster-dgram-2.js",
+       "test-cluster-disconnect-unshared-udp.js",
+       "test-dgram-bind-socket-close-before-cluster-reply.js",
+       "test-dgram-cluster-bind-error.js",
+       "test-dgram-cluster-close-during-bind.js"
+      ],
+      "cause": "agent-6 had added cluster integration (cluster._getServer for a worker's shared UDP handle; closing a handle handed over after the socket already closed) INSIDE the dgram stand-in. agent-7 branched before that landed, so its translation does not carry it, and taking the translation dropped it. Hand-writing the port into 1028 lines of unfamiliar translated code risked a subtle break, so the cost was MEASURED (6 files, all timeout) rather than guessed. Well-scoped follow-up: port the cluster._getServer path into js_dgram.cppm's Socket.prototype.bind, inside the lookup callback where node puts it.",
+      "net_effect": "72 gained, 6 lost on the same four subsystems = +66 net"
+     }
+    },
+    {
+     "id": "r10/agent-8",
+     "cluster": "node:http2 tail (SECOND pass over an already-worked list)",
+     "worklist_files": 167,
+     "cluster_homogeneity": "medium",
+     "target_delta_pass": 40,
+     "actual_delta_pass": 51,
+     "hit_rate": 1.28,
+     "wall_clock_min": 109,
+     "split": {
+      "http2": "104/272 -> 154/272 green (38.2% -> 56.6%)",
+      "guard_1027_files": "501 -> 552"
+     },
+     "iterative_evidence": {
+      "per_cycle_delta": [
+       8,
+       8,
+       15,
+       9,
+       11
+      ],
+      "cycles": 5,
+      "single_blind_change_would_have_reached": 15,
+      "note": "A SECOND pass over a list a previous agent had already declared free of causes above 5 files still yielded +51. The previous 'no cause above 5 files' verdict was true of the SIGNATURES and false of the underlying causes — the +15 cycle was one missing layer (Http2Stream must be a stream.Duplex, not an EventEmitter; both halves re-emitted 'data' straight out of the frame parser, so pipe(), bufferSize, pause(), writableLength, readableEnded and util.inspect all failed for one reason)."
+     },
+     "stop_was_budget_not_evidence": "Per-cycle deltas were still +9 and +11 when it stopped. The agent said so explicitly and estimated a third pass at +15 to +25. This is the first task in the record whose stop condition was NOT met — worth re-dispatching rather than treating the cluster as done.",
+     "regressions": 1,
+     "regression_detail": "test-http2-session-graceful-close: client.on('goaway') never fires because the compat response's 'finish' now arrives after the client's 'end', so session.close()'s GOAWAY is written too late. Three fixes were attempted; each traded it for 2-3 other files, so all were reverted and the file left red. Disclosed rather than absorbed — the first non-zero regression count in the record.",
+     "bugs_found_beyond_the_cluster": [
+      "An EOF push does not end a Duplex nobody read: a Duplex runs its end check from read(). node's onStreamClose pokes it with read(0) (or resume()s a never-read server stream). Without that, six previously-green files hung the full timeout.",
+      "net.Socket.destroy() discards its write queue, so session.close() was destroying the GOAWAY it had just written.",
+      "RST_STREAM must wait for buffered writes: write(a); write(b); end(); close() put only `a` on the wire.",
+      "The http2 client wrote an unconditionally EMPTY SETTINGS frame, silently dropping everything passed to http2.connect(url, {settings}) — including the ENABLE_PUSH=0 a peer reads to decide whether it may push."
+     ],
+     "refused_on_correctness_grounds": "3 files assert `session instanceof ServerHttp2Session` against NODE's class, which mbun's session cannot satisfy without faking Symbol.hasInstance. Judged that weakening the assertion and stopped."
+    },
+    {
+     "id": "r10/agent-9",
+     "cluster": "node permission model (+ trace/snapshot verdicts)",
+     "worklist_files": 106,
+     "cluster_homogeneity": "selected by the green-ratio heuristic",
+     "target_delta_pass": 35,
+     "actual_delta_pass": 43,
+     "hit_rate": 1.23,
+     "wall_clock_min": 102,
+     "split": {
+      "permission": "0/51 -> 43/51 on the work-list; whole subsystem 2/60 -> 45/60",
+      "trace": "0 (verdict: not worth it)",
+      "snapshot": "0 (verdict: not worth it)"
+     },
+     "security": {
+      "before": "--permission was accepted, enforced NOTHING, and process.permission did not exist — a user believed they had a sandbox and had none.",
+      "after": "Real enforcement in C++ at the syscall boundary, verified independently by the coordinator on the composed binary: fs read/write, spawn and path traversal all ERR_ACCESS_DENIED under --permission; process.permission is an object; and the model is INERT with the flag off (no false denials).",
+      "boundary": "All 21 __mbunFsNative entries + __mbunFdNative.open (the only route to the filesystem in this runtime, so bypassing node:fs is denied identically), the five spawn bridges at the fork, worker_spawn_host, napi_dlopen, ffi_dlopen, netn_connect/listen, dgram bind/send, DNS at submit_ (no query enqueued), the WASI constructor, and the module loader's read hook.",
+      "self_found_holes": "Two holes found by probing its own work and closed: DNS was not gated on Net, and bun:ffi REPORTED denied while actually open.",
+      "residual": [
+       "--allow-inspector is answered correctly but there is no inspector to gate (unimplemented, not bypassable)",
+       "denials raised inside the C++ fs gate do not publish to node:permission-model:fs (observability only; the gate must not re-enter JS mid-syscall)",
+       "audit mode logs in mbun's format, not node's ProcessWarning shape"
+      ]
+     },
+     "third_verification_defect": {
+      "defect": "assert.throws ignored its error argument entirely: (fn, e, m) => { try { fn(); } catch (_) { return; } ... }. So assert.throws(fn, {code:'ERR_X'}) passed for ANY throw, and assert.throws(fn, common.expectsError({...})) never called the validator.",
+      "why_it_was_a_prerequisite": "Without fixing it, test-permission-child-process-cli would have 'passed' while the denial threw the wrong error — i.e. the permission work could not be honestly measured at all.",
+      "impact": "49 green->non-green across the guard sets; 48 individually verified as vacuous passes by re-running with the old no-op restored. The 49th (test-dgram-exclusive-implicit-bind) is pre-existing flaky: 2/8 pass on the PRE-round binary, 3/8 on this one.",
+      "coordinator_error": "This is the third verification-mechanism defect of the round, after self-skips-as-passes and unenforced mustCall. My own recorded rule says such a task must be SEQUENCED FIRST; I had two agents already running on a pre-fix base when it landed, so their baselines contain vacuous passes. Both were notified rather than left to discover it in integration."
+     },
+     "verdicts_on_secondary": {
+      "snapshot": "24 files, 0% conversion. Wall: V8 startup snapshots — 18 of 24 logs name it directly. Every file spawns --build-snapshot then consumes the blob; JSC has no serialize-heap-to-blob API. Faking one would still fail the reproducible-bytes and --build-snapshot-config assertions.",
+      "trace": "31 files, 0% conversion. Wall: no trace-event emission. 22 of 31 die on an existsSync(node_trace.1.log) check. A writer alone clears only that check; each file then greps for its own subsystem's event names. Symptom cluster with ~N independent causes; a Chrome-trace writer plus metadata events would plausibly convert 3-6 of 31."
+     }
+    },
+    {
+     "id": "r10/agent-10",
+     "cluster": "10 known regressions + http2 third pass",
+     "worklist_files": 126,
+     "cluster_homogeneity": "mixed (repair + tail)",
+     "target_delta_pass": 28,
+     "actual_delta_pass": 31,
+     "hit_rate": 1.11,
+     "wall_clock_min": 88,
+     "split": {
+      "regressions": "10 of 10 closed",
+      "http2": "154/272 -> 175/272 (+21) against a +18 target",
+      "bonus": "test-dgram-exclusive-implicit-bind also converted"
+     },
+     "corrected_the_brief": {
+      "my_hypothesis": "I told it the dns regression was a leaked `pending` count that held the loop open.",
+      "actual_cause": "The pending count was CORRECT. DnsAsyncState had ONE worker thread and a resolver query blocks it for the whole query budget (8s at node's defaults). node's dgram resolves the destination through dns.lookup before every send(), so a test whose fake nameserver is a dgram socket IN THE SAME PROCESS deadlocks: the lookup for its reply is queued behind the very resolve it would unblock.",
+      "lesson": "A coordinator hypothesis stated in a brief is a hint, not a finding. This one was wrong in mechanism while right about the symptom, and the agent measured its way to the real cause instead of implementing mine."
+     },
+     "perf_finding": {
+      "measure": "dns.lookup on a literal IP",
+      "before_ms": 8011,
+      "after_ms": 3,
+      "note": "A grow-on-demand worker pool replaced the single thread. This is a 2670x improvement on one of the most common calls in any networked program, and it was invisible as a perf problem because it only showed up as corpus TIMEOUTS."
+     },
+     "assert_throws_discipline": "Checked all 22 files it converted: none uses assert.throws / assert.rejects / expectsError, so none of its gains is vacuous through that hole. It then deliberately did NOT work the 8-file `Missing expected exception` bucket, because that bucket's oracle was broken on its base — flagged for re-triage on the merged branch instead of banking unreliable wins.",
+     "guard_derived_from_diff": "Followed the new rule: diff touched runtime/dns.inc, js_dgram.cppm, js_http2.cppm, builtins/node_cluster.cppm and builtins/process_web.cppm, so it widened the guard by 283 test-child-process/process/worker files AND measured a true baseline for them by reverting the five files and rebuilding, rather than assuming. Total guard 1809 files, 1160 -> 1181, REGRESSIONS 0.",
+     "measured_negative_recorded": "Force-finishing a client session's OPEN streams on teardown (rather than only pending ones) cost 5 files; reverted, and the commit message names which 5 so nobody retries it.",
+     "stop_condition": "Both conditions met: cycle 6 delivered +0, cycle 5 delivered +1, and it verified by opening each assertion site that the remaining 9-file AssertionError bucket is 9 unrelated causes."
+    },
+    {
+     "id": "r10/agent-11",
+     "cluster": "node:tls + node:dns",
+     "worklist_files": 172,
+     "cluster_homogeneity": "medium (second pass over tls)",
+     "target_delta_pass": 45,
+     "actual_delta_pass": 36,
+     "hit_rate": 0.8,
+     "wall_clock_min": 114,
+     "split": {
+      "tls": "56/215 -> 74/215 (+18)",
+      "dns": "2/29 -> 12/29 (+10)",
+      "free_elsewhere": "https +3, net +3, http +2",
+      "guard_1370": "708 -> 744, 0 regressions"
+     },
+     "shortfall_stated": "62% of target in-cluster, reported as a shortfall rather than padded. Both stop conditions were met (no homogeneous cause above 5 files; last two cycles +3 and +2) over 8 cycles.",
+     "SECURITY_VULNERABILITY_FOUND": {
+      "severity": "high — certificate validation bypass",
+      "class": "null-prefix certificate spoofing, CVE-2009-2408 class",
+      "defect": "subjectAltName was read with ASN1_STRING_to_UTF8 and handed over as a C string, so a DNS altname TRUNCATED AT AN EMBEDDED NUL. A certificate for `good.example.org\\0.evil.example.com` read back as plain `good.example.org`, and checkServerIdentity then matched it against the victim host. An embedded comma likewise forged an extra list entry.",
+      "impact": "An attacker holding a certificate for a domain they control could have it accepted as valid for a domain they do not, over TLS, with verification enabled. This is a real exploitable bypass, not a compatibility gap.",
+      "fix": "Translated from node's deps/ncrypto/ncrypto.cc IsSafeAltName / PrintAltName / PrintGeneralName: raw ASN1_STRING_get0_data + ASN1_STRING_length (never ASN1_STRING_to_UTF8), rejecting '\"', '\\\\', ',', '\\'' and anything outside printable ASCII (which catches NUL), with node's exact quoting/escaping for unsafe values.",
+      "verification": "Coordinator-verified independently: node's OWN regression test for this CVE, test-tls-0-dns-altname.js — whose header comment reads \"Check getPeerCertificate can properly handle '\\0' for fix CVE-2009-2408\" — now passes (exit 0). I also inspected the implementation and confirmed it uses raw bytes with an explicit length rather than a NUL-terminated string. My own attempt to hand-craft a malicious certificate did NOT reproduce the injection, because openssl's config parser sanitises the input into legitimate separate SAN entries; the corpus test is the reliable oracle here and it is the one node ships for exactly this."
+     },
+     "second_security_defect": {
+      "defect": "options.ciphers was validated and then DROPPED — a caller's cipher restriction had no effect at all.",
+      "impact": "A security control that silently does nothing is worse than an absent one: code auditing as hardened was not.",
+      "fix": "SSL_CTX_set_cipher_list where node does it, and an unmatchable list is a HARD failure (ERR_SSL_NO_CIPHER_MATCH) rather than a silent fallback to a broader default.",
+      "also": "tls.DEFAULT_CIPHERS copied verbatim from node — a restriction of OpenSSL's default, preserving !aNULL:!eNULL:!EXPORT:!DES:!RC4:!MD5:!PSK:!SRP:!CAMELLIA."
+     },
+     "declined_rather_than_weaken": [
+      "NODE_TLS_REJECT_UNAUTHORIZED=0 (per instruction; still pending a maintainer decision)",
+      "NODE_EXTRA_CA_CERTS — 2 files, extends the trust store",
+      "padding tls.rootCertificates so sort() throws — 2 files, would add CAs to satisfy a test",
+      "remapping UNABLE_TO_GET_ISSUER_CERT_LOCALLY -> UNABLE_TO_VERIFY_LEAF_SIGNATURE — 4 files; the code reflects what the verifier actually concluded"
+     ],
+     "assert_throws_discipline": "Acted on the warning: hand-verified 32 error shapes (code + name + exact message) with standalone probes, which caught a genuine vacuous pass — test-tls-basic-validations asserts `Received type number (1)` while mbun emitted `Received 1`, using inspect where node uses determineSpecificType. Fixed and re-verified 32/32.",
+     "guard_derived_from_diff": "Followed the rule and it paid: the diff touched crypto_asym.inc, which also feeds crypto.X509Certificate — a subsystem the brief's guard list did NOT name. It extended the guard by 342 diff-derived files (crypto 129, cluster 80, dgram 76, webcrypto 47) and built a true f628517 binary to baseline them. 236 -> 236, 0 regressions.",
+     "environmental_flag": "test-tls-min-max-version + 6 test-tls-cli-*-version dependents now reach the TLSv1/TLSv1.1 rows, where the peer answers `tlsv1 alert protocol version` despite ciphers ALL@SECLEVEL=0 and an explicit floor. Looks like the linked OpenSSL 3.1.5 refusing legacy protocols below its configured policy — flagged as possibly environmental rather than fixable in mbun."
+    },
+    {
+     "id": "r10/agent-12",
+     "cluster": "node:test runner",
+     "worklist_files": 57,
+     "cluster_homogeneity": "brief claimed high; MEASURED to be a symptom cluster",
+     "target_delta_pass": 25,
+     "actual_delta_pass": 10,
+     "hit_rate": 0.4,
+     "wall_clock_min": 87,
+     "split": {
+      "runner": "17/77 -> 26/77 (22.1% -> 33.8%)",
+      "guard_869": "400 -> 415 pass"
+     },
+     "coordinator_brief_error": {
+      "what_I_wrote": "I passed the previous agent's verdict along as if it were a root cause: '--test CLI and run()/TestsStream hold 23 files, those two alone'.",
+      "reality": "Both are SYMPTOM clusters. --test now works end to end (verified by hand: TAP document, NODE_DEBUG config dump, discovery, exit codes) and converted only 2 of ~24 files, because each of the others asserts on a DIFFERENT unimplemented thing behind it: tracingChannel('test'), coverage, watch mode, snapshots, randomize/seeds, per-file worker IDs, declaration-order event buffering, reporter flush under --test-force-exit. test-runner-run.mjs alone has ~40 subtests spanning watch mode, abort signals, coverage and rerun state.",
+      "lesson": "compat/README.md already predicts this exactly, and I made the mistake anyway by inheriting a file COUNT as if it were a cause. A previous agent's 'N files share this' is a signature grouping until someone has verified the shared mechanism. Restate it as a hypothesis in the brief, never as a premise.",
+      "agent_self_critique": "It noted it should have reported the premise was wrong after cycle 5 rather than at the end — a fair criticism I should design for: ask for an early verdict on the brief's premise as an explicit deliverable."
+     },
+     "architectural_finding": {
+      "question": "Translate node's internal/test_runner/* wholesale, or graft its logic into mbun's builtins?",
+      "decided_by_measurement": "8 of node's 17 internal/test_runner modules already load unmodified; all 9 failures shared one cause (No such binding: url). Implementing that binding moved it to 12/17, then the wall named itself twice more (modules, contextify) and stopped at node's internal/modules/cjs/loader.js:440.",
+      "verdict": "GRAFT, translating file by file with PORT-SOURCE: headers. Wholesale translation is blocked structurally: internal/test_runner/test.js hard-requires mock/mock.js, which hard-requires node's COMPLETE CJS and ESM loaders (it uses Module._cache as the live registry plus registerHooks). mbun has its own native loader; installing node's beside it is either dead code or two loaders fighting.",
+      "decisive_point": "Those modules resolve ONLY from a node checkout. A shipped mbun has no lib/internal/, so a 'translation' that works inside compat/ would be measurement-only, not a runtime feature. This constrains every future 'just translate node's lib/' plan and is the most reusable thing the task produced."
+     },
+     "infrastructure_side_win": "internalBinding('url') was worth landing independently of the cluster: it unlocked internal/url, internal/fs/utils and internal/modules/helpers corpus-wide, and 5 of the 16 guard-set gains are OUTSIDE its cluster (fs-open-flags, fs-utils-get-dirents, fs-watch-recursive-linux-parallel-remove, module-main-extension-lookup, url-is-url-internal, watch-file-shared-dependency).",
+     "own_runner_protected": "mbun's own test runner untouched — every new path gated on !globalThis.__mbunBT. Verified by the coordinator after merge: `mbun test` on a bun corpus file gives 13 pass / 0 fail.",
+     "infrastructure_blocker": "`mcpp test -p jsc` COULD NOT BE RUN: it links ~25 test binaries of ~370MB each and produced ZERO binaries in 40 minutes under SAFE_MEM=6G, and again in 40 minutes under SAFE_MEM=24G/TASKS=512. Pre-existing, not caused by this work. It means the project cannot currently run its own jsc test suite on this machine, so 'no regression in modules/jsc' is not a claim anyone can make here. Needs a link-parallelism cap in the build tooling."
+    },
+    {
+     "id": "r10/agent-14",
+     "cluster": "node:util (inspect) + diagnostics_channel + an 8-file http2 re-triage",
+     "worklist_files": 73,
+     "cluster_homogeneity": "selected by the green-ratio heuristic",
+     "target_delta_pass": 30,
+     "actual_delta_pass": 40,
+     "hit_rate": 1.33,
+     "wall_clock_min": 102,
+     "split": {
+      "diagnostics": "25/67 -> 59/67",
+      "util": "5/29 -> 11/29",
+      "http2_retriage": "3 of 8 convert",
+      "guard_1856": "1084 -> 1132"
+     },
+     "FOURTH_diagnosability_defect": {
+      "defect": "assert.strictEqual produced an AssertionError with an EMPTY message and no actual/expected/operator. Coordinator-verified on the pre-round binary: assert.strictEqual(1,2) gives message:\"\" and actual/expected/operator all undefined. After the fix (a port of internal/assert/assertion_error.js) it gives node's full text plus 1 / 2 / \"strictEqual\".",
+      "why_it_matters_beyond_its_own_files": "This is why cluster_finder kept ranking `error: AssertionError` as the corpus's largest cross-subsystem cause — 359 files across 78 subsystems at its peak. That bucket was largely an ARTIFACT: N different failures all rendered identically because the assertion carried no message. The tool was reporting the shape of a broken error formatter, not a shared root cause. Fixing it converted almost nothing by itself and made the whole area triageable.",
+      "lesson": "A signature cluster is only as meaningful as the error text feeding it. Before treating a large single-signature bucket as one cause, check that the failing assertion actually SAYS anything. Three of this round's four largest apparent causes turned out to be artifacts of broken diagnostics (empty AssertionError, self-skips, a no-op assert.throws)."
+     },
+     "perf_gate_respected": {
+      "inspect_80k_calls": "69.0ms -> 68.2ms (flat)",
+      "format": "119.4 -> 125.6ms (+5%, buys node-correct %d/%i/%f/%s)",
+      "assert_message_path": "67.7 -> 68.4ms while emitting 64% MORE message text (329,783 -> 539,566 chars)",
+      "guard_wall_clock": "229s -> 224s",
+      "verdict": "The brief required a perf gate because a previous wholesale util.inspect replacement caused a catastrophic regression. It stayed out of that territory deliberately and the numbers show it."
+     },
+     "measurement_trap_found": "Running the guard set from a binary COPIED OUTSIDE target/ produced 8 phantom regressions: every self-respawning test saw process.execPath === 'mbun' and failed with `spawn mbun ENOENT`. Always measure the binary at its canonical path.",
+     "honest_non_counts": "test-util-styletext moved fail -> skipped (self-skips on 'Could not create TTY fd'); explicitly not counted as a pass. One knowing cross-corpus risk declared: util.parseEnv now returns a null-prototype object per node's contract, where bun's vendored copy of the same test expects a plain object."
+    },
+    {
+     "id": "w2/agent-1",
+     "cluster": "tls -> 100% (wave 2, second pass)",
+     "worklist_files": 204,
+     "target_delta_pass": 115,
+     "actual_delta_pass": 4,
+     "hit_rate": 0.035,
+     "wall_clock_min": 100,
+     "note": "Target was '100% of the subsystem', i.e. +115. Delivered +4 (85->89). The gap is NOT agent underperformance: the brief's two densest leads were both mine and both wrong-sized, and the agent spent budget proving that before it could spend any on code. It also refused to claim zero regressions when its guard showed 70 pass->fail, and was right to: I verified 4 of the named files pass 3/3 standalone, so all 70 were contention artifacts of a --jobs 10 guard.",
+     "leads_i_got_wrong": [
+      "PFX/PKCS#12 (4 files) was briefed as an OpenSSL legacy-provider search-path fix. grep finds only a no-op `loadPKCS12() {}` stub and no `d2i_PKCS12` anywhere: the work is 'write PKCS#12 parsing, then load the provider', an order of magnitude larger than briefed. Check for `d2i_PKCS12` before budgeting those files.",
+      "The security-level cluster was briefed as 'mbun never forwards @SECLEVEL=0'. It does forward it, to SSL_CTX_set_cipher_list. The real remaining gap is narrower: SSL_CTX_set_ciphersuites (TLS 1.3 suites take a different setter) plus --tls-min-v1.x last-flag-wins."
+     ]
+    },
+    {
+     "id": "w2/agent-2",
+     "cluster": "http -> 100% (wave 2, second pass)",
+     "worklist_files": 396,
+     "target_delta_pass": 98,
+     "actual_delta_pass": 2,
+     "hit_rate": 0.02,
+     "wall_clock_min": 100,
+     "note": "Delivered +2 (296->298) and the deliverable I actually asked for first: the 19 http timeouts reduce to 4 shapes, not 19 mechanisms. A: server outlives a dead client flow (10 files; Server{listening} + zero sockets; server.close() sits in a client callback that never fired). B: stalled exchange mid-flight (4). C: sockets outlive a closed server (3). D: no dump, native WTFCrashWithInfo (2) -- these are CRASHES misfiled as timeouts. Not one of the 19 is an event-loop bug, which is the fourth independent confirmation of that classification error.",
+     "budget_breakdown_min": {
+      "triage": 35,
+      "builds_and_measurement": 20,
+      "coding": 30,
+      "guard_and_revert": 15
+     },
+     "lesson": "Budget a full guard cycle INSIDE the estimate, not after it. Its first build read +3 while carrying 5 real regressions; the honest number was -2 until the guard re-ran. An estimate that omits the guard is an estimate of the wrong quantity."
+    },
+    {
+     "id": "w2/agent-3",
+     "cluster": "fs -> 100% (wave 2, second pass)",
+     "worklist_files": 334,
+     "target_delta_pass": 57,
+     "actual_delta_pass": 4,
+     "hit_rate": 0.07,
+     "wall_clock_min": 100,
+     "note": "Delivered +4 (273->277) and one oom-kill->fail (test-fs-readfile: readFileSync now refuses >2**31-1 with ERR_FS_FILE_TOO_LARGE BEFORE allocating; the old code |0-truncated the stat size to int32 and read to EOF). No new native fs entry point, so the --permission gate surface is byte-identical to base -- it stated and evidenced this unprompted. Its 58-file unreached list is per-file with a specific named cause each, which is the most reusable artifact of the wave.",
+     "leads_i_got_wrong": [
+      "'fs.ReadStream/WriteStream translation is your best single move' was STALE: node_fs_streams.cppm (e0ca19c) was already merged in the base two rounds earlier. The remaining stream files are semantics, not absence. I did not check the base before writing the brief."
+     ],
+     "densest_remaining": "FileHandle lock/ref protocol (kLocked/kCloseSync/kClosePromise), 6 files, ~570 lines of fs.promises.ts"
+    },
+    {
+     "id": "r10/self-verify-cluster",
+     "cluster": "verify-error-code mapping (cross-subsystem tls+http2)",
+     "worklist_files": 9,
+     "target_delta_pass": 9,
+     "actual_delta_pass": 3,
+     "hit_rate": 0.33,
+     "wall_clock_min": 40,
+     "executed_by": "me, not an agent (three agents were already at the 1-3 worktree limit)",
+     "miss_cause": "The cluster was correctly identified as ONE cause and the fix did land it -- 7 of 9 files now report node's code. But 'the code is now correct' is not 'the file passes': 6 of them had the wrong code as their FIRST failure and have further ones behind it. I budgeted the cluster by counting files whose log mentioned the code, which measures how many files TOUCH a cause, not how many are BLOCKED ONLY by it. Same shape as the internalBinding lesson: clearing a cause transfers files to the next cause. Budget a cause family by asking 'is this the file's LAST wall?', which the log alone cannot answer.",
+     "what_went_right": "Root cause was measured, not theorised: `openssl s_client` against mbun's own server showed OpenSSL emitting 20 then 21 and returning 21, which named the mechanism in one command. Two of my theories died first -- 'mbun sends a longer chain' (it sends exactly 1 cert) and gating on SSL_get1_peer_certificate (nullptr on this path, and it regressed the working files until I noticed).",
+     "estimate_overrun": "40 min against a ~25 min estimate. The overrun was entirely the two failed attempts plus the 681-file guard, i.e. exactly the 'budget the guard inside the estimate' lesson applied to myself."
+    },
+    {
+     "id": "w3/agent-3",
+     "cluster": "fs.watch + realpath (wave 3, inventory-driven)",
+     "worklist_files": 11,
+     "target_delta_pass": 6,
+     "actual_delta_pass": 10,
+     "hit_rate": 1.67,
+     "wall_clock_min": 49,
+     "note": "First task dispatched with NO triage phase -- causes came pre-named from unreached-inventory.json. Delivered 167% of target in 49 min against a 100-min budget, versus wave 2's 3.7% at 100 min. That is the clearest evidence the bottleneck was the discarded triage, not agent execution. It also ran its guard against TWO separate builds (stash, rebuild, baseline, restore, rebuild) so it had no phantoms to chase.",
+     "security_finding_INDEPENDENTLY_VERIFIED": {
+      "defect": "__mbunWatchNative.start reached inotify_init1/inotify_add_watch with no check at the native boundary. Under --permission a script could watch any directory and enumerate filenames it was never granted.",
+      "precise_shape": "My own verification refines the agent's description. Pre-fix, fs.watch('/etc') WAS denied -- the JS shim checked. What was ungated was the native entry point: RAW globalThis.__mbunWatchNative.start('/etc') returned a watch descriptor. So the gate sat in the shim rather than at the boundary, and every test that went through fs.watch made the runtime look correctly gated. That is a defence-in-depth failure, and it is harder to notice than a missing check.",
+      "my_verification": "On the merged binary: fs.watch('/etc') -> ERR_ACCESS_DENIED, RAW __mbunWatchNative.start('/etc') -> ERR_ACCESS_DENIED, fs.realpathSync.native('/etc') -> ERR_ACCESS_DENIED, fs.watch(<allowed>) -> still works (not over-blocking). On the pre-merge binary the RAW call returned 1. Gated as kFileSystemRead per node's fs_event_wrap.cc classification."
+     },
+     "leads_i_got_wrong": [
+      "The fs-watch mechanism I recorded -- 'a watcher registers as a pollable but holds no fd, so the drain's stall clock never advances' -- is a description of the MANIFESTATION, and the three hangs had three unrelated semantic causes: recursive:'1' not being validated (so a watcher that should never have existed pinned the loop), decodeName ignoring every encoding but 'buffer' (so the hex watcher never recognised its own filename), and an async iterator that had to REJECT with ABORT_ERR instead of ending cleanly. The agent changed nothing in the event loop. FIFTH instance of the manifestation-as-cause error, and the first one I committed to the inventory myself -- I inherited the phrasing from the previous agent's report and recorded it as a cause without testing it.",
+      "test-fs-watchfile-bigint is not '4 Date properties node's zero-row omits'. mbun loads node's REAL internal/fs/utils, so deepStrictEqual fails on PROTOTYPE IDENTITY before comparing any key. Reaching it means having mbun's stats constructed by node's own Stats/BigIntStats -- architectural, adjacent to fs-not-routed-through-internalBinding. The agent deliberately left the date fields alone because the native stat row sets them as own props, so changing only the constructor would desynchronise statSync from new Stats() and risk currently-green test-fs-stat-* files.",
+      "realpath-js-resolver is 2 files, not 3. test-fs-realpath-native requires cwd == the node checkout root; the corpus runner uses cwd=repo root. Pre-change it 'passed' that path silently because weakly_canonical invents non-existent tails; it now honestly throws ENOENT. This is a HARNESS cause, not an fs one, and fixing it means changing the shared runner's cwd -- which would move numbers for every agent mid-wave."
+     ]
+    },
+    {
+     "id": "w3/agent-2",
+     "cluster": "http timeout shapes A and C (wave 3, inventory-driven)",
+     "worklist_files": 13,
+     "target_delta_pass": 6,
+     "actual_delta_pass": 9,
+     "hit_rate": 1.5,
+     "wall_clock_min": 77,
+     "note": "Second inventory-driven task, second overshoot: 150% of target, 0 regressions. pass 514->523, timeout 49->41 across 734 test-http*/test-https* files. Two mechanisms, both real reactor/protocol bugs: (1) node's socketOnClose -> abortIncoming/abortOutgoing was entirely absent, so req 'aborted'/'close'/signal never fired and the client callback holding server.close() never ran; needed node's per-connection state.incoming LIST because a pipeline has several live at once. (2) the reactor held the loop for every OPEN socket where libuv holds it for every ACTIVE one, so an allowHalfOpen socket that had seen EOF pinned the process forever.",
+     "traps_it_recorded": [
+      "The abort must share freeParser's existing one-turn deferral. Eager abort gained 5 and cost 3 (all on a req.on('end') that stopped firing) -- exactly what the freeParser comment already warned about. Net was +2 until deferred.",
+      "socketOnError ended in a bare destroy() under a comment asserting node hides the error from socket listeners. The comment's PREMISE was wrong: node ends with this.destroy(e), and that argument is what emits the socket 'error'; node hides it only from a server with no listener, via its own noop. Fixing it also flipped test-http-header-overflow."
+     ],
+     "my_process_error_it_exposed": {
+      "symptom": "its first guard read -2 with three pass->fail",
+      "agent_diagnosis": "build-environment drift -- fresh prebuilts pulled between two builds of the same commit",
+      "actual_cause": "MINE. Agents were dispatched at base e2bd37d but took their BASELINE BINARY from the integration worktree, and I kept committing and rebuilding there while they worked. By measurement time that binary carried 6acbb34 (tls verify) and 8009cfc (debuglog). The three files map exactly onto those two commits: test-tls-friendly-error-message and test-tls-socket-default-options on the verify code, test-repl-history-init-fail-leak on 'testEnabled is not a function'. Verified by commit ancestry: neither commit is in e2bd37d.",
+      "why_the_distinction_matters": "Recording 'prebuilts drift within a session' would have sent the next round chasing something that does not exist. The integration worktree's binary is a moving target BY CONSTRUCTION; same-commit was never the question.",
+      "fix_now_policy": "Snapshot the base binary at dispatch (cp to a stable path) and hand agents that path. Same trick already in use to let a multi-hour corpus run survive integration work. Recorded in compat/README.md.",
+      "credit": "The agent's remedy was right even though its diagnosis was not: it rebuilt its own control from its own base in its own worktree, which is what caught this at all."
+     },
+     "leads_i_got_wrong": [
+      "http-timeout-shape-D DID NOT EXIST. I recorded 2 files as dying in native WTFCrashWithInfo, inherited from a wave-2 agent report. Measured independently: all 49 remaining test-http* timeouts exit 124 and not one log contains WTFCrash/SIGSEGV/SIGABRT/Segmentation text. A crashing process exits on a signal and never reaches the timeout kill, so crash and 124 are mutually exclusive. One of the two 'no dump' cases was hang_dump.js's own limitation: it REQUIREs its target, so a process.argv[2]-dispatched re-exec test throws instead of running. Entry deleted; the limitation is now documented in the tool.",
+      "Shape A is 10 files by DUMP SIGNATURE but 5 by cause. The other 5 share the signature and nothing else (2 need --expose-gc/FinalizationRegistry, 2 are destroySoon, 1 is cluster). A dump signature groups files by what the loop looks like when they stop, which is downstream of the cause -- the log-text trap in a better disguise."
+     ]
+    },
+    {
+     "id": "w3/agent-1",
+     "cluster": "FileHandle protocol + fs one-offs (wave 3, inventory-driven)",
+     "worklist_files": 21,
+     "target_delta_pass": 8,
+     "actual_delta_pass": 11,
+     "hit_rate": 1.38,
+     "wall_clock_min": 93,
+     "note": "Third inventory-driven task, third overshoot. Full-corpus before/after (4433 files, not a sample): 2359 -> 2370 pass, 0 pass->fail, 0 pass->timeout. It chose the whole corpus as its guard because the fs filter costs ~95s per 874 files, so a full before/after was cheaper than justifying a subset -- and that left zero phantom leads to chase.",
+     "it_declined_my_mis_sized_lead_and_was_right": "I briefed filehandle-lock-ref-protocol as '6 files, ~570 lines of node's fs.promises.ts, translate it'. Two independent reasons that is wrong, both cheap to check and neither checked by me. (a) 3 of the 6 carry '// Flags: --experimental-stream-iter' and drive require('stream/iter'); in node 26 fh.pull/pullSync/writer exist ONLY inside that flag's branch. It is a stream/iter-over-an-fd task, not fs. (b) The other 3 do const {FileHandle} = require('internal/fs/promises'), patch FileHandle.prototype.fd, then call fs/promises.*. That only works if fs/promises IS internal/fs/promises. In mbun they are two different classes -- fs/promises is mbun's own object in bootstrap.cppm while require('internal/fs/promises') resolves via compat/node/tsconfig.json paths to node's real lib. Translating 570 lines into mbun's class changes nothing because the test never touches it. Real size: fold into fs-not-routed-through-internalBinding, an architectural round.",
+     "leads_i_got_wrong": [
+      "fs-one-off UNDERCOUNTS badly. The fs set had 57 fail + 5 timeout on that base; my inventory listed 15. FIVE of its ELEVEN gains had no inventory row at all (test-fs-write-file-flush, -append-file-flush, -stat-abort-test, -write-file-sync, -lchown). A third of the delta came from files the inventory did not know were red -- so the inventory's coverage, not just its accuracy, is a gating factor.",
+      "test-fs-readfile was NOT 'only the AbortSignal validation'. It also needed a nextTick-ordering fix, and that points at a GENERAL untouched defect: mbun drains process.nextTick and promise microtasks as ONE FIFO, so a queueMicrotask-deferred fs callback runs BEFORE a nextTick-scheduled abort(). Fixed narrowly with setImmediate; the general defect -- nextTick has no priority over microtasks -- is still owed and will keep producing this shape.",
+      "test-fs-truncate's EACCES errno mapping was the SYMPTOM. The cause is that mbun never applied node's len = MathMax(0, len); both failures were truncate(f, -1). The clamp is what moved the file.",
+      "test-fs-readdir-stack-overflow is not an fs bug at all. JSC's engine-level message is 'Maximum call stack size exceeded.' for ALL recursion -- a bare function r(){return r()} reproduces it. Fixing it means overriding the engine's RangeError text. Reclassify out of fs-one-off."
+     ],
+     "new_defects_it_found_while_probing": [
+      "fs.unlinkSync(<nonexistent>) does not throw -- std::filesystem::remove returns false rather than setting ec",
+      "fs.chmodSync(<nonexistent>) throws with NO .code/.errno/.syscall/.path",
+      "fs.renameSync(<nonexistent>, x) likewise carries none of them",
+      "fs.linkSync is implemented as COPYFILE: .syscall === 'copyfile', .path is the mangled \"src' -> 'dest\" string, .dest undefined",
+      "fs.readlinkSync(<nonexistent>) gives EINVAL where node gives ENOENT"
+     ],
+     "tooling_defect_it_exposed_in_my_runner": "--max-seconds could not bound a fresh full run: the deadline was checked before each executor.submit(), but submit returns immediately, so all 4433 futures were queued within milliseconds against a clock that had barely moved. Fixed with a bounded feeder (~2x jobs in flight, deadline re-checked as real work completes). Verified: 600 files with --max-seconds 20 now stops at 82 and reports remaining=518 instead of running all 600.",
+     "brief_error": "my brief said cd .claude/worktrees/wt1; worktree_setup.sh wt1 actually creates <repo>/wt1"
+    },
+    {
+     "id": "w4/agent-tls",
+     "cluster": "tls (wave 4, inventory-driven)",
+     "worklist_files": 135,
+     "target_delta_pass": 14,
+     "actual_delta_pass": 16,
+     "hit_rate": 1.14,
+     "wall_clock_min": 66,
+     "note": "tls+https 128/263 -> 144/263 (48.7% -> 54.8%). 0 regressions on a 280-file subsystem guard AND a 418-file cross-subsystem guard where every bucket was byte-identical -- it ran the second one because its keylog work touched js_net.cppm _poll, which every socket goes through. That is the right instinct: guard by what the diff TOUCHES, not by what it targets.",
+     "estimate_overrun": "Roughly 40 of its ~106 minutes went to a toolchain mismatch that names nothing (see below), so the delivered rate against ACTUAL working time is closer to 16 in 66 minutes.",
+     "found_a_cluster_the_inventory_did_not_have": "TLS session resumption is entirely absent (getSession returns undefined, setSession is a no-op, the reactor never emits 'session'). One mechanism covers 8 files that sat SPLIT ACROSS THREE existing buckets, so every previous brief under-budgeted all three. Lesson: per-bucket ranking cannot see a cause that spans buckets -- the inventory needs a periodic pass that asks 'what single change would close files in more than one bucket?'",
+     "leads_i_got_wrong": [
+      "tls-protocol-method-validation: the CAUSE was stale even though the SIZE was right. SSLv2/v3_method rejection already worked -- those subcases were passing. The real blockers were secureProtocol version-window semantics (node never passes min=max=0; SSLv23_method lowers only the ceiling) and the fact that --tls-min-v1.x is NOT last-flag-wins -- lib/tls.js is a fixed if/else chain so the WIDEST flag wins wherever it sits. I briefed last-flag-wins explicitly and it was wrong.",
+      "tls-connect-duplex-transport is 7 files, not 6: test-tls-socket-snicallback-without-server was filed under tls-mustcall-never-fired but drives a TLSSocket over stream.duplexPair().",
+      "The @SECLEVEL/ciphersuites lead was sized right but UNDERRATED -- SSL_CTX_set_ciphersuites was worth 2 files directly and unblocked a third that was hiding behind it."
+     ],
+     "my_wrong_public_diagnosis": "I published, in a commit message and on PR 32, that deleting build.ninja is not a safe reset because it left a worktree unable to build. False. The global ~/.mcpp/config.toml toolchain default had been flipped to gcc 15.1.0 and the project needs 16.1.0; the deletion merely forced a reconfigure that picked up the wrong default. Verified by restoring the default and rebuilding the same worktree with build.ninja still absent. build_or_die.sh now checks this before building.",
+     "environment_hazard": "An agent modified ~/.mcpp/config.toml -- a GLOBAL user config outside the repo. Worktree isolation does not cover $HOME, so one agent's environment change is every concurrent agent's."
+    },
+    {
+     "id": "w4/agent-http",
+     "cluster": "http + http2 (wave 4, inventory-driven)",
+     "worklist_files": 112,
+     "target_delta_pass": 12,
+     "actual_delta_pass": 26,
+     "hit_rate": 2.17,
+     "wall_clock_min": 73,
+     "note": "Best rate of any agent so far. http filter 526->552 pass, 41->24 timeout; http2 alone 180->195 pass, 26->17 timeout. Guard 1124 files -- it WIDENED past the brief's filter because one of its changes (events.listenerCount) is global. It also caught a real regression of its own making and fixed it: self-removing the socketOnError listener left an https TLSSocket occupying the last 'error' slot, so a later write-after-end threw; node keeps a permanent noop underneath.",
+     "http2_timeout_histogram": {
+      "B stalled exchange": 18,
+      "B' + the test's own timer": 1,
+      "A dead client flow": 3,
+      "D no dump": 3,
+      "misclassified (exits 1, not 124)": 1
+     },
+     "leads_i_got_wrong": [
+      "http-destroySoon: the CAUSE was wrong. res._last is NOT set by maxRequestsOnConnectionReached -- node's _storeHeader writes 'Connection: close' there without touching _last, and mbun matches, so resOnFinish never called destroySoon() in those files at all. The real cause was the parser rejecting the stray CRLF the test writes between pipelined requests, which llhttp's s_start_req swallows per RFC 9112 2.2.",
+      "http-client-connect-ignores-options-signal: my caveat was wrong AND was refuted the right way -- the agent RAN the test against real node v24.15.0 and it passes. I had guessed a corpus expectation might be unsatisfiable and briefed an agent to be wary of it. node is installed; use it as an oracle.",
+      "reset-flood was filed as a native block and was nothing of the kind -- the server accepted a malformed HEADERS block instead of rejecting it. THIRD time a 'native crash/block' claim dissolved under measurement."
+     ]
+    },
+    {
+     "id": "w4/agent-fs",
+     "cluster": "fs to ceiling (wave 4, inventory-driven)",
+     "worklist_files": 37,
+     "target_delta_pass": 11,
+     "actual_delta_pass": 11,
+     "hit_rate": 1.0,
+     "wall_clock_min": 99,
+     "note": "Target hit exactly. fs 298->309 of 334 live (92.5%). Guarded with the FULL 4433-file corpus on both binaries -- the most rigorous guard any agent has run: baseline 2404, after 2417, one 'regression' that passes 3/3 standalone. Its baseline reading 2404 against my recorded 2403 for the same commit is a 1-file harness variance and is itself a useful calibration.",
+     "declined_item_2_correctly": "I briefed the nextTick-vs-microtask queue split as the highest-leverage item. It did not attempt it and said so plainly: 'I did not measure it, so I make no claim about it', judging a broad event-pump change plus a full re-guard worse value than banking 11 files. That is the right call and the right way to report it.",
+     "measurement_defect_it_found": "node:test's mock had TWO dead features: mockImplementationOnce compared against calls.length, which is incremented BEFORE the implementation runs, so the once-implementation was never selected; and mock.getter/setter used plain assignment, which cannot replace a prototype accessor. Any corpus file relying on either was silently testing the UNMOCKED path -- the same class as the assert.throws defect that removed 126 false passes in an earlier round. Its full-corpus guard shows no pass loss from the fix.",
+     "leads_i_got_wrong": [
+      "test-fs-error-messages' note ('needs fstat in the syscall slot') was stale: it was blocked on readlink ENOENT, and behind that a whole family (close/ftruncate/fdatasync/fsync/chown/utimes/mkdtemp/copyFile/read/write/fchmod/fchown/futimes) all had to raise node's EBADF/ENOENT.",
+      "fs-one-off UNDERCOUNTS AGAIN -- 7 of its 11 gains had no inventory row. Second wave running: the inventory's COVERAGE, not its accuracy, is now the binding constraint.",
+      "test-fs-cp-async-file-url is a HARNESS cause (relative-to-cwd fixture path, same as test-fs-realpath-native), not the 'import.meta.url/__dirname bug' I recorded."
+     ]
+    },
+    {
+     "id": "w7/net-dgram",
+     "cluster": "net+dgram worklist (round 14, long-tail protocol)",
+     "worklist_files": 12,
+     "target_delta_pass": 6,
+     "actual_delta_pass": 9,
+     "hit_rate": 1.5,
+     "note": "test-net 95->107, test-dgram unchanged, corpus_diff GATE PASS, 0 regressions. Plus 3 gains outside its list. It did the thing the protocol asks for and that two of my own merges failed to do: it probed the two load-bearing halves of js_net.cppm BEHAVIOURALLY (8 files, all 0->0) rather than trusting a clean build, because its diff touched _adopt/write/destroy/accept.",
+     "security_judgment_i_verified": "It added one native entry point, NN.getSockOptInt(fd, which), and argued it needs no --permission gate because getsockopt acquires no resource — then flagged the judgment explicitly so I could disagree. I checked: getSockOptInt(999, 4) on a descriptor the process does not own returns -1, leaking nothing, and fs reads stay ERR_ACCESS_DENIED in the same process. Agreed, and recorded so the reasoning is auditable.",
+     "named_causes_for_the_3_unreached": [
+      "test-net-normalize-args: needs the SAME Symbol instance node's vendored internal/net.js exports, since deepStrictEqual compares own symbol keys. mbun's net is native and internal/net resolves per-requiring-file via compat/node/tsconfig.json paths, so there is no registry holding those exports. Adding _normalizeArgs with our own symbol converts nothing.",
+      "test-net-connect-options-fd: needs a BIND-ONLY unix socket (NN.listenUnix binds AND listens, so the fd cannot then be connect(2)-ed) plus connect(fd, sockaddr_un) on an already-open fd. Both are new network entry points and would need native-boundary gating with --permission evidence.",
+      "test-net-autoselectfamily-ipv4first: the known IPv6 gap. net.inc:45 builds only sockaddr_in, and js_net remaps '::1'->'127.0.0.1' on BOTH sides, which is what keeps today's listen('::1')+connect('::1') pairs green. A real AF_INET6 bind needs the symmetric change in netn_connect_cb plus peer-address reporting in accept — net/http/serve-wide, not one file."
+     ]
+    },
+    {
+     "id": "w7/http2",
+     "target_delta_pass": 6,
+     "actual_delta_pass": 7,
+     "hit_rate": 1.17,
+     "note": "test-http2 200->208, zero pass->fail. Headline: createSecureServer({allowHTTP1:true}) had NO HTTP/1.1 fallback at all — every secureConnection went to ServerHttp2Session regardless of ALPN. It also warned that js_http2.cppm had reached 246,389 bytes against mcpp's ~256 KiB limit; I split it pre-emptively (133K+115K, test-http2 208 both sides)."
+    },
+    {
+     "id": "w7/tls",
+     "target_delta_pass": 6,
+     "actual_delta_pass": 7,
+     "hit_rate": 1.17,
+     "note": "test-tls 114->122, test-https unchanged, 0 regressions.",
+     "production_relevant_bug": "PEM_read_bio_PrivateKey was called with a NULL password, which sends OpenSSL to its TERMINAL UI: an encrypted key with no passphrase printed 'Enter PEM pass phrase:' 14 times and then failed. That is a latent hang in any non-interactive server loading an encrypted key, not merely a test failure. Verified after the fix: 0 terminal prompts, clean ERR_OSSL_CRYPTO_INTERRUPTED_OR_CANCELLED.",
+     "declined_to_game_a_test": "test-tls-off-thread-cert-loading asserts stderr matches /Started loading .* root certificates off-thread/. mbun loads them synchronously. Its words: emitting the line without the behaviour would be pure test-gaming. Left alone — the right call."
+    },
+    {
+     "id": "w7/crypto",
+     "target_delta_pass": 6,
+     "actual_delta_pass": 7,
+     "hit_rate": 1.17,
+     "note": "test-crypto 68->75, 0 regressions.",
+     "three_security_hardenings_I_VERIFIED": [
+      "DH computeSecret ran no DH_check_pub_key equivalent: a peer key of 0, 1, or >= p-1 was reduced into a 'shared secret' the ATTACKER chose, and computeSecret('') decoded to 0 and derived from it. Verified after: peer=0/1/empty all rejected with ERR_CRYPTO_INVALID_KEYLEN.",
+      "createHmac rejected only null/undefined, so any object wearing KeyObject.prototype was accepted and MAC'd as empty bytes. Verified after: a prototype-forged KeyObject is ERR_INVALID_ARG_TYPE, a real one still works.",
+      "KeyObject identity was `instanceof`, so Object.setPrototypeOf({}, secretProto) passed as a key everywhere. Now a private WeakMap brand. Verified after: util.types.isKeyObject(forgery) === false."
+     ],
+     "fork_bomb_fix_I_VERIFIED": "mbun runs a Worker as a CHILD PROCESS and passed the parent's execArgv straight to spawn(), so `mbun -e '<code with new Worker>'` made every worker re-evaluate the parent's -e program and forked without bound. Verified: baseline hangs (exit 124), current exits 0.",
+     "declined_to_loosen": "test-crypto-no-algorithm wants setFips(1) to return normally on a build with no FIPS provider. It refused: that is exactly the failure mode it had just hardened against.",
+     "corrected_my_briefing": "crypto.constants.defaultCipherList/defaultCoreCipherList DO exist (lazy accessors in crypto_asym.cppm delegating to node:tls). My brief said they were absent; that was stale."
+    }
+   ],
+   "verdicts": {
+    "tls_regression_candidates": "The 5 TLS files flagged as the round's only outstanding genuine-regression candidates are NOT regressions. Shared pre-existing root cause: tls.Server attached its pre-handshake error handler to the raw transport, but TLSSocket._wrapTransport re-emits transport 'error' onto the TLSSocket, which had no listener, so EventEmitter's unhandled-'error' throw leaked the raw OpenSSL string to top level instead of node's 'tlsClientError'. 4 of 5 now pass (independently re-verified on the composed binary); the 5th needs SNI addContext and is deferred.",
+    "round_9_real_regressions_final": "Exactly one: test-http-write-empty-string. All other 495 of 496 green->non-green transitions were classified from logs as honest reclassification."
+   },
+   "calibration_addendum": {
+    "signature_clustering_blind_spot": "A missing or stand-in LAYER is invisible to signature clustering. Each file asserts something different about the layer, so the logs share no signature and the cluster ranks as a heterogeneous tail — while the true fix is one translation. Two independent checks now recommended before believing a 'heterogeneous tail': (1) how much of the subsystem is green? http was 102/398 = 26% while its API surface is old and stable, which is itself the signal; (2) is the mbun implementation a translation of node's lib/, or a hand-written stand-in? A stand-in with many small assertion failures means translate the layer, do not extend the stand-in.",
+    "green_ratio_heuristic": "For a mature, stable node subsystem, a low green ratio is stronger evidence of a missing layer than the error signatures are. cluster 11/80 and runner 10/73 currently look the same way http did.",
+    "instrumented_stub_pattern": "The strongest single technique observed so far for an unknown-depth wall: stub the missing capability so it FAILS LOUDLY WITH ITS OWN NAME, then let the log histogram pick the next target each cycle. On the internalBinding cluster this produced deltas of +8,+13,+14,+4,+3,+1,+2 over 7 cycles (45 total) where a single blind change would have reached ~21. It converts an open-ended 'implement internalBinding' into a measured, self-terminating work queue.",
+    "green_ratio_heuristic_validated": "Confirmed twice in one round. http: 26% green -> stand-in -> +170 (2.8x target). cluster: 13.3% green -> stub -> +65 on that subsystem (+73 task, 1.62x target). In both cases signature clustering gave no usable signal (a bare AssertionError tail, and a bare `global code@...` bucket respectively). The green ratio of a mature subsystem is now the primary targeting input; signatures are for picking work WITHIN a subsystem.",
+    "second_pass_is_worth_it": "A cluster declared 'no cause above 5 files' by a previous pass is NOT necessarily exhausted. The http2 tail yielded +51 on a second pass, +15 of it from a single missing layer (Http2Stream as a stream.Duplex). The earlier verdict was true of the SIGNATURES and false of the CAUSES — the same blind spot as the green-ratio finding. Treat 'no dominant signature' as 'no more cheap wins by signature', not as 'subsystem done', and re-check the green ratio.",
+    "guard_must_cover_what_you_edited": "A guard set scoped to the TARGET subsystems is not enough — it must cover every subsystem the change touched. The dns regression escaped because the task guarded http/https/tls/net/dgram (its targets) while also editing dns. Rule: derive the guard from the DIFF, not from the brief. `git diff --name-only` -> which builtins/modules changed -> guard every corpus subsystem that loads them.",
+    "three_verification_defects": "Round 10 found THREE independent defects in how the corpus was verified, each of which had been inflating the number for an unknown time: self-skips counted as passes (277 files), common.mustCall unenforced because process.on('exit') never fired (946 of 1533 passing files used it), and assert.throws ignoring its error argument so any throw satisfied any matcher (48 verified vacuous passes on the guard sets alone). Lesson: before optimising a metric, audit the metric. All three were found by agents doing unrelated work who stopped to ask why a test passed.",
+    "coordinator_hypotheses_are_hints": "A cause stated in a brief must be labelled as a hypothesis, and agents must be told to measure rather than implement it. Two cases this round: the 580-file timeout target assumed handle ref-counting (real cause: the event pump swallowing exceptions), and the dns regression brief assumed a leaked pending count (real cause: a single-threaded resolver deadlocking against dgram's own pre-send lookup, 8011ms -> 3ms once the pool could grow). Both agents measured their way to the real cause. A brief that states a cause as fact would have produced the wrong fix twice.",
+    "security_findings_outrank_counts": "This task delivered 80% of its file target and was still the most valuable of the round: it found a certificate-validation bypass of the CVE-2009-2408 class (subjectAltName truncated at an embedded NUL, so a cert for `good.example.org\\0.evil.example.com` was accepted as good.example.org) and a silently-ignored options.ciphers. Neither was visible as a failing count — the SAN bug's corpus test was one file. Briefs for security-adjacent subsystems should ask explicitly for an audit of what the code CLAIMS to enforce versus what it does, and should say that such a finding outranks the file target.",
+    "inherited_counts_are_not_causes": "Do not inherit a previous agent's file count as a root cause in a new brief. 'These 23 files share X' is a signature grouping until the shared MECHANISM has been verified. I passed such a verdict through as a premise and the task delivered 40% of target because --test turned out to be a symptom cluster: implementing it end to end converted 2 of ~24 files, each of the rest asserting on a different missing feature behind it. Ask for an early verdict on the brief's premise as an explicit deliverable, so a wrong premise is reported at cycle 2 rather than in the final report.",
+    "large_signature_buckets_may_be_diagnostic_artifacts": "Three of round 10's four largest apparent 'root causes' were artifacts of broken diagnostics rather than shared mechanisms: self-skips counted as passes, assert.throws ignoring its matcher, and assert.strictEqual emitting an EMPTY message so 359 files across 78 subsystems rendered as one indistinguishable `error: AssertionError` bucket. Before committing a round to a big single-signature cluster, verify the failing assertion actually reports something. cluster_finder measures error TEXT; if the text is empty or constant, it is measuring the formatter, not the bug."
+   },
+   "open_regressions": {
+    "total": 10,
+    "note": "All named, all measured, none absorbed. Bundled into a single repair task rather than left in the tail.",
+    "groups": [
+     {
+      "cause": "dns: in-flight resolver requests now count in the reactor's pending channel (needed so a dgram lookup does not let the pump take a 60s poll() park), but a request whose completion never decrements the count holds the loop open forever.",
+      "files": [
+       "test-dns-multi-channel.js",
+       "test-dns-resolvesrv-econnrefused.js",
+       "test-dns-resolvesrv.js"
+      ],
+      "was": "pass",
+      "now": "timeout",
+      "why_it_escaped": "The task's guard sets covered http/https/tls/net/dgram — its TARGET subsystems — but not dns, which it also edited."
+     },
+     {
+      "cause": "agent-6's cluster integration lived inside the dgram stand-in that agent-7's translation replaced.",
+      "files": [
+       "test-cluster-dgram-1.js",
+       "test-cluster-dgram-2.js",
+       "test-cluster-disconnect-unshared-udp.js",
+       "test-dgram-bind-socket-close-before-cluster-reply.js",
+       "test-dgram-cluster-bind-error.js",
+       "test-dgram-cluster-close-during-bind.js"
+      ],
+      "was": "pass",
+      "now": "timeout"
+     },
+     {
+      "cause": "http2 compat response 'finish' now arrives after the client's 'end', so session.close()'s GOAWAY is written too late.",
+      "files": [
+       "test-http2-session-graceful-close.js"
+      ],
+      "was": "pass",
+      "now": "fail",
+      "note": "Disclosed by the task itself; three fixes attempted and reverted because each traded it for 2-3 other files."
+     }
+    ]
+   }
+  }
+ ],
+ "post_mortems": [
+  {
+   "round": "goal round (tls/http/fs to 100%)",
+   "outcome": "tls 71->81 (+10), http 279->290 (+11), fs 227->266 (+39). 100% not reached on any.",
+   "mean_delta_per_task": 18.7,
+   "historical_mean_delta_per_task": 51.6,
+   "confound_stated": "The 2.8x drop is NOT attributable to method alone. These agents worked a tail that ten prior rounds had already stripped of cheap clusters, so diminishing returns is expected and real. Two data points bound it: a SECOND iterative pass over the http2 tail still returned +51, and a second iterative pass over tls returned +36 — so a hard tail does not by itself force single digits.",
+   "root_causes": [
+    {
+     "cause": "WORK ALLOCATION — mine, and the biggest one.",
+     "evidence": "Reclassifying the 299 remaining files by CAUSE rather than by subsystem shows every cause family spans all three subsystems: 45 timeouts (tls 16 / http 24 / fs 5), 31 re-spawn-needs-node-internals (13/8/10), 25 internalBinding namespaces (11/6/8). That is 101 files, 34% of the remainder, in three families that each cut across all three agents.",
+     "consequence": "Three subsystem agents each independently attacked the same three mechanisms, each seeing only a third of the evidence — so none of them could see the shared cause. Triple the work, a third of the signal. internalBinding + re-spawn are in fact ONE piece of work (provide node's internal modules and the bindings they need) worth 56 files across all three."
+    },
+    {
+     "cause": "THE 100% TARGET ITSELF MISALLOCATED EFFORT.",
+     "evidence": "'Guarantee 100%' pushes an agent to spread across every remaining file rather than go deep on the densest block. All three reported the same shape: budget consumed by the mechanical clusters, and the hard blocks never opened. The http agent: 'the timeouts each need individual teardown tracing and none was even opened.' The tls agent: the Duplex/memory-BIO transport was 'designed, not written — the round's build+measure cycles ate the budget.' The fs agent ran out before implementing internalBinding('fs').",
+     "consequence": "The single largest block in the remainder — 45 hangs — received zero minutes across three agents and 300+ minutes of budget."
+    },
+    {
+     "cause": "MEASUREMENT OVERHEAD, estimated at 40-50% of each budget.",
+     "evidence": "Each agent ran its own baseline (a 4433-file run is ~9-10 min at jobs 8), then N build+measure cycles (~1 min build each plus the measure), then a guard-before and guard-after (a 1000-file guard is ~3 min). Estimated 40-50 of each 100-minute budget. This is an estimate from observed run times, not an instrumented measurement.",
+     "consequence": "I already HAD the baseline measured and did not hand it over, so three agents each re-derived a number I was holding."
+    },
+    {
+     "cause": "METHOD MISMATCH — but not the way it first looks.",
+     "evidence": "The one-sweep-then-fix method the maintainer asked for was RIGHT for the mechanical cluster: the http agent reported '9 of 13 spot-checked files passed on the first build'. It was wrong for the hangs, which need per-file tracing and cannot be batch-implemented. The agent's own conclusion: 'worth splitting those into their own round.'",
+     "consequence": "The fix is not to revert the method. It is to MATCH THE METHOD TO THE CAUSE FAMILY — one-sweep translation for a known missing layer or a binding surface, per-file tracing for hangs, per-file work for assertion divergences. Splitting by cause family is what makes that possible."
+    }
+   ],
+   "optimisations_applied": [
+    "Split by CAUSE FAMILY, not by subsystem: one agent on internalBinding+re-spawn (56 files, one-sweep suits it), one on all 45 timeouts across all three subsystems (per-file tracing, and the causes should cluster once seen together), one on the 151 assertion divergences (the irreducibly per-file block, given the largest budget).",
+    "Hand over the baseline I already hold (target/integration/goal-after) and forbid re-measuring it — recovers ~10-15 min per agent.",
+    "Scope guards to the diff-derived set with --files instead of full-corpus runs; I run the authoritative full corpus once at integration.",
+    "Replace 'guarantee 100%' with an explicit block ordering: open the assigned block FIRST, and report its result before touching anything else. No block can be starved by a queue behind it."
+   ]
+  },
+  {
+   "round": "cause-family wave 1 — bindings agent",
+   "id": "g2/agent-1",
+   "target_delta_pass": 35,
+   "actual_delta_pass": 3,
+   "hit_rate": 0.09,
+   "structural_error_in_MY_split": {
+    "what_I_got_wrong": "I treated 'blocked on internalBinding' as a CAUSE FAMILY. It is not a cause, it is a LAYER. Clearing it does not convert files — it transfers them to whichever family owns the next layer down.",
+    "the_evidence": "All 22 `No such binding: X` files stopped failing at module load, and every one then failed PAST load on a real behaviour gap in mbun's own fs/http/tls JS layers — i.e. in the other two agents' files. The +35 target assumed load-blocking was the whole cause; it was one layer of several.",
+    "the_rule": "A cause family must be a family of CAUSES, not a family of SYMPTOMS AT ONE DEPTH. Before assigning a layer as a block, sample five of its files, remove the layer by hand, and see what is underneath. If the answer is 'someone else's family', the work is enabling INFRASTRUCTURE and must be budgeted and credited as such — its value shows up in other agents' numbers, not its own, and giving it a pass target is a category error.",
+    "what_it_should_have_been_given": "A diagnosis target, not a conversion target. It delivered exactly that and it is worth more than the 3 passes: 22 opaque `No such binding: fs` logs became 49 specific causes, each attributed to a named owner (2 need fs to route THROUGH the binding, 4 need GC/heap introspection, 4 need node's internal symbols to be the SAME symbols mbun's http/net use, 4 need a JS-visible parser/stream handle, 2 need createSecureContext to route through binding.SecureContext, 28 are behaviour gaps in their own families, 1 is impossible on JSC, 4 are honest feature-absence skips)."
+   },
+   "verified_by_coordinator": "Gate re-probed independently on the merged binary: with node_modules/internal/{http,fs}.js present, the user package WINS in both flag states; internalBinding is undefined lexically and on globalThis; no enumerable leak; enumerable globals still exactly 15. Permission statement checked: every binding entry bottoms out in __mbunFsNative/__mbunFdNative, which is where the C++ --permission gate lives, so internalBinding('fs').open is gated identically to fs.openSync.",
+   "design_point_worth_keeping": "Unimplemented members throw naming themselves (`No such binding member: fs.lchown`) — that is what converted 22 opaque logs into 49 attributable causes. BUT `crypto` is deliberately exempt: node's own lib/internal/crypto/util.js feature-detects optional algorithms by destructuring them and testing for undefined, so a throwing member would break the very code that handles their absence."
+  },
+  {
+   "round": "cause-family wave 1 — values agent",
+   "id": "g2/agent-3",
+   "target_delta_pass": 45,
+   "actual_delta_pass": 9,
+   "hit_rate": 0.2,
+   "triage_delivered_first_as_required": {
+    "distinct_mechanisms_counted": 60,
+    "largest_single_mechanism": "5 files (fs.watch recursive)",
+    "then": "4 (OpenSSL verify-code mapping), 4-5 (requestTimeout/headersTimeout never firing — the TIMEOUTS owner's family, not this one), then a tail of 1-2",
+    "measured_fixed_cost_per_mechanism_min": 10,
+    "why_the_target_was_over_scoped": "60 mechanisms x ~10 min measured fixed cost (read node's lib, find mbun's site, verify) = ~600 minutes of work. A +45 target inside a 100-minute budget was over-scoped by roughly 4.5x, and the agent produced the per-mechanism cost figure that proves it rather than just missing quietly."
+   },
+   "MY_CLASSIFIER_WAS_TOO_SHALLOW": {
+    "what_I_did": "I built the cause families by grepping the failure LOG TEXT. Anything containing AssertionError/Mismatched went into 'value divergence'.",
+    "what_that_got_wrong": "A TLS handshake, cipher or verify failure that surfaces THROUGH an assertion reads exactly like a value divergence in the log. Coordinator-verified floor: 20 of the 197 files in fam-values fail on `ssl: error`, `alert handshake failure`, `no ciphers available`, `key too small`, `UNABLE_TO_*`, `No cipher match` or the honest deferredTLS/Duplex-transport throw. The agent's own read of all 197 put it at ~36 (~30 protocol + 6 deferred), i.e. 18% of the family was not a value-semantics bug at all and could not be fixed in the JS layer. A further ~5 belonged to the timeouts owner.",
+    "the_rule": "Classify by the failure's LAYER, not by its log text. This is the SAME error as the earlier finding that the 359-file `AssertionError` bucket was an artifact of an empty assertion message — both times I keyed on symptom text. Before assigning a file to a family, ask which layer actually failed: a protocol failure, a missing capability and a wrong value are three different owners even when all three print `AssertionError`.",
+    "cheap_check_that_would_have_caught_it": "grep the family's logs for protocol/transport error signatures BEFORE dispatching, and split those out. It costs seconds and would have moved 20-36 files out of a 100-minute budget."
+   },
+   "brief_premises_refuted_by_measurement": [
+    "I told it to check for the lib/internal/errors.js message-builder drift layer that a sibling had found. Measured: only 1 of 197 fails on that shape.",
+    "I told it a ~25-file 'ERR_INVALID_ARG_TYPE code missing' cluster was in its set. Measured: only 3 fail on a wrong code. That cluster is NOT inside this work-list.",
+    "I flagged assert's Myers line diff as relevant. Measured: irrelevant here — every deep-equal failure in the set has a genuinely different VALUE, not different diff text."
+   ],
+   "what_it_fixed": "4 mechanisms, each translated from node's lib/: fs.watch delivering events after close() (the only reason 4 files reported a wrong value — it proved the C++ inotify mask was already correct with a standalone probe before touching anything); HTTP trailers having no verbatim form (parser kept only a lowercased last-wins object, server never populated rawTrailers); fs.Stats key set (native row carried isFile() as own-enumerable plus *Ns fields node lacks, so node's key-by-key walk landed a function in its numeric branch; promises stat/lstat were also returning a prototype-less row and ignoring {bigint:true}); and fs.realpath ignoring options.encoding.",
+   "guard": "1315 files measured in full, 790 -> 799 pass, 0 regressions."
+  },
+  {
+   "round": "cause-family wave 1 — hangs agent, and the wave's combined verdict",
+   "id": "g2/agent-2",
+   "target_delta_pass": 20,
+   "actual_delta_pass": 3,
+   "timeout_to_fail": 2,
+   "hit_rate": 0.15,
+   "delivered_the_thing_that_was_asked_for_instead": "The survivor cause histogram, which no subsystem-split agent could assemble because each saw only a third of the hangs. It required building an instrument that did not exist.",
+   "THIRD_confirmation_of_the_same_classification_error": {
+    "my_premise": "I defined the family as 'hangs' and handed it every previously-found teardown/handle-lifetime mechanism, expecting the causes to cluster there.",
+    "measured_reality": "31 of 41 survivors are NOT event-loop bugs. 20 show a held server plus live sockets, empty write queues and no ref'd timer — a stalled exchange where the test is genuinely WAITING, and node would hold the loop identically. 11 show a server outliving a dead client flow with socket count 0. Those 31 are protocol-semantics gaps wearing a hang costume and need per-file http/tls work. Only 3 (a never-converging ref'd interval) and 2 (FSWatcher counted as pending but never progressing) are loop-shaped. 4 produce no dump at all — the pump is blocked inside native code, the most severe class.",
+    "the_pattern": "This is the THIRD independent confirmation in one wave that my classifier keys on MANIFESTATION rather than cause. (1) The 359-file `AssertionError` bucket was an artifact of an empty assertion message. (2) 20-36 of the 197 'value divergences' were TLS protocol failures surfacing through an assertion. (3) 31 of 41 'hangs' are protocol gaps that merely manifest as a hang. Manifestation is not cause, and grepping log text can only ever see manifestation."
+   },
+   "instrument_built": "tools/integration/hang_dump.js (promoted from the agent's scratchpad). require()s the target so its timer shares the loop, then dumps reactor pending/handles/serveActive/stall, every item's _fd/_refd/_held/destroyed/listening/_wq, and every timer with its source. Works because its timer is REF'D, bounding the pump's 60s poll() park so control returns to JS mid-hang. Exit 99 marks a dump. Coordinator-verified on a real hang.",
+   "what_it_fixed": "Three defects of one shape: work llhttp does CONTINUOUSLY was deferred to an event a stuck peer never produces. Leftover bytes past a completed message were only parsed when the current response finished (node keeps one parser per connection, so a handler that never ends its response left the peer's bytes unparsed forever); header overflow was only checked once \\r\\n\\r\\n arrived; and the method was validated by a regex over the completed head, so garbage pipelined behind a request was never rejected. It also found and fixed two self-inflicted regressions before committing.",
+   "side_finding_routed_and_fixed_by_coordinator": "process._rawDebug was in an 'undefinedStubs' list: callable, returned without throwing, wrote NOTHING. node's writes to stderr synchronously, bypassing the stream stack, because it is the diagnostic of last resort. A silent no-op swallows exactly the output someone reached for because nothing else worked — it cost this agent ~15 minutes. Now implemented and verified on fd 2.",
+   "wave_combined": {
+    "targets": [
+     35,
+     45,
+     20
+    ],
+    "actuals": [
+     3,
+     9,
+     3
+    ],
+    "corpus": "2329 -> 2358 pass (52.5% -> 53.2% strict, 60.0% -> 60.8% excluding self-skips), timeouts 132 -> 125, zero regressions across three independently-measured guards of 1322, 1315 and 1957 files",
+    "verdict": "The cause-family split was the right correction to the subsystem split, and it still under-delivered — for three separate and now-documented reasons: one family was a LAYER not a cause (bindings, whose value transfers to other families), one was over-scoped by ~4.5x against a measured ~10 min per mechanism (values), and one was defined by manifestation rather than cause (hangs, 31 of 41 misassigned). All three targets were wrong in a way the agents could measure and did.",
+    "what_the_next_round_should_do": "Split the 31 stalled-exchange hangs into the http and tls protocol families where they belong; give the values family mechanisms x 10 min of budget or cut its scope to the top mechanisms; treat binding/infrastructure work as enabling with a diagnosis target; and pre-split any family by grepping for protocol/transport signatures before dispatch."
+   }
+  },
+  {
+   "round": "wave 2 — 'each agent must guarantee 100% of its subsystem in 100 minutes'",
+   "id": "w2/all-three",
+   "target_delta_pass": 270,
+   "actual_delta_pass": 10,
+   "hit_rate": 0.037,
+   "the_instruction_was_structurally_unachievable_and_i_should_have_said_so_up_front": {
+    "arithmetic": "270 files across 3 agents in 100 min. Measured fixed cost per mechanism is ~10 min, and the measured overhead is ~55 of every 100 min (triage 35 + build/measure 20). That leaves ~4 mechanisms per agent, ~12 for the wave. 270 files would need every mechanism to convert ~22 files. The observed conversion is 1-3 files per mechanism outside a homogeneous cluster, and all three subsystems' homogeneous clusters were already consumed in wave 1.",
+    "what_i_should_have_done": "Reported that arithmetic before dispatch and asked whether to re-scope to a reachable target or accept the wave as diagnostic. Instead I passed '100%' through to three agents as if it were a plan, and all three spent their budget discovering it was not one.",
+    "what_the_wave_was_actually_worth": "Three per-file unreached inventories with a named cause each (58 fs + tls + http), the 4-shape hang histogram, two corrected leads of mine, and a reproducer for issue #16. That is a diagnosis round mislabelled as a conversion round."
+   },
+   "measurement_methodology_defect_found_this_round": {
+    "finding": "My authoritative full-corpus runs, and every agent's zero-regression guard, run at --jobs 10. That parallelism MANUFACTURES failures. Evidence: 4 files the tls guard reported as pass->fail each pass 3/3 standalone; test-fs-buffer SIGSEGVs in JSC's JSRopeString::view under load but passes 4/4 alone and 3/3 at --jobs 5.",
+    "cost": "Agents spend budget triaging regressions that do not exist, and my published pass counts are understated by the artifact size.",
+    "action": "Re-measuring the full corpus at --jobs 6 and diffing against the jobs-10 baseline to size the artifact. Until that number exists, treat any single pass->fail in a parallel guard as unconfirmed until reproduced standalone."
+   },
+   "issue_16_now_has_a_reproducer": {
+    "was": "changelog round entry: 'JSC rope-string heap use-after-free; victim frame is JSC-internal, culprit is an async wild write, needs ASAN to find the source, left under observation.'",
+    "now": "test-fs-buffer.js + test-fs-readfile.js together at --jobs 6 crashes 1 of 3 attempts in JSRopeString::view at address 0x0. test-fs-buffer alone: 4/4 clean. The trigger is the memory pressure from test-fs-readfile's 2 GiB sparse file, which only appears now that the file survives instead of being OOM-killed.",
+    "why_it_matters": "A 1-in-3 reproducer is enough to run under ASAN. The bug was parked for want of exactly this."
+   }
+  },
+  {
+   "round": "wave 4 — inventory-driven, arithmetic targets",
+   "targets": {
+    "tls": 14,
+    "http": 12,
+    "fs": 11,
+    "total": 37
+   },
+   "actual": {
+    "tls": 16,
+    "http": 26,
+    "fs": 11,
+    "total": 53
+   },
+   "hit_rate": 1.43,
+   "verdict": "Third consecutive wave to beat target since triage moved out of the agents and into compat/data/unreached-inventory.json. Wave 2 (agents triage, target '100%') returned 3.7%; waves 3 and 4 returned 150% and 143%. The constraint has now MOVED: every wave-4 agent reported that the inventory UNDERCOUNTS -- 7 of agent-fs's 11 gains and several of agent-tls's had no row at all, and agent-tls found an 8-file cause (TLS session resumption) that was invisible because its files sat split across three existing buckets. Per-bucket ranking cannot see a cause that spans buckets. Next mechanism improvement: a periodic pass that asks 'what single change would close files in more than one bucket?', plus feeding failure_signature.py output back in so coverage stops depending on what an agent happened to trip over."
+  }
+ ]
+}

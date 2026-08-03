@@ -1,0 +1,11 @@
+[package]
+name        = "api"
+version     = "0.1.0"
+description = "mbun.api — runtime-independent Bun API descriptors and capability seams"
+license     = "MIT"
+standard    = "c++26"
+
+
+
+[indices]
+mbun = { path = "../../mcpp" }

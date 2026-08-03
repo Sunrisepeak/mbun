@@ -1,0 +1,34 @@
+[package]
+name        = "bundler"
+version     = "0.1.0"
+description = "mbun.bundler — bun bundler pure-logic port (graph/chunk/options/output; parse+link internals DEFERRED)"
+license     = "MIT"
+standard    = "c++26"
+
+
+
+[targets.bench-bundler]
+kind = "bin"
+main = "../../benchmarks/suites/bundler/bench.cpp"
+
+# core transitively links the local-index mimalloc package. Indices do not
+# inherit across members, so the consumer must know the same local index.
+
+# Cross-member: reuse mbun.core.paths for posix path normalize/join/dirname.
+# ref: modules/resolver depends on core the same way.
+# resolver: node module resolution (extensions/index/node_modules/exports) for
+# the bundler's disk-backed resolve path — reused, not reimplemented.
+[dependencies]
+core = { path = "../core" }
+# css: a `.css` entry point is printed through mbun.css (the port of bun's
+# lightningcss printer) rather than being handed to the JS parser, which used to
+# reject the very first `.` of a class selector.
+css = { path = "../css" }
+js = { path = "../js" }
+resolver = { path = "../resolver" }
+# toml: the .toml loader parses config into a JS object module (mbun.toml, the same
+# parser behind Bun.TOML.parse) rather than reimplementing TOML in the bundler.
+toml = { path = "../toml" }
+
+[indices]
+mbun = { path = "../../mcpp" }

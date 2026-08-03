@@ -1,0 +1,11 @@
+[package]
+name        = "url_jsc"
+version     = "0.1.0"
+description = "mbun.url_jsc — URL object binding and parse/serialize seams"
+license     = "MIT"
+standard    = "c++26"
+
+
+
+[indices]
+mbun = { path = "../../mcpp" }

@@ -1,0 +1,175 @@
+// Bun.spawn ReadableStream stdin adapter.
+//
+// This is a separate payload partition because process_web.cppm is already
+// close to GCC's constant-evaluated string-length ceiling. js_builtins.cppm
+// appends it immediately after process_web, so it remains inside the same
+// Bun block and sees spawnAsyncBun, anyToU8, and the process object it returns.
+export module mbun.jsc.js_builtins:bun_spawn_stream;
+
+import std;
+
+export namespace mbun::jsc::builtins::detail {
+
+inline constexpr std::string_view kBunSpawnStreamJS = R"JS(
+  // Web Streams protocol glue for Bun.spawn stdin. Native fd creation and
+  // non-blocking writes remain in spawnAsyncBun/io_tick.
+  const validateBunReadableStdin = (stream) => {
+    if (stream.locked) throw new TypeError("'stdin' ReadableStream is locked");
+    if (G.__mbunStreams && G.__mbunStreams.isDisturbed(stream)) {
+      throw new TypeError("'stdin' ReadableStream has already been used");
+    }
+  };
+  const pumpBunReadableStdin = (proc, source, isStream) => {
+    let reader = null;
+    let iterator = null;
+    let childClosed = false;
+    let cancelIssued = false;
+    const childClosedResult = {};
+    const cancelSource = () => {
+      if (cancelIssued) return;
+      cancelIssued = true;
+      if (reader) {
+        try {
+          const result = reader.cancel();
+          if (result && typeof result.catch === "function") result.catch(() => {});
+        } catch (e) {}
+      } else if (iterator && typeof iterator.return === "function") {
+        try {
+          const result = iterator.return();
+          if (result && typeof result.catch === "function") result.catch(() => {});
+        } catch (e) {}
+      }
+    };
+    // A pending source pull must be cancelled after the child closes, or the
+    // source can keep producing work after its pipe has gone away.
+    const childExit = proc.exited.then(() => {
+      childClosed = true;
+      cancelSource();
+      return childClosedResult;
+    }, () => {
+      childClosed = true;
+      cancelSource();
+      return childClosedResult;
+    });
+    const pump = (async () => {
+      try {
+        if (isStream) reader = source.getReader();
+        else iterator = source[Symbol.asyncIterator]();
+        if (childClosed) {
+          cancelSource();
+          return;
+        }
+        for (;;) {
+          const next = isStream ? reader.read() : iterator.next();
+          const result = await Promise.race([next, childExit]);
+          if (result === childClosedResult) break;
+          if (result.done) break;
+          if (childClosed || proc.killed || proc.exitCode !== null || proc.signalCode !== null) {
+            cancelSource();
+            break;
+          }
+          proc.stdin.write(result.value);
+        }
+      } catch (e) {
+        // Preserve bytes already queued and keep source errors from becoming
+        // unhandled rejections after the child has closed.
+        if (!childClosed) { try { proc.stdin.end(); } catch (e2) {} }
+      } finally {
+        try { if (reader) reader.releaseLock(); } catch (e) {}
+        try { proc.stdin.end(); } catch (e) {}
+      }
+    })();
+    pump.catch(() => {});
+  };
+  const wrapBunReadableConsumption = (stream) => {
+    if (!stream || typeof stream.__data !== "function" || typeof stream.__end !== "function") return stream;
+    let used = false;
+    const usedError = () => {
+      const e = new Error("ReadableStream has already been used");
+      e.code = "ERR_BODY_ALREADY_USED";
+      return e;
+    };
+    const claim = () => {
+      if (used) return usedError();
+      used = true;
+      return null;
+    };
+    for (const name of ["text", "bytes", "arrayBuffer", "blob", "json"]) {
+      const consume = stream[name];
+      if (typeof consume !== "function") continue;
+      stream[name] = function (...args) {
+        const e = claim();
+        return e ? Promise.reject(e) : consume.apply(this, args);
+      };
+    }
+    const pipeTo = stream.pipeTo;
+    if (typeof pipeTo === "function") {
+      stream.pipeTo = function (...args) {
+        const e = claim();
+        return e ? Promise.reject(e) : pipeTo.apply(this, args);
+      };
+    }
+    const asyncIterator = stream[Symbol.asyncIterator];
+    if (typeof asyncIterator === "function") {
+      stream[Symbol.asyncIterator] = function (...args) {
+        const iterator = asyncIterator.apply(this, args);
+        let first = true;
+        return {
+          next(...nextArgs) {
+            if (first) {
+              first = false;
+              const e = claim();
+              if (e) return Promise.reject(e);
+            }
+            return iterator.next(...nextArgs);
+          },
+          return(...returnArgs) {
+            return typeof iterator.return === "function" ? iterator.return(...returnArgs) : Promise.resolve({ done: true });
+          },
+          throw(...throwArgs) {
+            return typeof iterator.throw === "function" ? iterator.throw(...throwArgs) : Promise.reject(throwArgs[0]);
+          },
+          [Symbol.asyncIterator]() { return this; },
+        };
+      };
+    }
+    return stream;
+  };
+  const wrapSpawnResult = (proc) => {
+    if (proc) {
+      proc.stdout = wrapBunReadableConsumption(proc.stdout);
+      proc.stderr = wrapBunReadableConsumption(proc.stderr);
+    }
+    return proc;
+  };
+  // Bun.file() is a regular-file stdio source. Wrap the already-installed
+  // Bun.spawn after process_web so this policy stays out of its near-limit
+  // constexpr payload; generic Blob values keep the live-pipe path.
+  if (G.Bun && typeof G.Bun.spawn === "function") {
+    const spawnWithBlob = G.Bun.spawn;
+    G.Bun.spawn = function (a, b) {
+      const opts = Array.isArray(a) ? (b || {}) : (a || {});
+      const file = opts.stdin;
+      const fs = M["fs"] || M["node:fs"] || (typeof G.require === "function" ? G.require("fs") : null);
+      if (file && file.__isBunFile && typeof file.name === "string" && fs &&
+          typeof fs.statSync === "function" && typeof fs.openSync === "function") {
+        let regular = false;
+        try { regular = fs.statSync(file.name).isFile(); } catch (e) {}
+        if (regular) {
+          let fd = -1;
+          try { fd = fs.openSync(file.name, "r"); } catch (e) { fd = -1; }
+          if (fd >= 0) {
+            try {
+              const next = { ...opts, stdin: fd };
+              const proc = Array.isArray(a) ? spawnWithBlob.call(this, a, next) : spawnWithBlob.call(this, next);
+              return wrapSpawnResult(proc);
+            } finally { try { fs.closeSync(fd); } catch (e) {} }
+          }
+        }
+      }
+      return wrapSpawnResult(spawnWithBlob.apply(this, arguments));
+    };
+  }
+)JS";
+
+}  // namespace mbun::jsc::builtins::detail

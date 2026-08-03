@@ -1,0 +1,75 @@
+# Agents
+
+[中文](zh/agents.md)
+
+The tool-neutral operating entry for any coding agent working in this repository.
+Authority is the [charter](charter.md); participation basics are in
+[contributing.md](contributing.md). This page is your checklist.
+
+## Read the right skill first
+
+Operating procedures live in [`.agents/skills/`](../.agents/skills/). Read the
+one that matches your task **before** acting — don't re-derive it:
+
+| When | Skill |
+| --- | --- |
+| Writing or reviewing C++ modules (naming, `.cppm`, module layout) | [`mcpp-style-ref`](../.agents/skills/mcpp-style-ref/SKILL.md) |
+| Developing any feature or fixing any bug | [`tdd-workflow`](../.agents/skills/tdd-workflow/SKILL.md) |
+| A runtime test fails / crashes / hangs | [`mbun-runtime-debugging`](../.agents/skills/mbun-runtime-debugging/SKILL.md) |
+
+## Hard rules
+
+- **Sandbox everything that can spawn or hang.** Run through
+  `tools/integration/safe-test.sh` / `bounded_run.py` — never bare. (A stray
+  fork storm can freeze the machine.)
+- **`compat/` is read-only.** Adapt for portability (paths, runner bridging), but
+  never weaken assertion semantics.
+- **Evidence before "done."** Build passing ≠ feature done. Provide suite
+  before→after counts + a reproduce command (see
+  [contributing.md](contributing.md#evidence)).
+- **Conventional commits**, one dev-item per commit; prefer separate red/green
+  commits.
+- **Target branch.** Open PRs against **`rewrite_bun_in_mcpp`**, never `main`.
+- **Filter local sensitive data.** Before putting diagnostics in code comments,
+  commit metadata, or PR title/body/comments, remove or replace local absolute
+  paths, usernames, hostnames, tokens/credentials, private URLs, environment
+  values, and machine identifiers with generic placeholders. Re-check copied
+  logs and error excerpts before publishing them.
+- **Batch PR updates.** Do not post a comment for every small probe or local
+  edit. Publish one concise update at a meaningful milestone: a real source
+  change, a bounded verification wave, a blocker/strategy change, or a
+  resource-safety event. Include quantitative evidence and the next direction;
+  combine adjacent results into one comment whenever possible.
+- **Keep commits substantive.** A normal development commit must contain the
+  source or test implementation that advances the task; update `changelog.md`
+  or handoff docs in the same commit when useful. Docs-only commits are
+  reserved for explicitly requested policy/design/handoff changes or a
+  maintainer request, and must explain their purpose rather than recording
+  every intermediate probe.
+- **Bounded parallel waves.** When the user specifies a per-round parallelism,
+  use it for independent bounded tasks (currently 5–8 for this work), while
+  reducing concurrency if memory, swap, or disk safety requires it and
+  reporting that adjustment.
+
+## Sign every commit to a builder
+
+You are always a **co-author**, never the primary author. Use the format in
+[contributing.md](contributing.md#commit-convention): builder `Signed-off-by:` +
+your `Co-authored-by:` line (agent name + model; official no-reply email, or `<>`
+if none). The builder you sign to must be able to **understand the diff**, so
+keep it reviewable.
+
+## Don't self-merge protected surfaces
+
+`hagent/**`, `.agents/skills/**`, the root pointers, `.github/workflows/**`,
+`CODEOWNERS`, `LICENSE` (charter §5) require **maintainer sign-off**. Open the
+PR; do not merge it yourself.
+
+## Coordinate through the changelog
+
+`changelog.md` is the shared work log and hand-off protocol:
+
+- Record substantive progress with evidence (suite `x/y → x'/y'`, zero-regression
+  claims backed by before/after).
+- Leave enough that the next session/agent can pick up without re-discovery.
+- Check it before starting to avoid duplicating or colliding with in-flight work.

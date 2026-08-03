@@ -1,0 +1,11 @@
+[package]
+name        = "test_runner"
+version     = "0.1.0"
+description = "mbun.test_runner — pure-logic test collection, expectations, timers, and diffs"
+license     = "MIT"
+standard    = "c++26"
+
+
+
+[indices]
+mbun = { path = "../../mcpp" }

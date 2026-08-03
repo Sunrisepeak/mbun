@@ -1,0 +1,17 @@
+[package]
+name        = "css"
+version     = "0.1.0"
+description = "mbun.css — CSS tokenizer / parser / printer / minify (generic token-list subset)"
+license     = "MIT"
+standard    = "c++26"
+
+
+
+# lib (src/css.cppm) is inferred.
+
+[targets.css-run]
+kind = "bin"
+main = "tools/css_run.cpp"
+
+[indices]
+mbun = { path = "../../mcpp" }

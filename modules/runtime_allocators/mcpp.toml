@@ -1,0 +1,11 @@
+[package]
+name        = "runtime_allocators"
+version     = "0.1.0"
+description = "mbun runtime allocator selection, arena, fallback, and backend seams"
+license     = "MIT"
+standard    = "c++26"
+
+
+
+[indices]
+mbun = { path = "../../mcpp" }

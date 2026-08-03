@@ -1,0 +1,317 @@
+# T0.2 CI: 双工具链 (gcc16 / llvm22) 构建 + 测试
+# 跨平台矩阵 (macos / windows) 待 linux 稳定后跟进 (docs/plan T0.2)
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        toolchain: ["gcc@16.1.0", "llvm@22.1.8"]
+    steps:
+      - uses: actions/checkout@v4
+
+      # Repo hygiene, before anything expensive. Both checks guard damage that
+      # is INVISIBLE to a build:
+      #  - a conflict marker inside a C++ raw string literal (where the JS
+      #    payloads live) compiles clean and ships broken JS;
+      #  - a compat/ submodule staged as a symlink still resolves on the machine
+      #    that created it, so the corpora look fine there and are simply absent
+      #    everywhere else. That one reached a merge commit undetected.
+      # Seconds to run, and neither can be caught later by a green build.
+      - name: Repo hygiene
+        run: |
+          bash tools/integration/check_conflict_markers.sh
+          bash tools/integration/check_submodule_gitlinks.sh
+
+      # The key is v3 (was v2) purely to evict entries written before mcpp was
+      # pinned below. Excluding ~/.mcpp/build-cache from this path was tried and
+      # REVERTED: a run with `Cache not found for input keys: mcpp-v3-...`, i.e.
+      # fully cold with nothing restored, failed identically on both toolchains.
+      # That rules out cache contents as the cause; do not re-try that fix.
+      - name: Cache mcpp home (toolchains + BMI)
+        uses: actions/cache@v4
+        with:
+          path: ~/.mcpp
+          key: mcpp-v3-${{ runner.os }}-${{ matrix.toolchain }}-${{ hashFiles('**/mcpp.lock') }}
+          restore-keys: mcpp-v3-${{ runner.os }}-${{ matrix.toolchain }}-
+
+      # PINNED, not `latest`. An unpinned toolchain means the build inputs change
+      # under CI without a commit, so a red run cannot be attributed to the diff
+      # that appears to have caused it -- which is exactly what happened here:
+      # the base branch went red on 2026-07-29 having been green through 07-26,
+      # with no relevant change in between. install.sh takes MCPP_VERSION and
+      # adds the `v` prefix itself (VERSION="${MCPP_VERSION:-latest}").
+      #
+      # Bump this deliberately, and re-run CI on the bump alone so a toolchain
+      # change is never entangled with a code change.
+      - name: Install mcpp
+        env:
+          MCPP_VERSION: "2026.7.30.3"
+        run: |
+          curl -fsSL https://github.com/mcpp-community/mcpp/releases/latest/download/install.sh | bash
+          echo "$HOME/.mcpp/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Install toolchain
+        run: |
+          mcpp --version
+          # gcc provides the base subos runtime (libstdc++.so.6 / libgcc_s.so.1)
+          # that the LLVM clang binary links against — without it clang exits 127.
+          mcpp toolchain install gcc 16
+          compiler="${TOOLCHAIN%@*}"; version="${TOOLCHAIN#*@}"
+          if [ "$compiler" != "gcc" ]; then
+            mcpp toolchain install "$compiler" "${version%%.*}"
+          fi
+          mcpp toolchain list
+        env:
+          TOOLCHAIN: ${{ matrix.toolchain }}
+
+      - name: Build
+        run: |
+          # Workspace root [toolchain] is inherited by all members.
+          printf '\n[toolchain]\ndefault = "%s"\n' "$TOOLCHAIN" >> mcpp.toml
+          mcpp build --workspace --verbose
+        env:
+          TOOLCHAIN: ${{ matrix.toolchain }}
+
+      - name: Test
+        run: |
+          if [ "${TOOLCHAIN%@*}" = "gcc" ]; then
+            mcpp test --workspace
+          else
+            # The prebuilt JavaScriptCore ships libstdc++-ABI symbols (std::span
+            # in WTF headers): a libc++ lane compiles everything but cannot LINK
+            # the JSC-binding test binaries, so modules/jsc tests are gcc-only.
+            # test_members.sh is silent by design (per-member logs); surface the
+            # failing members and their log tails when it fails.
+            if ! SKIP_MEMBERS="modules/jsc" tools/integration/test_members.sh; then
+              results="target/integration/member-results.tsv"
+              echo "failed members:"; awk -F'\t' '$3=="fail"{print "  " $1}' "$results"
+              awk -F'\t' '$3=="fail"{print $5}' "$results" | while read -r log; do
+                echo "::group::$log"; tail -60 "$log"; echo "::endgroup::"
+              done
+              exit 1
+            fi
+          fi
+        env:
+          TOOLCHAIN: ${{ matrix.toolchain }}
+
+      - name: Smoke
+        # The root binary links the prebuilt JSC — gcc lane only (same ABI note).
+        if: startsWith(matrix.toolchain, 'gcc')
+        run: mcpp run -- --version
+
+      - name: Smoke (example apps)
+        # Boots every examples/ app, hits 127.0.0.1:3000, asserts 2xx, reaps it.
+        # Same gcc-only reason as above. The framework demos (express, elysia)
+        # report as skipped here: their node_modules are not in the checkout and
+        # `mbun install` does not currently finish for them (measured: still
+        # running past a 880s bound on examples/bun/elysia). Add --install to
+        # this command once that is fixed, and the demos boot in CI too.
+        if: startsWith(matrix.toolchain, 'gcc')
+        run: |
+          MBUN="$(find target -type f -name mbun -perm -111 -printf '%T@ %p\n' \
+            | sort -rn | head -1 | cut -d' ' -f2)"
+          python3 tools/integration/smoke_examples.py --bin "$MBUN" \
+            --out target/integration/smoke
+
+      - name: Smoke logs
+        if: failure() && startsWith(matrix.toolchain, 'gcc')
+        run: |
+          for log in target/integration/smoke/logs/*.log; do
+            [ -f "$log" ] || continue
+            echo "::group::$log"; tail -60 "$log"; echo "::endgroup::"
+          done
+
+  # macOS (arm64). Build and Smoke are now GATES: they went green on 4305e5b8,
+  # which retired the standing `TODO(T3.1b): macOS 实机验证` -- the macosx
+  # ldflags had been derived from the tarball manifest and never linked on real
+  # hardware until then. Job-level continue-on-error is gone with it.
+  #
+  # The steps added after Smoke keep a step-level continue-on-error until they
+  # have actually been observed on macOS. Same reason the job had one: a step
+  # nobody has ever run must not be able to fail a gate on its first attempt,
+  # and it must not be able to pass silently either. Drop each `true` once its
+  # step is green, exactly as this job's own was dropped.
+  #
+  # arm64 is not a preference, it is the only option: mcpp's installer publishes
+  # linux-x86_64, linux-aarch64 and macosx-arm64 only, and GitHub's macos-latest
+  # is arm64. There is deliberately no Windows job -- see the note at the bottom
+  # of this file.
+  macos-probe:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Cache mcpp home (toolchains + BMI)
+        uses: actions/cache@v4
+        with:
+          path: ~/.mcpp
+          # v4 (linux stays v3, which is green and has no reason to cold-start).
+          # jsc-prebuilt's install() only just grew a macosx branch; an entry
+          # cached from an earlier probe already has the package installed with
+          # the old no-op hook, and a hook does not re-run for an installed
+          # package -- so restoring v3 here would silently keep the missing
+          # header. Bump this whenever install() changes what it writes.
+          key: mcpp-v4-${{ runner.os }}-macos-arm64-${{ hashFiles('**/mcpp.lock') }}
+          restore-keys: mcpp-v4-${{ runner.os }}-macos-arm64-
+
+      - name: Install mcpp
+        env:
+          MCPP_VERSION: "2026.7.30.3"
+        run: |
+          curl -fsSL https://github.com/mcpp-community/mcpp/releases/latest/download/install.sh | bash
+          echo "$HOME/.mcpp/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Toolchain
+        run: |
+          mcpp --version
+          mcpp toolchain list
+
+      - name: Build
+        run: mcpp build --workspace --verbose
+
+      - name: Smoke
+        run: mcpp run -- --version
+
+      # Workspace unit tests. The linux llvm lane has to skip modules/jsc --
+      # the prebuilt JSC ships libstdc++-ABI symbols there, so a libc++ lane
+      # compiles but cannot link the binding tests. That does not apply here:
+      # the macOS artifact and this toolchain are both libc++, so the whole
+      # workspace is attempted. If it turns out otherwise, this is where it
+      # shows up, and SKIP_MEMBERS is the same escape hatch linux uses.
+      # Run the readiness/socket vectors FIRST and on their own. `mcpp test
+      # --workspace` reaches modules/install before it reaches these, and a hang
+      # in install's network tests eats the whole budget, so the three modules
+      # that would actually localise a kqueue fault never get to run. Cheap, and
+      # it answers the only open question: if these pass, the Darwin backend
+      # honours the same contract epoll does and the fault is above it.
+      - name: Test (readiness + socket backends)
+        continue-on-error: true
+        timeout-minutes: 15
+        run: |
+          for m in modules/event_loop modules/runtime_socket modules/runtime_server; do
+            echo "::group::$m"
+            mcpp test -p "$m" || echo "MEMBER FAILED: $m"
+            echo "::endgroup::"
+          done
+
+      # timeout-minutes is not boilerplate here: the first run of this step HUNG
+      # rather than failed. modules/event_loop has no macOS readiness backend --
+      # epoll_backend.cppm's non-linux path returns an empty BackendSeam and a
+      # poll() that never reports anything ready (marked DEFERRED in-source), so
+      # anything waiting on socket readiness waits forever. Without a bound the
+      # job sits until GitHub's 6-hour ceiling. 20 minutes: the hung run had
+      # already compiled and run most members by then, so a stall is reported
+      # quickly rather than paid for.
+      - name: Test
+        continue-on-error: true
+        timeout-minutes: 20
+        run: mcpp test --workspace
+
+      # Same example-app boot check the linux gcc lane runs. `find -printf` is
+      # GNU-only and this is BSD find, hence the plainer selector; there is one
+      # mbun binary under target/ either way.
+      - name: Smoke (example apps)
+        continue-on-error: true
+        run: |
+          MBUN="$(find target -type f -name mbun | head -1)"
+          test -n "$MBUN" || { echo "no mbun binary under target/"; exit 1; }
+          python3 tools/integration/smoke_examples.py --bin "$MBUN" \
+            --out target/integration/smoke
+
+      - name: Smoke logs
+        if: always()
+        run: |
+          for log in target/integration/smoke/logs/*.log; do
+            [ -f "$log" ] || continue
+            echo "::group::$log"; tail -40 "$log"; echo "::endgroup::"
+          done
+
+# ---------------------------------------------------------------------------
+# Platform status, measured rather than assumed.
+#
+# linux    the gate. Both toolchains build; gcc additionally runs the workspace
+#          unit tests and the example smoke.
+# macos    arm64 (the only macOS target mcpp publishes, and what macos-latest
+#          is). GREEN as of 4305e5b8: `mcpp build --workspace` completes and the
+#          binary runs -- `mbun 2026.07.18.0`, zero linker warnings. Build and
+#          Smoke are gates; the steps after them are still measuring.
+#
+#          The walls it cleared, in order, all of them measured rather than
+#          predicted: arc4random_buf's missing <stdlib.h>; the x86_64-only
+#          $NOCANCEL asm labels; glibc's execvpe (now
+#          mbun.platform.process::exec_path_env); the vendored OpenSSL backend
+#          (replaced by compat.openssl 3.5.1, which does publish macOS); two
+#          WTF headers the artifact fails to ship; PlatformEnable.h's
+#          COCOA_WEBM_PLAYER/MEDIA_SOURCE config contradiction; struct stat's
+#          st_*timespec vs st_*tim and the Linux-only statx; _SC_AVPHYS_PAGES;
+#          IPV6_ADD_MEMBERSHIP's Linux-only spelling; sigemptyset being a macro
+#          on Darwin; `environ` not being a linkable symbol; and finally the 8
+#          weak bun-embedder hooks that ELF resolves to null and Mach-O will
+#          not.
+#
+#          The artifact-side gap, kept because it recurs on every pin bump:
+#          bun-webkit-macos-arm64 ships wtf/RetainRef.h, whose line 30 includes
+#          <wtf/cocoa/NSTypeTraits.h> under `#if USE(CF) || defined(__OBJC__)`,
+#          but that header is not in the tarball -- 0 matches across all 3,016
+#          entries, alongside 12 sibling wtf/cocoa/ headers that ARE shipped.
+#          We satisfy the guard because the prebuilt's own Platform.h has
+#          USE(CF) on, and turning that off is not ours to do: it is shared with
+#          the already-compiled JSC/WTF archives. The chain reaching it
+#          (StringView.h -> RetainPtr.h -> RetainRef.h) is core WTF.
+#
+#          This is an upstream PACKAGING regression, not a version to outrun.
+#          WebKit split NSTypeTraits.h out of RetainRef.h on 2026-05-13 (both
+#          files carry that same commit timestamp) and oven-sh's release
+#          pipeline has not shipped the new header since. Measured: absent from
+#          our c9ad5813 (3,016 entries), from bun's own pinned 4895f45d (3,017)
+#          and from upstream latest 45e21dc0 (3,037), and from the -lto and
+#          -debug macOS variants as well.
+#
+#          Bun has the identical defect and is not a source of a workaround:
+#          its pin is NEWER than ours (2026-07-13 vs 2026-06-30), its
+#          RetainRef.h carries the same include on the same line 30, and its
+#          tarball is missing the same header. Its build scripts never name
+#          either header and define nothing CF-related; why this has not broken
+#          its macOS lane is unknown from the checkout here (its CI results are
+#          not in it) and is deliberately not guessed at.
+#
+#          mcpp/pkgs/m/mbun.jsc-prebuilt.lua's install() supplies the header on
+#          macosx. Measured, not assumed: the probe then failed at RetainRef.h
+#          line 34 instead of line 30 -- the same #if USE(CF) block's NEXT
+#          missing header, wtf/cf/CFTypeTraits.h.
+#
+#          Rather than discover these one CI round-trip at a time, the artifact's
+#          include tree was scanned for references to headers it does not carry.
+#          13 exist, and they partition cleanly: 11 are for other ports
+#          (wtf/glib/*, wtf/win/*, PlatformEnable{Glib,Win,PlayStation}.h) and
+#          sit behind platform guards Darwin never reaches. Exactly 2 are
+#          macOS-relevant -- NSTypeTraits.h and CFTypeTraits.h -- and install()
+#          now supplies both. So this class of failure is bounded and should be
+#          finished, though only a green probe settles that.
+# windows  no job. Deliberately removed rather than left red: mcpp does publish
+#          a Windows release, so this is not a toolchain gap, but nothing here
+#          has ever been built or measured on Windows and a permanently-failing
+#          probe is noise rather than information. Reinstate it when someone
+#          intends to act on what it reports.
+#
+# mbun's own platform coupling is far smaller than a wholesale grep suggests.
+# Over the 889 TRACKED, mbun-authored source files: 16 include <unistd.h>, 12
+# include <sys/socket.h>, 10 call dlopen, and 36 already carry a _WIN32 guard.
+# Grepping modules/ and src/ returns 349/122/23, but those are dominated by
+# compat/ and the vendored packages under .mcpp/ -- OpenSSL, SQLite, the JSC
+# prebuilt -- none of which a port touches.
+#
+# modules/platform/ is where the divergence belongs; it now carries a real POSIX
+# backend and owns the pty primitive outright.

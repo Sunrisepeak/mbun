@@ -1,0 +1,11 @@
+[package]
+name        = "ptr"
+version     = "0.1.0"
+description = "mbun.ptr — tagged pointers, checked offsets, and ownership/view seams"
+license     = "MIT"
+standard    = "c++26"
+
+
+
+[indices]
+mbun = { path = "../../mcpp" }

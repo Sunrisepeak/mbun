@@ -1,0 +1,16 @@
+[package]
+name        = "resolve_builtins"
+version     = "0.1.0"
+description = "mbun.resolve_builtins — Bun/Node/Web builtin module naming and resolution seams"
+license     = "MIT"
+standard    = "c++26"
+
+
+
+# lib (src/*.cppm) is inferred; bench is an explicit bin target.
+[targets.bench-resolve-builtins]
+kind = "bin"
+main = "benches/bench_resolve_builtins.cpp"
+
+[indices]
+mbun = { path = "../../mcpp" }

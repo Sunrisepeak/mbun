@@ -1,0 +1,11 @@
+[package]
+name        = "bindgenv2"
+version     = "0.1.0"
+description = "mbun.bindgenv2 — binding type, function, and ABI metadata seams"
+license     = "MIT"
+standard    = "c++26"
+
+
+
+[indices]
+mbun = { path = "../../mcpp" }

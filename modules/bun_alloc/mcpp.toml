@@ -1,0 +1,11 @@
+[package]
+name        = "bun_alloc"
+version     = "0.1.0"
+description = "mbun.bun_alloc — native-neutral allocator, arena, stats, and ownership seams"
+license     = "MIT"
+standard    = "c++26"
+
+
+
+[indices]
+mbun = { path = "../../mcpp" }

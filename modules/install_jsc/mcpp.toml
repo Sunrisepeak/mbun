@@ -1,0 +1,13 @@
+[package]
+name        = "install_jsc"
+version     = "0.1.0"
+description = "mbun.install_jsc — install JSC binding and execution seams"
+license     = "MIT"
+standard    = "c++26"
+
+[indices]
+mbun = { path = "../../mcpp" }
+
+
+[dependencies]
+install = { path = "../install" }

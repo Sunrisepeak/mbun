@@ -1,0 +1,19 @@
+[package]
+name        = "http-jsc"
+version     = "0.1.0"
+description = "mbun.http_jsc — JSC-facing HTTP conversion seams"
+license     = "MIT"
+standard    = "c++26"
+
+
+
+[lib]
+path = "src/http_jsc.cppm"
+
+
+[dependencies]
+http = { path = "../http" }
+http-client = { path = "../http_client" }
+
+[indices]
+mbun = { path = "../../mcpp" }

@@ -1,0 +1,17 @@
+compat/node/test/parallel/test-compile-cache-api-env.js
+compat/node/test/parallel/test-compile-cache-api-flush.js
+compat/node/test/parallel/test-compile-cache-api-options-portable-env.js
+compat/node/test/parallel/test-compile-cache-api-permission.js
+compat/node/test/parallel/test-compile-cache-api-portable.js
+compat/node/test/parallel/test-compile-cache-api-success.js
+compat/node/test/parallel/test-compile-cache-api-tmpdir.js
+compat/node/test/parallel/test-compile-cache-bad-syntax.js
+compat/node/test/parallel/test-compile-cache-dynamic-import.js
+compat/node/test/parallel/test-compile-cache-esm.js
+compat/node/test/parallel/test-compile-cache-existing-directory.js
+compat/node/test/parallel/test-compile-cache-permission-allowed.js
+compat/node/test/parallel/test-compile-cache-permission-disallowed.js
+compat/node/test/parallel/test-compile-cache-portable-esm.js
+compat/node/test/parallel/test-compile-cache-portable.js
+compat/node/test/parallel/test-compile-cache-success.js
+compat/node/test/parallel/test-compile-cache-updated-file.js

@@ -1,0 +1,16 @@
+[package]
+name        = "shell"
+version     = "0.1.0"
+description = "mbun.shell — Bun shell parser, execution plan, and template compiler"
+license     = "MIT"
+standard    = "c++26"
+
+
+
+# This member uses the repository-local package index. Workspace indices are
+# intentionally not inherited by mcpp members.
+
+# lib (src/shell.cppm) is inferred; tests are auto-discovered under tests/.
+
+[indices]
+mbun = { path = "../../mcpp" }

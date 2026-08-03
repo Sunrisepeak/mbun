@@ -1,0 +1,23 @@
+[package]
+name        = "libarchive"
+version     = "0.1.0"
+description = "mbun.libarchive — Bun.Archive data model and native backend seam"
+license     = "MIT"
+standard    = "c++26"
+
+
+
+[lib]
+path = "src/archive.cppm"
+
+# Keep the mbun local index available for future mbun.* native packages.
+
+# Real libarchive C library (3.8.7), compiled from source by the mcpp registry
+# package (which bundles zlib/bzip2/lz4/zstd/xz). mbun.libarchive.native
+# includes <archive.h>/<archive_entry.h> in a global module fragment and drives
+# the live archive_read_*/archive_write_* API for tar/zip/gzip round-trips.
+[dependencies.compat]
+libarchive = "3.8.7"
+
+[indices]
+mbun = { path = "../../mcpp" }

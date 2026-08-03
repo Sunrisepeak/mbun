@@ -1,0 +1,13 @@
+[package]
+name        = "event_loop"
+version     = "0.1.0"
+description = "mbun.event_loop — task, timer, threading and backend seams"
+license     = "MIT"
+standard    = "c++26"
+
+
+
+# Keep the member self-contained while preserving the workspace index boundary.
+
+[indices]
+mbun = { path = "../../mcpp" }

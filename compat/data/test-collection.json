@@ -1,0 +1,35 @@
+{
+  "generated_at": "2026-07-11",
+  "source": "rg --files compat/bun/test | rg '\\.test\\.[^/]+$'",
+  "total_test_files": 1936,
+  "top_level": [
+    { "path": "js", "test_files": 1129 },
+    { "path": "regression", "test_files": 405 },
+    { "path": "cli", "test_files": 175 },
+    { "path": "bundler", "test_files": 97 },
+    { "path": "napi", "test_files": 60 },
+    { "path": "integration", "test_files": 26 },
+    { "path": "bake", "test_files": 24 },
+    { "path": "internal", "test_files": 16 },
+    { "path": "config", "test_files": 1 },
+    { "path": "snippets", "test_files": 1 },
+    { "path": "v8", "test_files": 1 },
+    { "path": "package-json-lint.test.ts", "test_files": 1 }
+  ],
+  "selected_subtrees": [
+    { "path": "js/bun", "test_files": 476 },
+    { "path": "js/node", "test_files": 285 },
+    { "path": "js/web", "test_files": 164 },
+    { "path": "js/third_party", "test_files": 120 },
+    { "path": "cli/install", "test_files": 89 },
+    { "path": "cli/run", "test_files": 43 },
+    { "path": "js/sql", "test_files": 42 },
+    { "path": "bundler/transpiler", "test_files": 22 },
+    { "path": "js/deno", "test_files": 16 },
+    { "path": "bundler/esbuild", "test_files": 14 },
+    { "path": "js/valkey", "test_files": 15 },
+    { "path": "integration/next-pages", "test_files": 6 },
+    { "path": "napi/node-napi-tests", "test_files": 55 },
+    { "path": "regression/issue", "test_files": 403 }
+  ]
+}

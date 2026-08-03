@@ -1,0 +1,8 @@
+compat/bun/test/js/third_party/express/express.json.test.ts
+compat/bun/test/js/third_party/grpc-js/test-server.test.ts
+compat/bun/test/js/third_party/express/res.sendFile.test.ts
+compat/bun/test/js/third_party/grpc-js/test-resolver.test.ts
+compat/bun/test/js/third_party/grpc-js/test-outlier-detection.test.ts
+compat/bun/test/js/third_party/wpt-h2/run.test.ts
+compat/bun/test/js/third_party/undici-h2/run.test.ts
+compat/bun/test/js/third_party/hono/hello-world-fixture.test.ts

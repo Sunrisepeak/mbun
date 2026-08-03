@@ -1,0 +1,11 @@
+[package]
+name        = "interchange"
+version     = "0.1.0"
+description = "mbun.interchange — serialized configuration values, schemas, and conversion seams"
+license     = "MIT"
+standard    = "c++26"
+
+
+
+[indices]
+mbun = { path = "../../mcpp" }

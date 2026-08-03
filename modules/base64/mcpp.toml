@@ -1,0 +1,11 @@
+[package]
+name        = "base64"
+version     = "0.1.0"
+description = "mbun.base64 — base64, base64url, and hex codecs"
+license     = "MIT"
+standard    = "c++26"
+
+
+
+[indices]
+mbun = { path = "../../mcpp" }

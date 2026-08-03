@@ -1,0 +1,16 @@
+[package]
+name        = "router"
+version     = "0.1.0"
+description = "mbun.router — injected FileSystemRouter route matching"
+license     = "MIT"
+standard    = "c++26"
+
+
+
+
+[dependencies]
+core = { path = "../core" }
+resolver = { path = "../resolver" }
+
+[indices]
+mbun = { path = "../../mcpp" }

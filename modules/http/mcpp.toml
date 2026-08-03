@@ -1,0 +1,21 @@
+[package]
+name        = "http"
+version     = "0.1.0"
+description = "mbun.http — HTTP/1.1, Headers, URL, and URLSearchParams pure logic"
+license     = "MIT"
+standard    = "c++26"
+
+
+
+[profile.sanitize]
+inherits = "release"
+debug    = true
+cxxflags = ["-fsanitize=address,undefined", "-fno-sanitize-recover=all", "-fno-omit-frame-pointer"]
+ldflags  = ["-fsanitize=address,undefined"]
+
+[targets.bench-url-search-params]
+kind = "bin"
+main = "benches/bench_url_search_params.cpp"
+
+[indices]
+mbun = { path = "../../mcpp" }

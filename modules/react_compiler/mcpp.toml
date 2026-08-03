@@ -1,0 +1,11 @@
+[package]
+name        = "react_compiler"
+version     = "0.1.0"
+description = "mbun.react_compiler — parser/HIR/lowering/validation seams"
+license     = "MIT"
+standard    = "c++26"
+
+
+
+[indices]
+mbun = { path = "../../mcpp" }

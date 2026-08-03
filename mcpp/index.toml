@@ -1,0 +1,3 @@
+[index]
+spec      = "1"
+min_mcpp  = "0.0.87"

@@ -1,0 +1,11 @@
+[package]
+name        = "analytics"
+version     = "0.1.0"
+description = "mbun.analytics — event schema and injectable analytics seams (transport deferred)"
+license     = "MIT"
+standard    = "c++26"
+
+
+
+[indices]
+mbun = { path = "../../mcpp" }

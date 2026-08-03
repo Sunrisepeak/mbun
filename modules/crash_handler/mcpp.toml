@@ -1,0 +1,11 @@
+[package]
+name        = "crash_handler"
+version     = "0.1.0"
+description = "mbun.crash_handler — crash event and report seams"
+license     = "MIT"
+standard    = "c++26"
+
+
+
+[indices]
+mbun = { path = "../../mcpp" }

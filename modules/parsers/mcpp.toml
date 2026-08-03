@@ -1,0 +1,11 @@
+[package]
+name        = "parsers"
+version     = "0.1.0"
+description = "mbun.parsers — shared parser input, diagnostics, and format registry seams"
+license     = "MIT"
+standard    = "c++26"
+
+
+
+[indices]
+mbun = { path = "../../mcpp" }

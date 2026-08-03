@@ -1,0 +1,11 @@
+[package]
+name        = "css_jsc"
+version     = "0.1.0"
+description = "mbun.css_jsc — CSS JavaScript object and backend seams"
+license     = "MIT"
+standard    = "c++26"
+
+
+
+[indices]
+mbun = { path = "../../mcpp" }

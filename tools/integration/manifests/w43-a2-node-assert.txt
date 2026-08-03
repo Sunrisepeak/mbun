@@ -1,0 +1,8 @@
+compat/node/test/parallel/test-assert-async.js
+compat/node/test/parallel/test-assert-class-destructuring.js
+compat/node/test/parallel/test-assert-class.js
+compat/node/test/parallel/test-assert-deep-with-error.js
+compat/node/test/parallel/test-assert-deep.js
+compat/node/test/parallel/test-assert-first-line.js
+compat/node/test/parallel/test-assert-partial-deep-equal.js
+compat/node/test/parallel/test-assert-typedarray-deepequal.js

@@ -1,0 +1,14 @@
+[package]
+name = "semver_jsc"
+version = "0.1.0"
+description = "mbun.semver_jsc — JavaScript binding and JSC seams for SemVer"
+license = "MIT"
+standard = "c++26"
+
+
+
+[dependencies]
+semver = { path = "../semver" }
+
+[indices]
+mbun = { path = "../../mcpp" }

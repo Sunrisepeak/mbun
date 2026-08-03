@@ -1,0 +1,11 @@
+[package]
+name        = "jsc_macros"
+version     = "0.1.0"
+description = "mbun.jsc_macros — JSC binding descriptors and generated wrapper seam"
+license     = "MIT"
+standard    = "c++26"
+
+
+
+[indices]
+mbun = { path = "../../mcpp" }

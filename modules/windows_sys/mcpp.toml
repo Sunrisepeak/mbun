@@ -1,0 +1,11 @@
+[package]
+name        = "windows_sys"
+version     = "0.1.0"
+description = "mbun.windows_sys — portable Win32 handle, error, path, and process seams"
+license     = "MIT"
+standard    = "c++26"
+
+
+
+[indices]
+mbun = { path = "../../mcpp" }

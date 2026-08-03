@@ -1,0 +1,192 @@
+// modules/jsc/src/runtime.cppm — module mbun.jsc.runtime
+//
+// mcpp 0.0.56 does not place non-exported module partitions in the provider
+// graph, while exporting partitions that include JSC's TU-local header graph
+// is rejected by GCC without non-portable permissive flags. Keep one compiled
+// module unit and split its implementation into ordered, responsibility-based
+// include fragments. Every physical source remains below the 2000-line limit.
+module;
+#include "runtime/prelude.hpp"
+
+export module mbun.jsc.runtime;
+
+import std;
+import mbun.semver;
+import mbun.toml;
+import mbun.ini;
+import mbun.glob;
+import mbun.which;
+import mbun.shell;
+import mbun.dotenv;
+import mbun.core.compress;
+import mbun.compress;
+import mbun.crypto;
+import mbun.image;
+import mbun.image.jpeg;
+import mbun.core.io;
+import mbun.core.strings;
+import mbun.css;
+// The platform layer. Strongly platform-dependent primitives live there, not
+// behind #ifdefs at the call site: runtime/process_extended.inc's pty bindings
+// are argument coercion and JS object shaping over mbun::platform::pty.
+import mbun.platform;
+// node's Permission Model (--permission / --allow-*): the scope table, the fs
+// radix matcher and path.resolve. Consulted by every fs/spawn/worker boundary.
+import mbun.permission;
+import mbun.js_parser;
+// T-CAP-BUILD: in-memory bundler engine backing Bun.build (runtime/bun_build.inc).
+import mbun.bundler.vertical_slice;
+import mbun.bundler.defines;
+// Target / target_is_bun + the JSC-facing `target` string decode: `target: "bun"`
+// drives the ASCII-only output pass.
+import mbun.bundler.options;
+// Bun.build({ compile }) — the single-file executable container (bun_build.inc).
+import mbun.bundler.standalone_exe;
+import mbun.bundler.bundler_jsc;
+import mbun.resolver;
+import mbun.jsc.module_loader;
+import mbun.jsc.js_streams;
+import mbun.jsc.js_builtins;
+import mbun.jsc.js_net;
+import mbun.jsc.js_bun_socket;
+import mbun.jsc.js_tls_live;
+import mbun.jsc.js_http2;
+import mbun.jsc.js_websocket;
+import mbun.jsc.js_dns;
+import mbun.jsc.js_dgram;
+import mbun.jsc.js_https_live;
+import mbun.dns;
+import mbun.ffi;
+import mbun.sqlite;
+import mbun.watcher;
+import mbun.postgres;
+// Bun.redis RESP codec (runtime/valkey_client.inc __mbunValkeyNative).
+import mbun.valkey;
+import mbun.sourcemap_jsc.internal_source_map;
+// hosted-git-info URL normalization backs bun:internal-for-testing.hostedGitInfo.
+import mbun.install.hosted_git_info;
+// npm `os`/`cpu` allow/block-list algebra — the SAME bitsets `bun install`'s
+// platform gate uses — backs bun:internal-for-testing isArchitectureMatch /
+// isOperatingSystemMatch (runtime/platform_match.inc).
+import mbun.install.npm.negatable;
+// T-LOOP native epoll event loop for Bun.serve (runtime/serve_native.inc).
+import mbun.event_loop;
+import mbun.runtime_socket;
+import mbun.runtime_server;
+import mbun.http;
+// issue #16: chained fault-signal handler (installed after JSC init below).
+import mbun.crash_handler;
+// CAP-S3: AWS SigV4 signing for Bun.S3Client (runtime/s3_native.inc __mbunS3Native).
+import mbun.s3_signing;
+import mbun.s3_signing.backend;
+// T-TLS.3: memory-BIO TLS channels over reactor fds (runtime/net.inc tls*).
+import mbun.tls;
+// CAP-HTMLREWRITER: dependency-free HTMLRewriter engine (runtime/html_rewriter.inc).
+import mbun.html_rewriter;
+
+// CAP-NAPI: the Node-API layer (runtime/napi_core.inc + napi_objects.inc) is
+// included from prelude.hpp in the GLOBAL MODULE FRAGMENT — its `extern "C"
+// napi_*` ABI must have plain external linkage for dlopen'd .node addons, and
+// JSC's pointer-tagging templates only instantiate cleanly there (see the
+// note in prelude.hpp). The mbun_napi_* runtime hooks engine.inc calls are
+// declared in runtime/napi/mbun_napi.h.
+
+// ── the process dialect ─────────────────────────────────────────────────────
+// mbun is ONE universal core with a thin node compat layer and a thin bun
+// compat layer (.agents/skills/dev-process/SKILL.md, "通用内核 + 各方言的薄
+// 兼容层"). Where compat/node and compat/bun demand different OBSERVABLE
+// behaviour from the same call, that call site is a dispatch point and this
+// value is its key — not a ceiling, and not something to decide by picking a
+// winner.
+//
+// It is process-level infrastructure: resolved ONCE, in C++, at CLI dispatch
+// (src/main.cpp `resolve_dialect`), never sniffed independently inside a
+// builtins JS payload. JS reads it back through the non-enumerable
+// `globalThis.__mbunDialect` string installed by bindings_install.inc.
+//
+// Declared here rather than in api_impl.inc because everything from
+// common.inc down lives in the anonymous namespace below and needs the type
+// for its storage, while the setter/getter must be exported.
+export namespace mbun::jsc::runtime {
+
+enum class Dialect {
+    Bun,   // the historical default: no signal at all behaves as it always did
+    Node,
+};
+
+}  // namespace mbun::jsc::runtime
+
+namespace {
+
+#include "runtime/common.inc"
+#include "runtime/jsc_internal.hpp"
+#include "runtime/core_bindings.inc"
+#include "runtime/css.inc"
+#include "runtime/webcrypto.inc"
+// node:crypto native backend (createHash/createHmac/pbkdf2/random* → mbun.crypto).
+#include "runtime/node_crypto.inc"
+#include "runtime/bun_password.inc"
+// node:crypto asymmetric + cipher backend over vendored OpenSSL (mbun.openssl).
+#include "runtime/crypto_asym.inc"
+// node:tls native backend (getCiphers) over vendored OpenSSL/libssl (mbun.openssl).
+#include "runtime/node_tls.inc"
+#include "runtime/sourcemap.inc"
+#include "runtime/hosted_git_info.inc"
+#include "runtime/platform_match.inc"
+#include "runtime/io_bindings.inc"
+// node's module compile cache (NODE_COMPILE_CACHE / module.enableCompileCache):
+// directory layout, cache records and NODE_DEBUG_NATIVE=COMPILE_CACHE traces,
+// ported from compat/node/src/compile_cache.cc. Needs gPermission (common.inc);
+// the CommonJS loader consumes it from module_loading.inc, further down.
+#include "runtime/compile_cache.inc"
+// node:zlib streaming Transform handles (mbun.compress.stream): incremental
+// deflate/inflate/brotli/zstd state machines behind __mbunZlibNative.stream*.
+#include "runtime/zlib_stream.inc"
+// Shell bridge owns marker compilation and bounded template-array flattening.
+#include "runtime/shell.inc"
+#include "runtime/process_base.inc"
+#include "runtime/process_extended.inc"
+// Bun.$ execution bridge: runs compiled shell scripts through mbun's own
+// interpreter (modules/shell) with output capture; needs b64_encode (process_base)
+// and the shell_value_to_string helper (shell.inc).
+#include "runtime/bunsh.inc"
+#include "runtime/net.inc"
+// T-LOOP: Bun.serve over the native epoll stack (__mbunServeNative bridge).
+#include "runtime/serve_native.inc"
+#include "runtime/node_net.inc"
+#include "runtime/dns.inc"
+// sqlite3-backed bun:sqlite native bridge (Database/Statement live in JS layer).
+#include "runtime/sqlite.inc"
+// CAP-WATCH: node:fs.watch inotify bridge (FSWatcher lives in the JS layer).
+#include "runtime/watch.inc"
+// bun:ffi native backend (Bun.FFI): dlopen + self-implemented SysV call path.
+#include "runtime/ffi.inc"
+// Bun.sql postgres wire codec bridge (frontend encoders + backend decoder).
+#include "runtime/sql.inc"
+// node:vm sandbox contexts (__mbunNodeVMNative): real JSC child global contexts.
+#include "runtime/node_vm.inc"
+// node:os / node:tty system-info bridge (uname/sysinfo/getpwuid/getifaddrs/…).
+#include "runtime/node_os.inc"
+#include "runtime/node_util.inc"
+// Bun.build in-memory bundler bridge → mbun.bundler.build_bundle (vertical slice).
+#include "runtime/bun_build.inc"
+// CAP-S3: AWS SigV4 request signing bridge (__mbunS3Native.sign → mbun.s3_signing).
+#include "runtime/s3_native.inc"
+// CAP-HTMLREWRITER: Bun's HTMLRewriter over mbun.html_rewriter
+// (__mbunHTMLRewriterNative.transform).
+#include "runtime/html_rewriter.inc"
+// Bun.redis RESP wire codec bridge (__mbunValkeyNative; offline codec only).
+#include "runtime/valkey_client.inc"
+// CAP-WORKER: real cross-thread Worker (second JSC VM per OS thread). Defines
+// the __mbunWorkerNative seam engine.inc install_bindings_ registers; the parent
+// event-loop pump drains it via globalThis.__mbunWorkerDrain.
+#include "runtime/worker.inc"
+// Engine owns binding installation and the child/microtask-aware event-loop pump.
+// The CommonJS require/module-environment JS prelude lives in its own slice
+// (engine.inc's 2000-line budget, enforced by test_runtime_structure).
+#include "runtime/engine_require_js.inc"
+#include "runtime/engine.inc"
+
+}  // namespace
+
+#include "runtime/api_impl.inc"

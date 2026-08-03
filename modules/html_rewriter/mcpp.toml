@@ -1,0 +1,9 @@
+[package]
+name        = "html_rewriter"
+version     = "0.1.0"
+description = "mbun.html_rewriter — dependency-free streaming HTML rewriter (HTMLRewriter engine), pure logic"
+license     = "MIT"
+standard    = "c++26"
+
+[indices]
+mbun = { path = "../../mcpp" }

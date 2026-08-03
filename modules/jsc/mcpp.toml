@@ -1,0 +1,87 @@
+[package]
+name        = "jsc"
+version     = "0.1.0"
+description = "mbun.compat.jsc — JavaScriptCore embedding (isolates the JSC dep)"
+license     = "MIT"
+standard    = "c++26"
+
+[build]
+default-profile = "release"
+
+[profile.release]
+opt   = 3
+debug = false
+
+
+
+# The heavy (~1.1GB) JSC prebuilt static lib is scoped to THIS member only, so
+# no other module's build or test touches it. See docs/design/20260710-jsc-integration.md.
+
+# Cross-member deps: module_loader (core/resolver/js) + runtime Bun.* bindings (semver/toml/glob).
+[dependencies]
+core     = { path = "../core" }
+css      = { path = "../css" }
+# mbun.platform — the strongly platform-dependent primitives (pty creation and
+# termios, the POSIX syscall backend). runtime/process_extended.inc consumes it
+# so the pty surface carries no terminal headers or platform #ifdefs here.
+platform = { path = "../platform" }
+# node's Permission Model. The decision logic is a separate, engine-free member
+# so it can be unit-tested; this member supplies the syscall boundary that
+# consults it (io_bindings.inc, the spawn bridges, the module loader).
+permission = { path = "../permission" }
+compress = { path = "../compress" }
+crypto   = { path = "../crypto" }
+resolver = { path = "../resolver" }
+js       = { path = "../js" }
+semver = { path = "../semver" }
+toml   = { path = "../toml" }
+ini    = { path = "../ini" }
+glob   = { path = "../glob" }
+image  = { path = "../image" }
+shell  = { path = "../shell" }
+which  = { path = "../which" }
+install = { path = "../install" }
+dns    = { path = "../dns" }
+dotenv = { path = "../dotenv" }
+sqlite = { path = "../sqlite" }
+# CAP-WATCH: node:fs.watch rides the inotify backend (runtime/watch.inc).
+watcher = { path = "../watcher" }
+postgres = { path = "../postgres" }
+valkey = { path = "../valkey" }
+# T-CAP-BUILD: Bun.build in-memory bundler bridge (runtime/bun_build.inc).
+bundler = { path = "../bundler" }
+ffi    = { path = "../ffi" }
+sourcemap_jsc = { path = "../sourcemap_jsc" }
+tls    = { path = "../tls" }
+# T-LOOP: Bun.serve rides the native epoll event-loop stack (B1-B3).
+event_loop     = { path = "../event_loop" }
+runtime_socket = { path = "../runtime_socket" }
+runtime_server = { path = "../runtime_server" }
+http           = { path = "../http" }
+# CAP-S3: AWS SigV4 signing bridge for Bun.S3Client (runtime/s3_native.inc).
+s3_signing     = { path = "../s3_signing" }
+# CAP-HTMLREWRITER: dependency-free HTMLRewriter engine (runtime/html_rewriter.inc).
+html_rewriter  = { path = "../html_rewriter" }
+# issue #16: chained SIGSEGV/SIGABRT handler that prints a symbolized backtrace;
+# installed at the end of the Runtime constructor, after JSC has initialized.
+crash_handler  = { path = "../crash_handler" }
+
+[dependencies.mbun]
+jsc-prebuilt = "20260706"
+# (OpenSSL moved to [dependencies.compat] below.)
+
+# OpenSSL comes from the OFFICIAL registry package compat.openssl, which builds a
+# fully static libcrypto.a + libssl.a FROM SOURCE on both linux and macosx. It
+# replaces the local-index mbun.openssl, whose own header excluded this option on
+# the premise that "mcpp 注册表有 compat.mbedtls，但无 compat.openssl" -- true when
+# that file was written, false now: the registry has since gained it. mbun.openssl
+# wrapped the xim:openssl PREBUILT, which exists only for linux, and that is what
+# stopped the macOS CI probe.
+#
+# This is a 3.1.5 -> 3.5.1 bump, not a drop-in swap, so it is gated on the crypto
+# and TLS corpora rather than assumed compatible.
+[dependencies.compat]
+openssl = "3.5.1"
+
+[indices]
+mbun = { path = "../../mcpp" }

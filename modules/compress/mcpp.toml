@@ -1,0 +1,24 @@
+[package]
+name        = "compress"
+version     = "0.1.0"
+description = "mbun.compress — Bun compression model and native-library seams"
+license     = "MIT"
+standard    = "c++26"
+
+
+
+# Real native compression backends from the official mcpp compatibility index.
+# The pure framing/model modules stay
+# backend-free; the *_native modules include the C headers in a global module
+# fragment and drive deflate/inflate/zstd/brotli round-trips.
+
+[dependencies.compat]
+zlib   = "1.3.2"
+zstd   = "1.5.7"
+
+[dependencies.mbun]
+brotli = "1.1.0+mbun.1"
+
+
+[indices]
+mbun = { path = "../../mcpp" }

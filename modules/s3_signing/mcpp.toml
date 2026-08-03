@@ -1,0 +1,16 @@
+[package]
+name        = "s3_signing"
+version     = "0.1.0"
+description = "mbun S3 AWS Signature Version 4 pure logic"
+license     = "MIT"
+standard    = "c++26"
+
+
+
+# The default SigningPrimitives backend (src/backend.cppm) wires the real
+# SHA-256 / HMAC-SHA256 from mbun.crypto; the core module stays crypto-agnostic.
+[dependencies]
+crypto = { path = "../crypto" }
+
+[indices]
+mbun = { path = "../../mcpp" }

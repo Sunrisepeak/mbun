@@ -1,0 +1,9 @@
+compat/node/test/parallel/test-fs-existssync-memleak-longpath.js
+compat/node/test/parallel/test-fs-readdir-stack-overflow.js
+compat/node/test/parallel/test-fs-readdir-ucs2.js
+compat/node/test/parallel/test-fs-write-buffer-large.js
+compat/node/test/parallel/test-module-loading-globalpaths.js
+compat/node/test/parallel/test-require-extension-over-directory.js
+compat/node/test/parallel/test-require-extensions-same-filename-as-dir.js
+compat/node/test/parallel/test-require-json.js
+compat/node/test/parallel/test-require-symlink.js

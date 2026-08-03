@@ -1,0 +1,4 @@
+   Resolving toolchain
+    Resolved gcc@16.1.0 → @mcpp/registry/data/xpkgs/xim-x-gcc/16.1.0/bin/g++
+   Compiling napi v0.1.0 (.)
+   Compiling test_napi (test)

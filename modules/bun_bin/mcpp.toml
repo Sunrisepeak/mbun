@@ -1,0 +1,11 @@
+[package]
+name        = "bun_bin"
+version     = "0.1.0"
+description = "mbun.bun_bin — executable identity, argv, artifacts, and launch seams"
+license     = "MIT"
+standard    = "c++26"
+
+
+
+[indices]
+mbun = { path = "../../mcpp" }

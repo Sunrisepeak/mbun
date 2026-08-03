@@ -1,0 +1,11 @@
+[package]
+name        = "meta"
+version     = "0.1.0"
+description = "mbun.meta — version, build, target, and feature metadata seams"
+license     = "MIT"
+standard    = "c++26"
+
+
+
+[indices]
+mbun = { path = "../../mcpp" }

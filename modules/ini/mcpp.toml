@@ -1,0 +1,14 @@
+[package]
+name        = "ini"
+version     = "0.1.0"
+description = "mbun.ini — INI / .npmrc core parser + serializer (pure logic; npmrc/install layer DEFERRED S-install)"
+license     = "MIT"
+standard    = "c++26"
+
+
+
+# lib (src/ini.cppm aggregator + submodules) is inferred; tests auto-discovered.
+# Pure byte-logic port of bun's src/ini/lib.rs core; no cross-member deps.
+
+[indices]
+mbun = { path = "../../mcpp" }
