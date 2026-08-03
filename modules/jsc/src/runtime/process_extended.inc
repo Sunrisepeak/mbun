@@ -707,8 +707,13 @@ void execve_mark_cloexec_above_stdio() {
 // asserts `err.errno > 0`), alongside code/syscall/path.
 JSValueRef execve_throw_errno(JSContextRef ctx, JSValueRef* exc, int e, const std::string& path) {
     const std::string code{fd_errno_code(e)};
-    const std::string msg{(code.empty() ? "E" + std::to_string(e) : code) + ": "
-                          + fd_errno_message(e) + ", execve '" + path + "'"};
+    // node ErrnoException(isolate, errno, syscall, msg, path) formats as
+    // "<CODE>, <strerror> '<path>'" -- NOT the libuv "CODE: msg, syscall 'path'"
+    // shape used by the fs bindings. execve reaches JS through ErrnoException
+    // (node_process_methods.cc Execve -> ThrowErrnoException), and bun's
+    // BunProcess.cpp builds the identical string, so both corpora read this one.
+    const std::string msg{(code.empty() ? "E" + std::to_string(e) : code) + ", "
+                          + fd_errno_message(e) + " '" + path + "'"};
     JSValueRef m{make_string(ctx, msg)};
     JSObjectRef err{JSObjectMakeError(ctx, 1, &m, nullptr)};
     if (!code.empty()) set_prop(ctx, err, "code", make_string(ctx, code));
@@ -790,6 +795,19 @@ std::optional<JSValueRef> builtin_module(JSContextRef ctx, const std::string& mo
         if (!JSValueIsUndefined(ctx, bt) && !JSValueIsNull(ctx, bt)) {
             return bt;
         }
+    }
+    // node's schemeless block list (lib/internal/bootstrap/realm.js
+    // `schemelessBlockList`): four builtins are requirable ONLY with the
+    // `node:` scheme, so a bare `require("test")` must miss the builtin table
+    // entirely and fall through to the ordinary node_modules resolver — that is
+    // what lets a userland package named `test` shadow the runner. mbun
+    // registered both keys, so bare `test` returned the builtin `nodeTest`
+    // function and `node_modules/test/index.js` was unreachable. The `node:`-
+    // prefixed spec is a different string and is unaffected; the
+    // BuiltinModule shim in this file already models the same list for
+    // `module.isBuiltin` / `builtinModules`.
+    if (mod == "test" || mod == "test/reporters" || mod == "sqlite" || mod == "quic") {
+        return std::nullopt;
     }
     // pure-JS node builtins: globalThis.__mbunNativeModules[mod]
     JSValueRef reg{get_prop(ctx, global, "__mbunNativeModules")};

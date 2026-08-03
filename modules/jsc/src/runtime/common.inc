@@ -257,9 +257,19 @@ std::vector<std::string> gEnvFiles{};
 // a miss is fatal with `preload not found <json path>`).
 std::vector<std::string> gPreloads{};
 
+// `--tsconfig-override <path>` — one process-wide explicit config for runtime
+// resolution. The CLI makes it absolute against its parse cwd before the
+// runtime starts, so imports never reinterpret it relative to their own file.
+std::string gTsconfigOverride{};
+
 // `--user-agent <STR>` — overrides the default fetch User-Agent.
 // ref: bun cli/Arguments.rs:1062 → bun_http::OVERRIDDEN_DEFAULT_USER_AGENT.
 std::string gUserAgent{};
+
+// `--fetch-preconnect <URL>` (repeatable) — origins to dial before the entry
+// module loads, so the first fetch to each skips the connect round trip.
+// ref: bun cli/Arguments.rs:1104 → run_command.rs do_preconnect (:837).
+std::vector<std::string> gFetchPreconnect{};
 
 // ── the Permission Model (node --permission / --allow-*) ────────────────────
 // One instance per process, exactly like node's Environment::permission(). It

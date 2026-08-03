@@ -932,7 +932,25 @@ export constexpr std::string_view kNetJS_part2 = R"JS(
         },
         publish(topic, data, compress) { const WS = G.__mbunWS; return WS ? WS.publish(serverObj, topic, data) : 0; },
         subscriberCount(topic) { const WS = G.__mbunWS; return WS ? WS.subscriberCount(serverObj, topic) : 0; },
-        requestIP() { return { address: "127.0.0.1", family: "IPv4", port: 0 }; },
+        // ref: bun src/runtime/server/mod.rs requestIP → getRemoteSocketInfo.
+        // This is the JS serve path (the one a `tls:` server takes), and it
+        // used to answer with a fixed 127.0.0.1:0 — which made every peer look
+        // like the same connection to anything counting client ports
+        // (regression/issue/27358). The accepted socket is already parked on
+        // the Request, so report its real peer and keep the old placeholder
+        // only when the transport has none.
+        requestIP(req) {
+          const sock = req && req.__mbunSock;
+          const addr = sock && sock.remoteAddress;
+          if (typeof addr !== "string" || addr === "") {
+            return { address: "127.0.0.1", family: "IPv4", port: 0 };
+          }
+          return {
+            address: addr,
+            family: sock.remoteFamily || (addr.indexOf(":") >= 0 ? "IPv6" : "IPv4"),
+            port: sock.remotePort | 0,
+          };
+        },
         timeout() { return serverObj; },
         ref() { return serverObj; },
         unref() { return serverObj; },
@@ -2335,14 +2353,310 @@ export constexpr std::string_view kNetJS_part2 = R"JS(
   // JSStringCreateWithUTF8CString, which stops at the first NUL and would
   // silently truncate this whole JS layer -- leaving the load-only fetch stub
   // ("network requests are not implemented yet") installed instead.
-  const poolKey = (host, port, secure, tlsVerify, tlsCa) =>
+  // `serverName` belongs in the key for the same reason verify+ca do: it is
+  // part of the SSLConfig the socket was handshaked under, so a request that
+  // overrides SNI must not be answered over a connection established without
+  // it (regression/issue/27358, "different custom TLS configs do NOT share
+  // keepalive connections").
+  const poolKey = (host, port, secure, tlsVerify, tlsCa, tlsSni) =>
     host.toLowerCase() + "\u0000" + port + "\u0000" + (secure ? 1 : 0) + "\u0000" +
-    (tlsVerify ? 1 : 0) + "\u0000" + tlsCa;
+    (tlsVerify ? 1 : 0) + "\u0000" + tlsCa + "\u0000" + (tlsSni || "");
 
   const poolClose = (e) => {
     if (e.tls) { try { NN.tlsClose(e.fd); } catch (x) {} }
     try { NN.close(e.fd); } catch (x) {}
   };
+
+  // Bun fetch.rs maps an explicit protocol:"http2"/"h2" option to
+  // force_http2; HTTPContext then offers only h2 through ALPN and dispatches
+  // the request to its HTTP/2 client. The ordinary fetch path below is an H1
+  // client and must not advertise h2: it serializes an HTTP/1.1 request. Reuse
+  // the already-installed node:http2 transport for the explicit-H2 surface
+  // instead of growing a second HPACK/frame implementation here (#89).
+  const h2AbortReason = (signal) =>
+    signal && signal.reason !== undefined && signal.reason !== null
+      ? signal.reason
+      : new G.DOMException("The operation was aborted.", "AbortError");
+
+  async function readH2RequestBody(body, signal) {
+    if (body == null) return null;
+    if (signal && signal.aborted) {
+      if (body && typeof body.cancel === "function") {
+        try { await body.cancel(h2AbortReason(signal)); } catch (e) {}
+      }
+      throw h2AbortReason(signal);
+    }
+    if (G.Blob && body instanceof G.Blob) return new Uint8Array(await body.arrayBuffer());
+    if (typeof body === "string" || body instanceof Uint8Array ||
+        ArrayBuffer.isView(body) || body instanceof ArrayBuffer ||
+        (body && body._u8 instanceof Uint8Array)) return u8(body).slice();
+
+    const reader = body && typeof body.getReader === "function" ? body.getReader() : null;
+    if (!reader) return u8(body).slice();
+    const chunks = [];
+    let rejectAbort;
+    let onAbort;
+    const aborted = new Promise((resolve, reject) => { rejectAbort = reject; });
+    if (signal && typeof signal.addEventListener === "function") {
+      onAbort = () => {
+        const why = h2AbortReason(signal);
+        try { Promise.resolve(reader.cancel(why)).catch(() => {}); } catch (e) {}
+        rejectAbort(why);
+      };
+      signal.addEventListener("abort", onAbort, { once: true });
+    }
+    try {
+      for (;;) {
+        const step = signal ? await Promise.race([reader.read(), aborted]) : await reader.read();
+        if (step.done) break;
+        const value = step.value;
+        if (!(value instanceof Uint8Array) && !ArrayBuffer.isView(value) &&
+            !(value instanceof ArrayBuffer))
+          throw new TypeError("ReadableStream yielded a non-BufferSource value");
+        chunks.push(u8(value).slice());
+      }
+    } finally {
+      if (signal && onAbort) {
+        try { signal.removeEventListener("abort", onAbort); } catch (e) {}
+      }
+      try { reader.releaseLock(); } catch (e) {}
+    }
+    return concatU8(chunks);
+  }
+
+  async function doFetchH2(url, init, depth) {
+    if (depth > 20) throw mkErr("redirect count exceeded", "ERR_TOO_MANY_REDIRECTS");
+    const h2 = M["http2"] || M["node:http2"];
+    if (!h2 || typeof h2.connect !== "function")
+      throw mkErr("HTTP/2 fetch is unavailable", "HTTP2Unsupported");
+
+    const parsed = new G.URL(String(url));
+    if (parsed.protocol !== "https:")
+      throw mkErr("HTTP/2 fetch requires HTTPS", "HTTP2Unsupported");
+    const signal = init && init.signal;
+    if (signal && signal.aborted) throw h2AbortReason(signal);
+    const method = String((init && init.method) || "GET").toUpperCase();
+    const originalBody = init && init.body;
+    const bodyIsStream = !!(originalBody && typeof originalBody.getReader === "function");
+    const body = await readH2RequestBody(originalBody, signal);
+
+    const requestHeaders = {
+      ":method": method,
+      ":scheme": "https",
+      ":authority": parsed.host,
+      ":path": parsed.pathname + parsed.search,
+    };
+    let hasLength = false;
+    for (const pair of collectHeaders(init, null)) {
+      const name = String(pair[0]).toLowerCase();
+      // RFC 9113 8.2.2: connection-specific fields are forbidden in H2.
+      if (name === "connection" || name === "proxy-connection" ||
+          name === "keep-alive" || name === "transfer-encoding" ||
+          name === "upgrade") continue;
+      if (name === "host") { requestHeaders[":authority"] = String(pair[1]); continue; }
+      if (name === "content-length") hasLength = true;
+      requestHeaders[name] = String(pair[1]);
+    }
+    if (!hasLength && body !== null) requestHeaders["content-length"] = String(body.length);
+    else if (!hasLength && (method === "POST" || method === "PUT" || method === "PATCH"))
+      requestHeaders["content-length"] = "0";
+
+    const tlsOpt = (init && init.tls) || {};
+    // mbun's node:http2 forwards its complete connect options object to
+    // tls.connect, so preserve every TLS credential/policy option instead of
+    // hand-picking CA and servername. The one exception is a custom identity
+    // callback: this runtime cannot enforce it when rejectUnauthorized is false
+    // (node:tls admits the peer before invoking the callback), so forced-H2
+    // fetch must fail before sending a request rather than bypass user policy.
+    if (typeof tlsOpt.checkServerIdentity === "function")
+      throw mkErr("HTTP/2 fetch cannot enforce tls.checkServerIdentity", "HTTP2Unsupported");
+    const connectOptions = Object.assign({}, tlsOpt, {
+      rejectUnauthorized: tlsOpt.rejectUnauthorized !== false &&
+        !(G.process && G.process.env && G.process.env.NODE_TLS_REJECT_UNAUTHORIZED === "0"),
+    });
+    delete connectOptions.serverName;
+    if (tlsOpt.serverName !== undefined) connectOptions.servername = tlsOpt.serverName;
+
+    return new Promise((resolve, reject) => {
+      let session;
+      let stream;
+      let headResolved = false;
+      let redirecting = false;
+      let bodyController = null;
+      let bodyDone = false;
+      let onAbort;
+      const release = () => {
+        if (signal && onAbort) {
+          try { signal.removeEventListener("abort", onAbort); } catch (e) {}
+          onAbort = null;
+        }
+        try { if (session && !session.destroyed) session.close(); } catch (e) {}
+      };
+      const cancelTransport = () => {
+        try {
+          if (stream && !stream.destroyed) {
+            if (typeof stream.close === "function") stream.close(h2.constants.NGHTTP2_CANCEL);
+            else stream.destroy();
+          }
+        } catch (e) { try { if (stream && !stream.destroyed) stream.destroy(); } catch (e2) {} }
+        release();
+      };
+      const failBody = (error) => {
+        if (bodyDone) return;
+        bodyDone = true;
+        try { if (bodyController) bodyController.error(error); } catch (e) {}
+        cancelTransport();
+      };
+      const fail = (error) => {
+        if (redirecting) return;
+        if (!headResolved) {
+          headResolved = true;
+          cancelTransport();
+          reject(error);
+        } else {
+          failBody(error);
+        }
+      };
+      try {
+        session = h2.connect(parsed.origin, connectOptions);
+        session.once("error", fail);
+        stream = session.request(requestHeaders, { endStream: false });
+        stream.once("error", fail);
+        stream.once("aborted", () => fail(mkErr("HTTP/2 response stream was aborted", "ECONNRESET")));
+        stream.once("response", (responseHeaders) => {
+          if (headResolved || redirecting) return;
+          const status = Number(responseHeaders && responseHeaders[":status"]) || 200;
+          const headers = new G.Headers();
+          if (responseHeaders) {
+            for (const name of Object.keys(responseHeaders)) {
+              if (name[0] === ":") continue;
+              const value = responseHeaders[name];
+              if (Array.isArray(value)) for (const item of value) headers.append(name, String(item));
+              else if (value !== undefined) headers.append(name, String(value));
+            }
+          }
+          const location = headers.get("location");
+          if (location && (status === 301 || status === 302 || status === 303 ||
+                           status === 307 || status === 308)) {
+            const mode = (init && init.redirect) || "follow";
+            if (mode === "error") {
+              headResolved = true;
+              cancelTransport();
+              reject(new TypeError("fetch redirect is not allowed"));
+              return;
+            }
+            if (mode === "follow") {
+              if (bodyIsStream && status !== 303) {
+                headResolved = true;
+                cancelTransport();
+                reject(new TypeError("Cannot follow redirect with a streaming request body"));
+                return;
+              }
+              const nextURL = new G.URL(location, parsed.href);
+              const next = nextURL.href;
+              const nextInit = Object.assign({}, init);
+              const nextHeaders = new G.Headers(nextInit.headers || undefined);
+              // Fetch redirect step 13 / bun CROSS_ORIGIN_STRIPPED_REQUEST_HEADERS:
+              // credentials and an explicit Host belong only to the old origin.
+              if (nextURL.origin !== parsed.origin) {
+                nextHeaders.delete("authorization");
+                nextHeaders.delete("proxy-authorization");
+                nextHeaders.delete("cookie");
+                nextHeaders.delete("host");
+              }
+              if (status === 303 || ((status === 301 || status === 302) && method === "POST")) {
+                nextInit.method = "GET";
+                nextInit.body = null;
+                nextHeaders.delete("content-length");
+                nextHeaders.delete("content-type");
+              }
+              nextInit.headers = nextHeaders;
+              // WHATWG redirect fetch acts on response metadata. Do not drain an
+              // attacker-controlled or long-lived redirect body before following.
+              redirecting = true;
+              cancelTransport();
+              doFetchH2(next, nextInit, depth + 1).then((res) => {
+                res.redirected = true;
+                resolve(res);
+              }, reject);
+              return;
+            }
+          }
+
+          // Fetch responses to HEAD and null-body statuses never expose a body,
+          // even if a peer sends payload bytes. This H2 fetch owns its session,
+          // so cancel the stream after resolving the metadata instead of leaving
+          // an unobservable payload buffered behind a synthetic ReadableStream.
+          if (method === "HEAD" || status === 204 || status === 205 || status === 304) {
+            let response;
+            try { response = new G.Response(null, { status, statusText: "", headers }); }
+            catch (error) { fail(error); return; }
+            response.url = parsed.href;
+            response.redirected = depth > 0;
+            headResolved = true;
+            bodyDone = true;
+            cancelTransport();
+            resolve(response);
+            return;
+          }
+
+          const rawBody = new G.ReadableStream({
+            start(controller) {
+              bodyController = controller;
+              stream.on("data", (chunk) => {
+                if (bodyDone) return;
+                try {
+                  controller.enqueue(u8(chunk).slice());
+                  if (controller.desiredSize !== null && controller.desiredSize <= 0 &&
+                      typeof stream.pause === "function") stream.pause();
+                } catch (error) { failBody(error); }
+              });
+              stream.once("end", () => {
+                if (bodyDone) return;
+                bodyDone = true;
+                try { controller.close(); } catch (e) {}
+                release();
+              });
+              stream.once("close", () => {
+                if (!bodyDone) failBody(mkErr("HTTP/2 response stream closed before END_STREAM", "ECONNRESET"));
+              });
+            },
+            pull() {
+              if (!bodyDone && stream && typeof stream.resume === "function") stream.resume();
+            },
+            cancel() {
+              if (!bodyDone) bodyDone = true;
+              cancelTransport();
+            },
+          });
+          let responseBody = rawBody;
+          const encoding = String(headers.get("content-encoding") || "").trim().toLowerCase();
+          if (encoding && encoding !== "identity" && (!init || init.decompress !== false)) {
+            const format = encoding === "x-gzip" ? "gzip" : encoding;
+            if (format === "gzip" || format === "deflate" || format === "br" || format === "zstd") {
+              try { responseBody = rawBody.pipeThrough(new G.DecompressionStream(format)); }
+              catch (error) { fail(error); return; }
+              headers.delete("content-encoding");
+              headers.delete("content-length");
+            }
+          }
+          let response;
+          try { response = new G.Response(responseBody, { status, statusText: "", headers }); }
+          catch (error) { fail(error); return; }
+          response.url = parsed.href;
+          response.redirected = depth > 0;
+          headResolved = true;
+          resolve(response);
+        });
+        if (signal && typeof signal.addEventListener === "function") {
+          onAbort = () => fail(h2AbortReason(signal));
+          signal.addEventListener("abort", onAbort, { once: true });
+        }
+        if (body && body.length) stream.write(body);
+        stream.end();
+      } catch (e) { fail(e); }
+    });
+  }
 
   // bun existing_socket HTTPContext.rs:790 -- a closed or errored slot is
   // dropped and the scan continues; it is never handed to a caller.
@@ -2388,6 +2702,8 @@ export constexpr std::string_view kNetJS_part2 = R"JS(
     }
     const m = /^(https?):\/\/([^/:?#]+)(?::(\d+))?([^#]*)/.exec(url);
     if (!m) return Promise.reject(new TypeError("fetch() URL is invalid: " + url));
+    if (init.protocol === "http2" || init.protocol === "h2")
+      return doFetchH2(url, init, depth);
     const secure = m[1] === "https";
     const host = m[2];
     const port = m[3] ? +m[3] : (secure ? 443 : 80);
@@ -2397,6 +2713,7 @@ export constexpr std::string_view kNetJS_part2 = R"JS(
     const tlsVerify = secure && tlsOpt.rejectUnauthorized !== false &&
       !(G.process && G.process.env && G.process.env.NODE_TLS_REJECT_UNAUTHORIZED === "0");
     const tlsCa = secure && tlsOpt.ca ? (Array.isArray(tlsOpt.ca) ? tlsOpt.ca.map((c) => typeof c === "string" ? c : td.decode(u8(c))).join("\n") : (typeof tlsOpt.ca === "string" ? tlsOpt.ca : td.decode(u8(tlsOpt.ca)))) : "";
+    const tlsSni = secure && typeof tlsOpt.serverName === "string" ? tlsOpt.serverName : "";
     let pathq = m[4] || "/";
     if (pathq === "" || pathq[0] !== "/") pathq = "/" + pathq;
     // Collapse a leading run of slashes in the request target to one: a URL
@@ -2438,8 +2755,16 @@ export constexpr std::string_view kNetJS_part2 = R"JS(
       lines.push("User-Agent: " + (ovUA || ("Bun/" + ((G.Bun && G.Bun.version) || "1.0"))));
     }
     if (!haveAccept) lines.push("Accept: */*");
-    for (const kv of hdrs) lines.push(kv[0] + ": " + kv[1]);
+    // This H1 client materializes every request body before serialization, so
+    // it is always bun's non-streaming build_request branch. That branch drops
+    // a caller Transfer-Encoding and emits one Content-Length framing mode;
+    // forwarding TE here produced TE: chunked + CL: 0 with no terminal chunk.
+    for (const kv of hdrs) {
+      if (kv[0].toLowerCase() !== "transfer-encoding") lines.push(kv[0] + ": " + kv[1]);
+    }
     if (bodyBytes && !haveCL) lines.push("Content-Length: " + bodyBytes.length);
+    else if (!haveCL && method !== "GET" && method !== "HEAD" && method !== "OPTIONS" && method !== "TRACE")
+      lines.push("Content-Length: 0");
     const reqBytes = bodyBytes
       ? concatU8([te.encode(lines.join("\r\n") + "\r\n\r\n"), bodyBytes])
       : te.encode(lines.join("\r\n") + "\r\n\r\n");
@@ -2453,7 +2778,7 @@ export constexpr std::string_view kNetJS_part2 = R"JS(
       : new G.DOMException("The operation was aborted.", "AbortError");
     if (signal && signal.aborted) return Promise.reject(abortReason());
 
-    const pkey = poolKey(host, port, secure, tlsVerify, tlsCa);
+    const pkey = poolKey(host, port, secure, tlsVerify, tlsCa, tlsSni);
 
     return new Promise((resolve, reject) => {
       let fd;
@@ -2778,7 +3103,74 @@ export constexpr std::string_view kNetJS_part2 = R"JS(
       return doFetch(url, init, 0);
     } catch (e) { return Promise.reject(e); }
   };
-  G.fetch.preconnect = function () {};
+  // fetch.preconnect(url) -- open the TCP connection now and park it in the
+  // same keepalive hive doFetch() checks out from, so the first real request to
+  // that origin skips the connect round trip.
+  // PORT-SOURCE: compat/bun/src/runtime/webcore/fetch.rs Bun__fetchPreconnect
+  // (:228) for the validation order and the exact messages, and
+  // compat/bun/src/http/AsyncHTTP.rs preconnect() (:404) for "connect, then
+  // release the socket into the pool without sending anything".
+  //
+  // Only http:// is actually dialed. A TLS preconnect would have to park a
+  // socket mid-handshake -- poolTake() hands a `tls: true` entry straight to
+  // the request writer as if the handshake had completed -- so https validates
+  // its URL and otherwise no-ops rather than poisoning the hive.
+  G.fetch.preconnect = function (input) {
+    if (arguments.length < 1)
+      throw new TypeError("Not enough arguments to fetch.preconnect. Expected 1, got 0.");
+    // bun runs the argument through jsc::URL::href_from_js first: anything the
+    // WHATWG parser rejects (""/" "/"http://:0") is a dead BunString -> the
+    // INVALID_ARG_TYPE "Invalid URL" arm, ahead of every scheme/host check.
+    let u;
+    try { u = new G.URL(String(input)); }
+    catch (e) { const er = new TypeError("Invalid URL"); er.code = "ERR_INVALID_ARG_TYPE"; throw er; }
+    const proto = u.protocol;
+    if (proto !== "http:" && proto !== "https:" && proto !== "s3:")
+      throw new TypeError("URL must be HTTP or HTTPS");
+    if (!u.hostname) { const er = new TypeError("fetch() URL must not be a blank string."); er.code = "ERR_INVALID_ARG_TYPE"; throw er; }
+    // has_valid_port(): an explicit :0 is not dialable. WHATWG drops the
+    // default port from `u.port`, so an empty string is the valid default.
+    if (u.port !== "" && !(+u.port >= 1 && +u.port <= 65535))
+      throw new TypeError("Invalid port");
+    if (proto !== "http:") return undefined;
+    // Strip the brackets a WHATWG IPv6 host carries; NN.connect() takes a bare
+    // address, and poolKey() is built from doFetch's bracket-free host too.
+    const host = u.hostname.replace(/^\[|\]$/g, "");
+    const port = u.port ? +u.port : 80;
+    try {
+      const fd = NN.connect(host, port);
+      if (NN.setSockBuf) { try { NN.setSockBuf(fd, 3, 60); } catch (e) {} }
+      // Same key doFetch() computes for a plain-http request: no TLS terms.
+      if (!poolPut(poolKey(host, port, false, false, "", ""), host, fd, false)) {
+        try { NN.close(fd); } catch (e) {}
+      }
+    } catch (e) {
+      // bun's preconnect is fire-and-forget: a refused connection is dropped on
+      // the HTTP thread and never surfaces to the caller.
+    }
+    return undefined;
+  };
+  // `--fetch-preconnect <URL>` (repeatable) dials before the entry module runs.
+  // PORT-SOURCE: compat/bun/src/runtime/cli/run_command.rs do_preconnect (:837),
+  // called from Run::start (:1090) ahead of the entry module load.
+  // __mbunHttpNative is installed by the C++ binding pass, which may not have
+  // run when this image is evaluated, so fall back to the first microtask —
+  // still before any user code, and the kernel completes the handshake whether
+  // or not the child ever polls the socket.
+  const __mbunDoCliPreconnects = function () {
+    let list;
+    try {
+      const HN = G.__mbunHttpNative;
+      list = HN && typeof HN.preconnectUrls === "function" ? HN.preconnectUrls() : null;
+    } catch (e) { return; }
+    if (!list || !list.length) return;
+    for (let i = 0; i < list.length; i++) {
+      try { G.fetch.preconnect(list[i]); }
+      catch (e) { try { console.error("error: " + ((e && e.message) || e) + ": " + list[i]); } catch (e2) {} }
+    }
+  };
+  if (G.__mbunHttpNative) __mbunDoCliPreconnects();
+  else if (G.queueMicrotask) G.queueMicrotask(__mbunDoCliPreconnects);
 })();
 )JS";
 

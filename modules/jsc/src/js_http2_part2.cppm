@@ -1016,7 +1016,9 @@ export constexpr std::string_view kHttp2JS_part2 = R"JS(
     _onSocketClose() { this._teardown(); }
     _teardown(hard) {
       if (this.destroyed) return;
-      this.destroyed = true; this.closed = true;
+      // See the client session's _teardown: node's SESSION_FLAGS_CLOSED is set by
+      // close() alone, never by a destroy.
+      this.destroyed = true;
       if (this._timer != null) { try { G.clearTimeout(this._timer); } catch (e) {} this._timer = null; }
       cancelSessionPings(this);
       closeSessionSocket(this._rawSocket, hard !== false);
@@ -1086,7 +1088,34 @@ export constexpr std::string_view kHttp2JS_part2 = R"JS(
       this._destroyPending = false;
       this._teardown(false);
     }
-    destroy(err, code) { if (this.destroyed) return; if (err) { const self = this; this._teardown(); G.queueMicrotask(() => self.emit("error", err)); } else this._teardown(); }
+    // See normalizeSessionDestroy / sessionFatalWithCode in part 1: node's
+    // `destroy(error = NGHTTP2_NO_ERROR, code)` treats a numeric first argument as
+    // the NGHTTP2 code, sends the GOAWAY that carries it, and resets every open
+    // stream with it.
+    destroy(err, code) {
+      if (this.destroyed) return;
+      ({ err, code } = normalizeSessionDestroy(err, code));
+      if (typeof code === "number") this._destroyCode = code;
+      if (!err) { this._teardown(); return; }
+      sessionFatalWithCode(this, err, code);
+    }
+    // The server session had no _fatal of its own; sessionFatalWithCode needs the
+    // same contract as the client's (tear down, then report on the session AND on
+    // the streams the teardown just took away, with the session's reset code).
+    _fatal(err, hard) {
+      if (this.destroyed) return;
+      const streams = Array.from(this.streams.values());
+      const self = this;
+      this._teardown(hard);
+      G.queueMicrotask(() => {
+        self.emit("error", err);
+        for (const s of streams) {
+          s.rstCode = typeof self._destroyCode === "number" ? self._destroyCode : constants.NGHTTP2_INTERNAL_ERROR;
+          s._closed = true;
+          try { s.emit("error", err); } catch (e) {}
+        }
+      });
+    }
     ref() { if (this._rawSocket && this._rawSocket.ref) this._rawSocket.ref(); return this; }
     unref() { if (this._rawSocket && this._rawSocket.unref) this._rawSocket.unref(); return this; }
     // PORT-SOURCE: compat/node/lib/internal/http2/core.js Http2Session `get socket()`
@@ -1211,12 +1240,10 @@ export constexpr std::string_view kHttp2JS_part2 = R"JS(
   }
 
   // === Http2ServerRequest / Http2ServerResponse (createServer((req,res)) compat) ===
-  // Translated from node lib/internal/http2/compat.js. The request keeps the
-  // Http2Stream's flowing-mode 'data' relay rather than a real Readable (mbun's
-  // Http2Stream is an EventEmitter, not a stream), but every observable member
-  // node's compat layer defines — header validation and its error codes, the
-  // socket proxy, statusCode/statusMessage semantics, writeHead's array form,
-  // trailers, informational responses — is ported as written there.
+  // Translated from node lib/internal/http2/compat.js. Http2ServerRequest is a
+  // real Readable over the underlying Http2Stream Duplex, matching node's
+  // compatibility layer: data starts flowing on the first _read(), backpressure
+  // pauses the stream, and the stream's END_STREAM pushes readable EOF.
   const HTTP_STATUS_CONTINUE = 100, HTTP_STATUS_EARLY_HINTS = 103;
   const HTTP_STATUS_EXPECTATION_FAILED = 417, HTTP_STATUS_METHOD_NOT_ALLOWED = 405;
   const kValidPseudoHeaders = new Set([":status", ":method", ":path", ":authority", ":scheme"]);
@@ -1322,9 +1349,12 @@ export constexpr std::string_view kHttp2JS_part2 = R"JS(
     return stream._proxySocket;
   }
 
-  class Http2ServerRequest extends EE {
+  const H2RequestBase = (streamMod && typeof streamMod.Readable === "function") ? streamMod.Readable : EE;
+  const kHaveRequestReadable = H2RequestBase !== EE;
+
+  class Http2ServerRequest extends H2RequestBase {
     constructor(stream, headers, options, rawHeaders) {
-      super();
+      super(kHaveRequestReadable ? { autoDestroy: false, ...(options || {}) } : undefined);
       this._state = { closed: false, didRead: false };
       this._headers = headers || {};
       this._rawHeaders = rawHeaders || [];
@@ -1332,21 +1362,40 @@ export constexpr std::string_view kHttp2JS_part2 = R"JS(
       this._rawTrailers = [];
       this._stream = stream;
       this._aborted = false;
-      this.readable = true;
-      this.readableEnded = false;
-      this.destroyed = false;
+      if (!kHaveRequestReadable) {
+        this.readable = true;
+        this.readableEnded = false;
+        this.destroyed = false;
+      }
       stream._proxySocket = null;
       stream._compatRequest = this;
       const self = this;
-      stream.on("data", (d) => self.emit("data", d));
       stream.on("trailers", (trailers, flags, raw) => {
         Object.assign(self._trailers, trailers || {});
         if (Array.isArray(raw)) for (const v of raw) self._rawTrailers.push(v);
       });
-      stream.on("end", () => { self.readableEnded = true; self.readable = false; self.emit("end"); });
+      stream.on("end", () => {
+        if (kHaveRequestReadable) self.push(null);
+        else { self.readableEnded = true; self.readable = false; self.emit("end"); }
+      });
       stream.on("aborted", () => { if (!self._state.closed) { self._aborted = true; self.emit("aborted"); } });
-      stream.on("close", () => { self._state.closed = true; stream._proxySocket = null; self.emit("close"); });
+      stream.on("close", () => {
+        self._state.closed = true;
+        if (kHaveRequestReadable) {
+          self.push(null);
+          if (!self._state.didRead && !(self._readableState && self._readableState.resumeScheduled)) self.resume();
+        }
+        stream._proxySocket = null;
+        stream._compatRequest = undefined;
+        self.emit("close");
+      });
       stream.on("timeout", () => self.emit("timeout"));
+      if (kHaveRequestReadable) {
+        self.on("pause", () => stream.pause());
+        self.on("resume", () => stream.resume());
+      } else {
+        stream.on("data", (d) => self.emit("data", d));
+      }
       // node compat.js attaches onStreamError, a DELIBERATELY EMPTY handler:
       // "errors in compatibility mode are not forwarded to the request and
       // response objects". Without it the stream error a compat write-after-end
@@ -1367,6 +1416,16 @@ export constexpr std::string_view kHttp2JS_part2 = R"JS(
     get httpVersion() { return "2.0"; }
     get socket() { return proxySocketOf(this._stream); }
     get connection() { return this.socket; }
+    _read() {
+      if (!kHaveRequestReadable) return;
+      if (!this._state.didRead) {
+        this._state.didRead = true;
+        const self = this;
+        this._stream.on("data", (chunk) => { if (!self.push(chunk)) self._stream.pause(); });
+      } else {
+        G.queueMicrotask(() => this._stream.resume());
+      }
+    }
     get method() { return this._headers[":method"]; }
     set method(method) {
       validateString(method, "method");
@@ -1377,20 +1436,7 @@ export constexpr std::string_view kHttp2JS_part2 = R"JS(
     get scheme() { return this._headers[":scheme"]; }
     get url() { return this._headers[":path"]; }
     set url(url) { this._headers[":path"] = url; }
-    setEncoding(enc) { this._stream.setEncoding(enc); return this; }
     setTimeout(msecs, callback) { if (!this._state.closed) this._stream.setTimeout(msecs, callback); return this; }
-    resume() { this._stream.resume(); this.emit("resume"); return this; }
-    pause() { this._stream.pause(); this.emit("pause"); return this; }
-    read() { return null; }
-    destroy(err) { if (this.destroyed) return this; this.destroyed = true; this._stream.destroy(err); return this; }
-    pipe(dest, options) {
-      const self = this;
-      const endDest = !(options && options.end === false);
-      this.on("data", (chunk) => { dest.write(chunk); });
-      this.on("end", () => { if (endDest && typeof dest.end === "function") dest.end(); });
-      try { if (typeof dest.emit === "function") dest.emit("pipe", self); } catch (e) {}
-      return dest;
-    }
   }
 
   class Http2ServerResponse extends EE {

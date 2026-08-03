@@ -334,6 +334,58 @@ inline bool asym_enc_map(std::string_view type, bool priv, int& sel, const char*
     return false;
 }
 
+// --- post-quantum key types (OpenSSL >= 3.5) -------------------------------
+// node's asymmetricKeyType spelling for these families is exactly OpenSSL's own
+// algorithm name lowercased, and the JWK "alg" is that canonical name VERBATIM.
+// That is why SLH-DSA's trailing f/s stays lowercase in the JWK while ML-DSA and
+// ML-KEM look fully uppercase — it is not a special case, it is the provider's
+// own casing showing through. So one list of node names is enough for both
+// directions: OpenSSL resolves a name through its namemap case-insensitively on
+// the way in, and EVP_PKEY_get0_type_name() supplies the canonical form on the
+// way out. A second hand-written table mapping node → OpenSSL spelling would be
+// a thing to keep in sync for no gain, and would get SLH-DSA's casing wrong.
+// ref: node lib/internal/crypto/keys.js + src/crypto/crypto_keys.cc (AKP JWK).
+inline bool asym_is_pqc_name(std::string_view lower) {
+    static constexpr std::string_view kNames[]{
+        "ml-dsa-44", "ml-dsa-65", "ml-dsa-87",
+        "ml-kem-512", "ml-kem-768", "ml-kem-1024",
+        "slh-dsa-sha2-128s", "slh-dsa-sha2-128f", "slh-dsa-sha2-192s", "slh-dsa-sha2-192f",
+        "slh-dsa-sha2-256s", "slh-dsa-sha2-256f",
+        "slh-dsa-shake-128s", "slh-dsa-shake-128f", "slh-dsa-shake-192s", "slh-dsa-shake-192f",
+        "slh-dsa-shake-256s", "slh-dsa-shake-256f",
+    };
+    return std::ranges::find(kNames, lower) != std::ranges::end(kNames);
+}
+
+inline std::string asym_lower(std::string_view s) {
+    std::string out;
+    out.reserve(s.size());
+    for (char c : s) { out.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c)))); }
+    return out;
+}
+
+// The canonical spelling of a PQC name, derived rather than tabulated: uppercase
+// throughout, except that SLH-DSA keeps its trailing f/s lowercase. `lower` must
+// already have passed asym_is_pqc_name.
+inline std::string asym_pqc_jwk_alg(std::string_view lower) {
+    std::string out;
+    out.reserve(lower.size());
+    for (char c : lower) { out.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(c)))); }
+    if (lower.starts_with("slh-dsa-") && !out.empty()) {
+        out.back() = static_cast<char>(std::tolower(static_cast<unsigned char>(out.back())));
+    }
+    return out;
+}
+
+// The key's canonical OpenSSL name when it is one of the PQC families, else "".
+// Used both to gate the PQC arms and to fill the JWK "alg" with the exact casing
+// node reports.
+inline std::string asym_pqc_canonical(EVP_PKEY* pkey) {
+    const char* name{EVP_PKEY_get0_type_name(pkey)};
+    if (name == nullptr) { return {}; }
+    return asym_is_pqc_name(asym_lower(name)) ? std::string{name} : std::string{};
+}
+
 #include "crypto_asym_keygen.inc"
 
 // __mbunCryptoAsymNative.generateKeyPair(type, modLen, namedCurve, pubType,
@@ -382,6 +434,16 @@ JSC_DEFINE_HOST_FUNCTION(node_asym_generate_host,
         pkey.reset(EVP_PKEY_Q_keygen(nullptr, nullptr, "X25519"));
     } else if (type == "x448") {
         pkey.reset(EVP_PKEY_Q_keygen(nullptr, nullptr, "X448"));
+    } else if (asym_is_pqc_name(type)) {
+        // Nothing to configure: ML-DSA/ML-KEM/SLH-DSA parameter sets are chosen
+        // by the algorithm NAME, not by a keygen parameter, which is why node
+        // exposes twelve SLH-DSA "types" rather than one type plus options.
+        const std::string osslName{[&] {
+            std::string u{type};
+            for (char& c : u) { c = static_cast<char>(std::toupper(static_cast<unsigned char>(c))); }
+            return u;
+        }()};
+        pkey.reset(EVP_PKEY_Q_keygen(nullptr, nullptr, osslName.c_str()));
     } else {
         return hasher_throw(global, "Unsupported key type: " + type);
     }
@@ -1191,6 +1253,103 @@ JSC_DEFINE_HOST_FUNCTION(node_asym_kmac_host,
     return JSC::JSValue::encode(toJS(global, static_cast<JSValueRef>(asym_u8(ctx, out))));
 }
 
+// __mbunCryptoAsymNative.argon2(type, message, nonce, parallelism, tagLength,
+//   memory, passes, secret, associatedData) → Uint8Array tag, or throws
+//   "Argon2 derivation failed" when the KDF rejects the parameters.
+//
+// `type` is node's kTypeArgon2{d,i,id} enum (0/1/2 — src/crypto/crypto_argon2.h).
+// Backed by OpenSSL's own ARGON2 KDF (>= 3.2), which is exactly what node's
+// Argon2Job drives, so the RFC 9106 test vectors — including the `secret` (key)
+// and `ad` inputs, which are part of the hashed prefix — match bit for bit
+// rather than by reimplementation. mbun.crypto's argon2 stays the Bun-side
+// password hasher; it has no secret/ad-carrying entry point on this path and
+// duplicating the KDF in JS would be a second, divergent implementation.
+//
+// memory ("memcost") is in KiB and lanes/iter are uint32, matching node's
+// ArgonOptions. Everything out of range is rejected by the provider itself —
+// this bridge deliberately adds NO parameter policy of its own, so the JS layer
+// (which ports node's validators verbatim) stays the single source of truth and
+// a value that slips past it still produces a clean error instead of UB.
+JSC_DEFINE_HOST_FUNCTION(node_asym_argon2_host,
+                         (JSC::JSGlobalObject* global, JSC::CallFrame* frame)) {
+    JSContextRef ctx{toRef(global)};
+    const int type{asym_int(native_arg(frame, 0), 2)};
+    const char* algo{type == 0 ? "ARGON2D" : (type == 1 ? "ARGON2I" : "ARGON2ID")};
+    std::vector<std::uint8_t> message;
+    std::vector<std::uint8_t> nonce;
+    std::vector<std::uint8_t> secret;
+    std::vector<std::uint8_t> ad;
+    asym_read(global, native_arg(frame, 1), message);
+    asym_read(global, native_arg(frame, 2), nonce);
+    asym_read(global, native_arg(frame, 7), secret);
+    asym_read(global, native_arg(frame, 8), ad);
+    // Doubles, not ints: node's validators allow up to 2^32-1, which does not
+    // fit an int. Out-of-range values reach the provider and are rejected there.
+    const auto u32 = [](JSC::JSValue v, std::uint32_t dflt) -> std::uint32_t {
+        if (!v || !v.isNumber()) { return dflt; }
+        const double d{v.asNumber()};
+        if (!(d >= 0.0) || d > 4294967295.0) { return 0; }
+        return static_cast<std::uint32_t>(d);
+    };
+    std::uint32_t lanes{u32(native_arg(frame, 3), 1)};
+    const double tagLenD{native_arg(frame, 4) && native_arg(frame, 4).isNumber()
+                             ? native_arg(frame, 4).asNumber()
+                             : 64.0};
+    std::uint32_t memcost{u32(native_arg(frame, 5), 8)};
+    std::uint32_t iter{u32(native_arg(frame, 6), 3)};
+    // One thread: OpenSSL's argon2 walks the lanes sequentially unless a thread
+    // pool was installed on the library context, and node does not install one.
+    std::uint32_t threads{1};
+
+    const auto fail = [&]() {
+        ERR_clear_error();
+        return hasher_throw(global, "Argon2 derivation failed");
+    };
+    // A tag OpenSSL cannot allocate is a parameter error, not an OOM claim.
+    if (!(tagLenD >= 4.0) || tagLenD > 4294967295.0) { return fail(); }
+    const std::size_t tagLen{static_cast<std::size_t>(tagLenD)};
+
+    struct KdfDel { void operator()(EVP_KDF* k) const { if (k) EVP_KDF_free(k); } };
+    struct KdfCtxDel { void operator()(EVP_KDF_CTX* c) const { if (c) EVP_KDF_CTX_free(c); } };
+    std::unique_ptr<EVP_KDF, KdfDel> kdf{EVP_KDF_fetch(nullptr, algo, nullptr)};
+    if (!kdf) { return fail(); }
+    std::unique_ptr<EVP_KDF_CTX, KdfCtxDel> kctx{EVP_KDF_CTX_new(kdf.get())};
+    if (!kctx) { return fail(); }
+
+    // An OSSL_PARAM octet string with a NULL data pointer is rejected outright,
+    // and `std::vector::data()` on an empty vector is allowed to be NULL. An
+    // EMPTY password is a legitimate Argon2 input (RFC 9106 and node's own test
+    // vectors both cover it), so a zero-length parameter must still carry a
+    // non-null address — hence the sentinel rather than a size-0 nullptr.
+    static std::uint8_t kEmptyOctet[1]{0};
+    const auto bytes = [](std::vector<std::uint8_t>& v) -> void* {
+        return v.empty() ? static_cast<void*>(kEmptyOctet) : static_cast<void*>(v.data());
+    };
+    OSSL_PARAM params[9];
+    int n{0};
+    params[n++] = OSSL_PARAM_construct_octet_string(
+        OSSL_KDF_PARAM_PASSWORD, bytes(message), message.size());
+    params[n++] = OSSL_PARAM_construct_octet_string(
+        OSSL_KDF_PARAM_SALT, bytes(nonce), nonce.size());
+    if (!secret.empty()) {
+        params[n++] = OSSL_PARAM_construct_octet_string(
+            OSSL_KDF_PARAM_SECRET, secret.data(), secret.size());
+    }
+    if (!ad.empty()) {
+        params[n++] = OSSL_PARAM_construct_octet_string(
+            OSSL_KDF_PARAM_ARGON2_AD, ad.data(), ad.size());
+    }
+    params[n++] = OSSL_PARAM_construct_uint32(OSSL_KDF_PARAM_ARGON2_LANES, &lanes);
+    params[n++] = OSSL_PARAM_construct_uint32(OSSL_KDF_PARAM_ARGON2_MEMCOST, &memcost);
+    params[n++] = OSSL_PARAM_construct_uint32(OSSL_KDF_PARAM_ITER, &iter);
+    params[n++] = OSSL_PARAM_construct_uint32(OSSL_KDF_PARAM_THREADS, &threads);
+    params[n] = OSSL_PARAM_construct_end();
+
+    std::vector<std::uint8_t> out(tagLen);
+    if (EVP_KDF_derive(kctx.get(), out.data(), out.size(), params) <= 0) { return fail(); }
+    return JSC::JSValue::encode(toJS(global, static_cast<JSValueRef>(asym_u8(ctx, out))));
+}
+
 JSC_DEFINE_HOST_FUNCTION(node_asym_okp_derive_host,
                          (JSC::JSGlobalObject* global, JSC::CallFrame* frame)) {
     JSContextRef ctx{toRef(global)};
@@ -1285,7 +1444,16 @@ JSC_DEFINE_HOST_FUNCTION(node_asym_key_type_host,
         case EVP_PKEY_ED448: type = "ed448"; break;
         case EVP_PKEY_X25519: type = "x25519"; break;
         case EVP_PKEY_X448: type = "x448"; break;
-        default: type = "unknown"; break;
+        default: {
+            // The PQC families have no stable legacy NID to switch on, so they
+            // are identified by provider name. Deliberately gated on the known
+            // list rather than reporting any provider name lowercased: an
+            // unrecognised key must stay "unknown", which is what node reports
+            // and what the JS layer's RAW_ASYM_TYPES check keys off.
+            const std::string canonical{asym_pqc_canonical(pkey.get())};
+            type = canonical.empty() ? "unknown" : asym_lower(canonical);
+            break;
+        }
     }
     JSObjectRef obj{JSObjectMake(ctx, nullptr, nullptr)};
     set_prop(ctx, obj, "type", make_string(ctx, type));

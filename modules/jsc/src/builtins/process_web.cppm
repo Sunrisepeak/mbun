@@ -693,15 +693,13 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
         if (value !== undefined) childEnv[key] = String(value);
       }
       if (ipcIndex >= 0) {
-        // node advertises the child's end of the channel through NODE_CHANNEL_FD
-        // (lib/internal/child_process.js spawn()); the fd number is the slot index.
-        // The serialization mode travels the same way, in
-        // NODE_CHANNEL_SERIALIZATION_MODE, so the child frames its half
-        // identically without being told twice.
+        // node advertises the IPC fd and serialization through the environment.
         const e = {};
         for (const k of Object.keys(childEnv)) e[k] = childEnv[k];
         e.NODE_CHANNEL_FD = String(ipcIndex);
         e.NODE_CHANNEL_SERIALIZATION_MODE = options.serialization === "advanced" ? "advanced" : "json";
+        if (options.__mbunTsconfig && G.process.__mbunTsconfigOverride)
+          e.MBUN_INTERNAL_TSCONFIG_OVERRIDE = G.process.__mbunTsconfigOverride;
         sopts.env = e;
       } else {
         sopts.env = childEnv;
@@ -1420,11 +1418,11 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     } else {
       stdio = stdio.slice();
     }
-    // node prepends the parent's execArgv (or options.execArgv) before the
-    // module path so the child inherits the same runtime flags.
-    const execArgv = options.execArgv !== undefined ? options.execArgv : ((G.process && G.process.execArgv) || []);
+    // node prepends the inherited (or explicit) execArgv before the module.
+    const inheritsExecArgv = options.execArgv == null;
+    const execArgv = inheritsExecArgv ? ((G.process && G.process.execArgv) || []) : options.execArgv;
     const child = new ChildProcess();
-    child.spawn({ file: exe, args: [exe].concat((execArgv || []).map(toStr), [toStr(modulePath)], (args || []).map(toStr)), cwd: options.cwd, env: options.env, stdio, detached: options.detached, timeout: options.timeout, killSignal: options.killSignal, signal: options.signal, serialization: validateSerialization(options.serialization) });
+    child.spawn({ file: exe, args: [exe].concat(execArgv.map(toStr), [toStr(modulePath)], (args || []).map(toStr)), cwd: options.cwd, env: options.env, stdio, detached: options.detached, timeout: options.timeout, killSignal: options.killSignal, signal: options.signal, serialization: validateSerialization(options.serialization), __mbunTsconfig: inheritsExecArgv });
     return child;
   }
 
@@ -1478,26 +1476,32 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
   // follows the target stream's isTTY. ref bun src/js/node/console.ts formatWithOptions.
   // ---- Console#table (https://console.spec.whatwg.org/#table) --------------
   // Blueprint: bun src/js/builtins/ConsoleObject.ts:180-250 (tableChars +
-  // renderRow/table) and :645-739 (the `table` method). Bun centers each cell
-  // within its display-width column; Node's cli_table keeps cells left-aligned.
-  // The process dialect selects the native contract without inspecting tests.
+  // renderRow/table) and :645-739 (the `table` method). Node's cli_table keeps
+  // every cell left-aligned; Console#table centers. `bunNative` is a THIRD
+  // contract, not a synonym for either: bun's native TablePrinter right-aligns
+  // column 0 (row label/index) and left-aligns the rest. Ground truth is bun's
+  // own committed snapshot, not inference -- test/js/bun/console/__snapshots__/
+  // console-table.test.ts.snap has "|   foo |" / "| 10 |" against "| 42     |".
+  // Opt-in, so consoleTableImpl's centering stays as it is.
   const tableChars = { middleMiddle: "─", rowMiddle: "┼", topRight: "┐", topLeft: "┌", leftMiddle: "├",
                        topMiddle: "┬", bottomRight: "┘", bottomLeft: "└", bottomMiddle: "┴",
                        rightMiddle: "┤", left: "│ ", right: " │", middle: " │ " };
   // Display width, not code-unit length: a CJK/emoji cell occupies two columns.
   const tableCellWidth = (s) => (G.Bun && typeof G.Bun.stringWidth === "function" ? G.Bun.stringWidth(String(s)) : String(s).length);
-  const renderTableRow = (row, widths, measure = row) => {
+  const renderTableRow = (row, widths, measure = row, bunNative = false) => {
     let out = tableChars.left;
     for (let i = 0; i < row.length; i++) {
       const cell = row[i];
-      const needed = Math.max(0, (widths[i] - tableCellWidth(measure[i])) / 2);
-      if (G.__mbunDialect === "node") out += cell + " ".repeat(Math.max(0, widths[i] - tableCellWidth(measure[i])));
+      const pad = Math.max(0, widths[i] - tableCellWidth(measure[i]));
+      const needed = pad / 2;
+      if (G.__mbunDialect === "node") out += cell + " ".repeat(pad);
+      else if (bunNative) out += i === 0 ? " ".repeat(pad) + cell : cell + " ".repeat(pad);
       else out += " ".repeat(needed) + cell + " ".repeat(Math.ceil(needed));
       if (i !== row.length - 1) out += tableChars.middle;
     }
     return out + tableChars.right;
   };
-  const renderTable = (head, columns, formatCell) => {
+  const renderTable = (head, columns, formatCell, bunNative = false) => {
     const format = (value, row, column) => formatCell ? formatCell(value, row, column) : { text: value, width: value };
     const renderedHead = head.map((value, column) => format(value, -1, column));
     const widths = renderedHead.map((cell) => tableCellWidth(cell.width));
@@ -1514,9 +1518,9 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     }
     const divider = widths.map((w) => tableChars.middleMiddle.repeat(w + 2));
     let result = tableChars.topLeft + divider.join(tableChars.topMiddle) + tableChars.topRight + "\n" +
-                 renderTableRow(renderedHead.map((cell) => cell.text), widths, renderedHead.map((cell) => cell.width)) + "\n" +
+                 renderTableRow(renderedHead.map((cell) => cell.text), widths, renderedHead.map((cell) => cell.width), bunNative) + "\n" +
                  tableChars.leftMiddle + divider.join(tableChars.rowMiddle) + tableChars.rightMiddle + "\n";
-    for (const row of rows) result += renderTableRow(row.map((cell) => cell.text), widths, row.map((cell) => cell.width)) + "\n";
+    for (const row of rows) result += renderTableRow(row.map((cell) => cell.text), widths, row.map((cell) => cell.width), bunNative) + "\n";
     return result + tableChars.bottomLeft + divider.join(tableChars.bottomMiddle) + tableChars.bottomRight;
   };
   // `logFn` is the console's own log (stream routing + formatting stay the
@@ -1614,7 +1618,7 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
       }
       const text = String(value);
       return { text, width: text };
-    }) + "\n";
+    }, /*bunNative*/ true) + "\n";
     if (tabularData instanceof Map) {
       const index = [], keys = [], values = [];
       let i = 0;
@@ -1666,7 +1670,8 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
   const kColorMode = Symbol("kColorMode");
   const kInspectOptions = Symbol("kInspectOptions");
   const kCounts = Symbol("counts");
-  const kTimes = Symbol("times");
+  // node keeps the console time map on the PUBLIC `_times` property
+  // (lib/internal/console/constructor.js kBindProperties), not a symbol.
   const kWriteToConsole = Symbol("kWriteToConsole");
   const kGetInspectOptions = Symbol("kGetInspectOptions");
   const kUseStdout = Symbol("stdout");
@@ -1692,9 +1697,9 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
     log(...args) { this[kWriteToConsole](kUseStdout, util.formatWithOptions(this[kGetInspectOptions](this._stdout), ...args)); },
     warn(...args) { this[kWriteToConsole](kUseStderr, util.formatWithOptions(this[kGetInspectOptions](this._stderr), ...args)); },
     dir(object, options) { this[kWriteToConsole](kUseStdout, util.inspect(object, Object.assign({ customInspect: false }, this[kGetInspectOptions](this._stdout), options))); },
-    time(label = "default") { label = `${label}`; if (this[kTimes].has(label)) return; this[kTimes].set(label, conNowNs()); },
-    timeEnd(label = "default") { label = `${label}`; const t = this[kTimes].get(label); if (t === undefined) return; this[kWriteToConsole](kUseStdout, label + ": " + conFormatDur(conNowNs() - t)); this[kTimes].delete(label); },
-    timeLog(label = "default", ...data) { label = `${label}`; const t = this[kTimes].get(label); if (t === undefined) return; this.log(label + ": " + conFormatDur(conNowNs() - t), ...data); },
+    time(label = "default") { label = `${label}`; if (this._times.has(label)) return; this._times.set(label, conNowNs()); },
+    timeEnd(label = "default") { label = `${label}`; const t = this._times.get(label); if (t === undefined) return; this[kWriteToConsole](kUseStdout, label + ": " + conFormatDur(conNowNs() - t)); this._times.delete(label); },
+    timeLog(label = "default", ...data) { label = `${label}`; const t = this._times.get(label); if (t === undefined) return; this.log(label + ": " + conFormatDur(conNowNs() - t), ...data); },
     trace(...args) { this[kWriteToConsole](kUseStderr, "Trace: " + util.formatWithOptions(this[kGetInspectOptions](this._stderr), ...args)); },
     assert(expression, ...args) { if (!expression) { args[0] = "Assertion failed" + (args.length === 0 ? "" : ": " + args[0]); this.warn(...args); } },
     clear() { const s = this._stdout; if (s && s.isTTY && typeof s.write === "function") { s.write("[1;1H"); s.write("[0J"); } },
@@ -1734,7 +1739,7 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
       "_stdout": na(stdout), "_stderr": na(stderr), "_ignoreErrors": na(Boolean(ignoreErrors)),
       [kColorMode]: na(colorMode),
       [kInspectOptions]: na((typeof inspectOptions === "object" && inspectOptions !== null) ? inspectOptions : undefined),
-      [kCounts]: na(new Map()), [kTimes]: na(new Map()),
+      [kCounts]: na(new Map()), "_times": na(new Map()),
       [kGroupIndent]: na(""), [kGroupIndentWidth]: na(groupIndentation === undefined ? 2 : groupIndentation),
     });
     const keys = Object.keys(Console.prototype);
@@ -1839,7 +1844,7 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
       [kColorMode]: naGlobal("auto"),
       [kInspectOptions]: naGlobal(undefined),
       [kCounts]: naGlobal(new Map()),
-      [kTimes]: naGlobal(new Map()),
+      "_times": naGlobal(new Map()),
       [kGroupIndent]: naGlobal(""),
       [kGroupIndentWidth]: naGlobal(2),
     });
@@ -2547,6 +2552,10 @@ inline constexpr std::string_view kProcessWebJS = R"JS(  // ---- child_process (
       fired++; T.fired++;
       if (bail) break;
     }
+    // As a LIFETIME counter the cap above silently stopped firing every timer
+    // after the process's 200_000th (setTimeout's leak fixtures exited 0
+    // mid-loop). Budget not exhausted => not a runaway => forget the count.
+    if (fired < budget) T.fired = 0;
     const now2 = Date.now();
     let due = 0; for (let i = 0; i < T.q.length; i++) if (T.q[i].at <= now2) due++;
     return due;

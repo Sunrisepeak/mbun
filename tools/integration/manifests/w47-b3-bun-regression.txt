@@ -1,0 +1,16 @@
+compat/bun/test/regression/issue/s3-header-injection.test.ts
+compat/bun/test/regression/issue/18028.test.ts
+compat/bun/test/regression/issue/28914.test.ts
+compat/bun/test/regression/issue/1632.test.ts
+compat/bun/test/regression/issue/24575.test.ts
+compat/bun/test/regression/issue/31401.test.ts
+compat/bun/test/regression/issue/17327.test.ts
+compat/bun/test/regression/issue/21677.test.ts
+compat/bun/test/regression/issue/27358.test.ts
+compat/bun/test/regression/issue/tty-reopen-after-stdin-eof.test.ts
+compat/bun/test/regression/issue/09555.test.ts
+compat/bun/test/regression/issue/03830.test.ts
+compat/bun/test/regression/issue/26360.test.ts
+compat/bun/test/regression/issue/24924.test.ts
+compat/bun/test/regression/issue/22199.test.ts
+compat/bun/test/regression/issue/31002.test.ts

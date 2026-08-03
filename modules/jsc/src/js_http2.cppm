@@ -378,6 +378,35 @@ export constexpr std::string_view kHttp2JS_part1 = R"JS(
   // below keeps errName().
   const sessionErr = (code) => mkErr("Session closed with error code " + code, "ERR_HTTP2_SESSION_ERROR");
   const streamErr = (code) => mkErr("Stream closed with error code " + errName(code), "ERR_HTTP2_STREAM_ERROR");
+  // PORT-SOURCE: compat/node/lib/internal/http2/core.js Http2Session#destroy
+  // (`destroy(error = NGHTTP2_NO_ERROR, code)`) — the first argument doubles as an
+  // NGHTTP2 error code. Shared by both session classes so the client and server
+  // halves cannot drift.
+  function normalizeSessionDestroy(err, code) {
+    if (err === undefined) err = constants.NGHTTP2_NO_ERROR;
+    if (typeof err === "number") {
+      code = err;
+      err = code !== constants.NGHTTP2_NO_ERROR ? sessionErr(code) : undefined;
+    }
+    if (code === undefined && err != null) code = constants.NGHTTP2_INTERNAL_ERROR;
+    return { err, code };
+  }
+  // node closeSession() ends with `handle.destroy(code, socket.destroyed)`, and
+  // nghttp2's session_destroy emits a GOAWAY carrying that code before the
+  // transport goes away — which is the ONLY way the peer learns the code and
+  // reports the matching ERR_HTTP2_SESSION_ERROR. mbun's teardown just dropped the
+  // socket, so `session.destroy(7)` was indistinguishable from a dead connection on
+  // the other end. A graceful teardown is required here: the hard one destroys the
+  // fd and takes the GOAWAY we just queued with it.
+  function sessionFatalWithCode(session, err, code) {
+    if (typeof code === "number" && code !== constants.NGHTTP2_NO_ERROR) {
+      const p = Buffer.alloc(8);
+      p.writeUInt32BE((session._lastStreamId > 0 ? session._lastStreamId : 0) >>> 0, 0);
+      p.writeUInt32BE(code >>> 0, 4);
+      try { session._writeFrame(FRAME.GOAWAY, 0, 0, p); } catch (e) {}
+    }
+    session._fatal(err, false);
+  }
   // ERR_HTTP2_SESSION_ERROR and ERR_HTTP2_ERROR are NOT interchangeable, and
   // mbun used the first for both. node reserves ERR_HTTP2_SESSION_ERROR for a
   // GOAWAY the PEER sent (core.js: `new ERR_HTTP2_SESSION_ERROR(code)`), while
@@ -2407,7 +2436,9 @@ export constexpr std::string_view kHttp2JS_part1 = R"JS(
           const lastStreamId = payload.readUInt32BE(0);
           const code = payload.readUInt32BE(4);
           this.emit("goaway", code, lastStreamId, payload.length > 8 ? Buffer.from(payload.subarray(8)) : undefined);
-          if (code !== 0) { this._fatal(sessionErr(code)); return false; }
+          // node onGoawayData(): the received code becomes `state.goawayCode`, which
+          // Http2Stream#_destroy prefers over any per-stream code when it resets.
+          if (code !== 0) { this._destroyCode = code; this._fatal(sessionErr(code)); return false; }
           // A graceful GOAWAY (NO_ERROR) starts an orderly shutdown but streams
           // with id <= lastStreamId keep running (RFC 9113 6.8); don't tear the
           // socket down now or an in-flight response would be lost.
@@ -2611,14 +2642,20 @@ export constexpr std::string_view kHttp2JS_part1 = R"JS(
       if (this.connecting) { this._fatal(mkErr("Socket has been disconnected from the Http2Session", "ERR_SOCKET_CLOSED")); return; }
       this._teardown();
     }
-    _fatal(err) {
+    _fatal(err, hard) {
       if (this.destroyed) return;
       const streams = Array.from(this.streams.values());
-      this._teardown();
+      this._teardown(hard);
       G.queueMicrotask(() => {
         this.emit("error", err);
         for (const s of streams) {
-          s.rstCode = constants.NGHTTP2_INTERNAL_ERROR; s._closed = true;
+          // node Http2Stream#_destroy: `const sessionCode = sessionState.goawayCode ||
+          // sessionState.destroyCode; … if (sessionCode) code = sessionCode;` — a
+          // stream torn down by its session resets with the SESSION's code, not a
+          // blanket INTERNAL_ERROR. `stream.rstCode` is asserted directly
+          // (test-http2-propagate-session-destroy-code).
+          s.rstCode = typeof this._destroyCode === "number" ? this._destroyCode : constants.NGHTTP2_INTERNAL_ERROR;
+          s._closed = true;
           if (!s.destroyed) { s.destroy(err); continue; }
           // node closeSession() splits the two stream lists: the ones with a
           // handle get the session's error, but `state.pendingStreams` — the
@@ -2655,7 +2692,12 @@ export constexpr std::string_view kHttp2JS_part1 = R"JS(
         // A drained GOAWAY/FIN can have torn the session down already.
         if (this.destroyed) return;
       }
-      this.destroyed = true; this.closed = true;
+      // node closeSession() sets SESSION_FLAGS_DESTROYED only — `closed` is the
+      // separate SESSION_FLAGS_CLOSED that ONLY close() sets. mbun latched both, so
+      // a session torn down by destroy() reported `closed === true` where node
+      // reports false (test-http2-propagate-session-destroy-code asserts it inside
+      // the 'error' handler). Every internal reader here checks `destroyed` first.
+      this.destroyed = true;
       if (this._timer != null) { try { G.clearTimeout(this._timer); } catch (e) {} this._timer = null; }
       cancelSessionPings(this);
       closeSessionSocket(this._rawSocket, hard !== false);
@@ -2775,9 +2817,20 @@ export constexpr std::string_view kHttp2JS_part1 = R"JS(
       const h = nextTurn(() => self._teardown(false));
       if (h && typeof h.unref === "function") h.unref();
     }
+    // PORT-SOURCE: compat/node/lib/internal/http2/core.js Http2Session#destroy —
+    // `destroy(error = NGHTTP2_NO_ERROR, code)`. A NUMBER in the first slot is an
+    // NGHTTP2 error code, not an error object: node converts it into
+    // ERR_HTTP2_SESSION_ERROR and records it as `state.destroyCode`, which is the
+    // code every stream then resets with and the code the GOAWAY carries. mbun
+    // passed the raw number straight through as the error object, so
+    // `session.destroy(NGHTTP2_REFUSED_STREAM)` emitted the number `7` on 'error'
+    // and every consumer reading `err.message` got undefined
+    // (test-http2-propagate-session-destroy-code).
     destroy(err, code) {
       if (this.destroyed) return;
-      if (err) this._fatal(err); else this._teardown();
+      ({ err, code } = normalizeSessionDestroy(err, code));
+      if (typeof code === "number") this._destroyCode = code;
+      if (err) sessionFatalWithCode(this, err, code); else this._teardown();
     }
     ref() { if (this._rawSocket && this._rawSocket.ref) this._rawSocket.ref(); return this; }
     unref() { if (this._rawSocket && this._rawSocket.unref) this._rawSocket.unref(); return this; }

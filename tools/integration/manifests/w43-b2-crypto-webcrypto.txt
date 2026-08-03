@@ -1,0 +1,12 @@
+compat/node/test/parallel/test-crypto-keygen.js
+compat/node/test/parallel/test-crypto-authenticated.js
+compat/node/test/parallel/test-crypto-key-objects-raw.js
+compat/node/test/parallel/test-crypto-no-algorithm.js
+compat/node/test/parallel/test-webcrypto-cryptokey-hidden-slots.js
+compat/node/test/parallel/test-webcrypto-export-import-ec.js
+compat/node/test/parallel/test-crypto-random.js
+compat/node/test/parallel/test-crypto-secure-heap.js
+compat/node/test/parallel/test-webcrypto-crypto-job-mode.js
+compat/node/test/parallel/test-webcrypto-promise-prototype-pollution.mjs
+compat/node/test/parallel/test-crypto-x509.js
+compat/node/test/parallel/test-webcrypto-webidl.js

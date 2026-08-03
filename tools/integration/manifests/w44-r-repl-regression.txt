@@ -1,0 +1,13 @@
+compat/node/test/parallel/test-repl-uncaught-exception-async.js
+compat/node/test/parallel/test-repl-autolibs.js
+compat/node/test/parallel/test-repl-uncaught-exception.js
+compat/node/test/parallel/test-repl-pretty-custom-stack.js
+compat/node/test/parallel/test-repl-tab-complete-computed-props.js
+compat/node/test/parallel/test-repl-tab-complete-new-expression.js
+compat/node/test/parallel/test-repl-user-error-handler.js
+compat/node/test/parallel/test-repl-empty.js
+compat/node/test/parallel/test-repl-multiline.js
+compat/node/test/parallel/test-repl-colors.js
+compat/node/test/parallel/test-repl-eval-error-after-close.js
+compat/node/test/parallel/test-repl-completion-on-getters-disabled.js
+compat/node/test/parallel/test-repl-tab-complete-nosideeffects.js

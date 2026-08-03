@@ -479,17 +479,19 @@ inline constexpr std::string_view kNodeModuleJS = R"JS(
     }),
   });
 
-  // The native module loader owns serialized bytecode.  Keep the public
-  // compile-cache configuration here, however, so CommonJS and ESM callers
-  // agree on one directory and on Node's enable/disable result contract.
-  // Loader-side cache production/consumption is intentionally separate from
-  // this API layer (see the DEFERRED note at the top of this payload).
-  let compileCacheDirectory;
+  // ── module compile cache ───────────────────────────────────────────────────
+  // The cache itself -- directory layout, records, invalidation and the
+  // NODE_DEBUG_NATIVE=COMPILE_CACHE traces -- is owned by the loader
+  // (runtime/compile_cache.inc, ported from node's src/compile_cache.cc),
+  // because that is where module compilation happens. What stays here is
+  // exactly what node keeps in JS (lib/internal/modules/helpers.js): argument
+  // validation and the defaulting of `directory`/`portable` from the
+  // environment. The native side returns the same [status, message, directory]
+  // triple upstream's internalBinding does.
   const compileCacheStatus = Module.constants.compileCacheStatus;
-
-  function compileCacheFs() {
-    return M["node:fs"] || M["fs"];
-  }
+  // Read lazily, not captured: this payload is evaluated as part of the
+  // builtins image, which is not ordered against native binding install.
+  const compileCacheNative = () => G.__mbunCompileCacheNative;
 
   function compileCacheDefaultDirectory() {
     const env = G.process && G.process.env;
@@ -504,30 +506,12 @@ inline constexpr std::string_view kNodeModuleJS = R"JS(
     return invalidArgType("options", "string or Object or undefined", options);
   }
 
-  // NODE_DEBUG_NATIVE=COMPILE_CACHE turns the compile-cache decisions into a
-  // stderr trace.  Node emits these from the native loader; the ones mbun can
-  // honestly report today are the configuration decisions made right here.
-  function compileCacheTrace(message) {
-    const env = G.process && G.process.env;
-    const spec = env && env.NODE_DEBUG_NATIVE;
-    if (!spec || String(spec).indexOf("COMPILE_CACHE") === -1) return;
-    if (G.process && typeof G.process._rawDebug === "function") {
-      G.process._rawDebug("[compile_cache] " + message);
-    } else if (G.process && G.process.stderr && typeof G.process.stderr.write === "function") {
-      G.process.stderr.write("[compile_cache] " + message + "\n");
-    }
-  }
-
   function enableCompileCache(options) {
     const env = G.process && G.process.env;
-    if (env && env.NODE_DISABLE_COMPILE_CACHE === "1") {
-      compileCacheTrace("Disabled by NODE_DISABLE_COMPILE_CACHE");
-      return { status: compileCacheStatus.DISABLED };
-    }
-    if (compileCacheDirectory !== undefined) {
-      return { status: compileCacheStatus.ALREADY_ENABLED, directory: compileCacheDirectory };
-    }
-
+    // NODE_DISABLE_COMPILE_CACHE is decided natively, not here. Upstream splits
+    // it the same way -- helpers.js validates and defaults, EnableCompileCache
+    // decides -- and the split matters: the disable path has to emit its
+    // NODE_DEBUG_NATIVE trace, and the trace writer lives on the native side.
     let directory;
     let portable;
     if (options === undefined || typeof options === "string") {
@@ -544,26 +528,28 @@ inline constexpr std::string_view kNodeModuleJS = R"JS(
     if (typeof directory !== "string") {
       throw invalidArgType("options.directory", "string", directory);
     }
-
-    try {
-      const fs = compileCacheFs();
-      if (!fs || typeof fs.mkdirSync !== "function") {
-        return { status: compileCacheStatus.FAILED, message: "The file system module is unavailable" };
-      }
-      fs.mkdirSync(directory, { recursive: true });
-      compileCacheDirectory = directory;
-      return { status: compileCacheStatus.ENABLED, directory };
-    } catch (error) {
-      return {
-        status: compileCacheStatus.FAILED,
-        message: error && error.message ? String(error.message) : String(error),
-      };
+    if (portable === undefined) {
+      portable = !!(env && env.NODE_COMPILE_CACHE_PORTABLE === "1");
     }
+
+    const native_ = compileCacheNative();
+    if (!native_) {
+      return { status: compileCacheStatus.FAILED, message: "The compile cache is unavailable" };
+    }
+    const native = native_.enable(directory, portable);
+    const result = { status: native[0] };
+    if (native[1]) result.message = native[1];
+    if (native[2]) result.directory = native[2];
+    return result;
   }
 
-  Module.getCompileCacheDir = () => compileCacheDirectory;
+  Module.getCompileCacheDir = () =>
+    (compileCacheNative() ? compileCacheNative().getDir() : undefined);
   Module.enableCompileCache = enableCompileCache;
-  Module.flushCompileCache = () => {};
+  Module.flushCompileCache = () => {
+    const n = compileCacheNative();
+    if (n) n.flush();
+  };
 
   // NODE_COMPILE_CACHE enables the cache during process initialization, before
   // user preloads can call getCompileCacheDir().

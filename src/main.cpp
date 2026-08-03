@@ -25,6 +25,15 @@ using namespace mbun::app;
 
 int main(int argc, char* argv[]) {
     mbun::platform::raise_file_descriptor_limit();
+    // Worker/fork pass the parent's normalized --tsconfig-override through a
+    // one-hop internal environment key while leaving process.execArgv raw. Copy
+    // then erase it before any runtime/JS environment snapshot can expose it.
+    if (const char* inherited{std::getenv("MBUN_INTERNAL_TSCONFIG_OVERRIDE")};
+        inherited != nullptr) {
+        std::string path{inherited};
+        mbun::platform::unset_env_var("MBUN_INTERNAL_TSCONFIG_OVERRIDE");
+        if (!path.empty()) set_inherited_tsconfig_override(std::move(path));
+    }
     // process.argv0 — node snapshots the ORIGINAL argv[0] before anything can
     // rewrite it, and the corpus respawns the runtime through it. Recorded first
     // so every dispatch below (compiled program, node emulation, run, -e) agrees.
@@ -65,6 +74,53 @@ int main(int argc, char* argv[]) {
         return run_embedded_program(*embedded, argc > 0 ? argv[0] : "mbun", embeddedArgs);
     }
     publish_dialect(resolvedDialect);
+
+    // ── NODE_OPTIONS may not select a startup MODE.
+    //    node marks every option kAllowedInEnvvar or not (src/node_options.cc);
+    //    the ones it withholds are those that decide WHAT the process runs
+    //    rather than how it runs — printing a version or help text, an eval
+    //    string, the REPL, a syntax check, the test runner, or the `--`
+    //    terminator. Meeting one in NODE_OPTIONS is fatal before any JS runs:
+    //    "<argv0>: <opt> is not allowed in NODE_OPTIONS", exit 9
+    //    (test-cli-node-options-disallowed enumerates exactly this set).
+    //
+    //    This is node's DENY set, not the complement of its allow set. mbun
+    //    accepts node flags it has not modelled everywhere else, so rejecting by
+    //    allowlist here would turn every uncatalogued flag into a hard startup
+    //    failure — a much larger claim than the one node is making.
+    {
+        static constexpr std::string_view kNotAllowedInNodeOptions[]{
+            "--version", "-v",  "--help",           "--", "-h", "--eval",  "-e",
+            "--print",   "-p",  "-pe",              "-ep",
+            "--check",   "-c",  "--interactive",    "-i",
+            "--v8-options", "--expose_internals", "--expose-internals", "--test"};
+        const auto refuse{[&](std::string_view word) {
+            if (word.empty()) return false;
+            std::string_view name{word};
+            if (const std::size_t eq{word.find('=')}; eq != std::string_view::npos) {
+                name = word.substr(0, eq);
+            }
+            for (const std::string_view bad : kNotAllowedInNodeOptions) {
+                if (name != bad) continue;
+                std::println(std::cerr, "{}: {} is not allowed in NODE_OPTIONS",
+                             argc > 0 ? argv[0] : "mbun", word);
+                return true;
+            }
+            return false;
+        }};
+        if (const char* nodeOptions{std::getenv("NODE_OPTIONS")}; nodeOptions != nullptr) {
+            std::string token{};
+            for (const char c : std::string_view{nodeOptions}) {
+                if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
+                    if (!token.empty() && refuse(token)) return 9;
+                    token.clear();
+                } else {
+                    token.push_back(c);
+                }
+            }
+            if (!token.empty() && refuse(token)) return 9;
+        }
+    }
 
     // ── --enable-fips / --force-fips on a non-FIPS OpenSSL → refuse to start.
     //    node ProcessFipsOptions() (src/crypto/crypto_util.cc) asks OpenSSL for a
@@ -255,6 +311,7 @@ int main(int argc, char* argv[]) {
     // Strip leading global run flags so `mbun [flags] <script>` runs the script,
     // but never past -e/-p/--eval/--print (those consume the next token as code).
     RunFlags globalFlags{};
+    mbun::cli::TsconfigOverrideArg globalTsconfig{};
     while (!args.empty() && !is_eval_flag(args[0])) {
         if (const std::size_t n{take_max_http_header_size_flag(args, 0)}; n > 0) {
             args.erase(args.begin(), args.begin() + static_cast<std::ptrdiff_t>(n));
@@ -312,6 +369,22 @@ int main(int argc, char* argv[]) {
             args.erase(args.begin(), args.begin() + static_cast<std::ptrdiff_t>(n));
             continue;
         }
+        if (const std::size_t n{take_valued_flag(args, 0, "--fetch-preconnect",
+                                                 mbun::jsc::runtime::add_fetch_preconnect)};
+            n > 0) {
+            args.erase(args.begin(), args.begin() + static_cast<std::ptrdiff_t>(n));
+            continue;
+        }
+        if (const std::size_t n{
+                mbun::cli::take_tsconfig_override(args, 0, globalTsconfig)};
+            n > 0) {
+            if (!globalTsconfig.parseError.empty()) {
+                std::println(std::cerr, "error: {}", globalTsconfig.parseError);
+                return 1;
+            }
+            args.erase(args.begin(), args.begin() + static_cast<std::ptrdiff_t>(n));
+            continue;
+        }
         // `--loader .ext:name` / `-l .ext:name` — shared with run/test, not
         // build-only (see apply_loader_flag).
         if (const std::size_t n{take_valued_flag(args, 0, "--loader", apply_loader_flag)};
@@ -355,6 +428,30 @@ int main(int argc, char* argv[]) {
         args.erase(args.begin());
     }
 
+    // Bun applies --cwd before joining the raw tsconfig value, regardless of
+    // their command-line order. Keep the option deferred until a runtime/build
+    // path is selected; --help/--version do not load resolver configuration.
+    const auto applyGlobalTsconfig{[&] {
+        return !globalTsconfig.value || apply_tsconfig_override(*globalTsconfig.value);
+    }};
+
+    // node's stdin main script (lib/internal/main/eval_stdin.js): with no file to
+    // run, node reads the WHOLE of stdin and evaluates it as the main module —
+    // either because an explicit `-` operand asked for it, or because a bare
+    // invocation found stdin was not a terminal (a terminal is the REPL instead).
+    // `-` is not an option, so it keeps its argv slot: `mbun - --opt` must put
+    // --opt at process.argv[2], which is what test-stdin-script-child-option
+    // asserts.
+    if ((!args.empty() && args[0] == "-") ||
+        (args.empty() && !mbun::platform::stdin_is_terminal())) {
+        if (!applyGlobalTsconfig()) return 1;
+        std::vector<std::string> jsArgv{"mbun"};
+        for (const std::string_view a : args) jsArgv.emplace_back(a);
+        mbun::jsc::runtime::set_argv(std::move(jsArgv));
+        const std::string source{std::istreambuf_iterator<char>{std::cin}, {}};
+        return mbun::jsc::runtime::run_eval(source);
+    }
+
     // Node-style re-exec: a leading `--flag` that is neither a bun run-flag nor
     // an eval flag, followed later by a positional entry point, is how the Node
     // corpus re-spawns `process.execPath` (`mbun --expose-gc file.js`,
@@ -378,7 +475,10 @@ int main(int argc, char* argv[]) {
                 break;
             }
         }
-        if (hasPositional) return exec_as_if_node(args);
+        if (hasPositional) {
+            if (!applyGlobalTsconfig()) return 1;
+            return exec_as_if_node(args);
+        }
     }
 
     // `mbun run <script> [args...]` and bare `mbun <script.(m)js> [args...]`
@@ -387,12 +487,28 @@ int main(int argc, char* argv[]) {
         // `bun repl` is a command, not a package.json script named "repl".
         // Keep it before auto-command resolution so both piped REPL input and
         // the command's own -e/-p forms reach the dedicated entry point.
-        if (args[0] == "repl") return exec_bun_repl(std::span{args}.subspan(1));
+        if (args[0] == "repl") {
+            if (!applyGlobalTsconfig()) return 1;
+            return exec_bun_repl(std::span{args}.subspan(1));
+        }
         // `mbun -e <code>` / `mbun --eval <code>`: evaluate a JS/TS string.
         if (is_eval_flag(args[0])) {
-            if (args.size() < 2) {
+            if (!applyGlobalTsconfig()) return 1;
+            // node's `--print` is a BOOLEAN option (node_options.cc), separate
+            // from `--eval`'s string, so the two compose: `-p -e 42` is one
+            // eval whose result is printed. Taking only args[0] made args[1]
+            // ("-e") the source, and `mbun -p -e 42` died with
+            // "ReferenceError: e is not defined" (test-cli-eval runs exactly
+            // that, alongside '-pe' and '--print').
+            std::size_t code_at{0};
+            bool prints{false};
+            while (code_at < args.size() && is_eval_flag(args[code_at])) {
+                prints = prints || eval_flag_prints(args[code_at]);
+                ++code_at;
+            }
+            if (args.size() <= code_at) {
                 std::println(std::cerr, "{}: {} requires an argument",
-                             argc > 0 ? argv[0] : "mbun", args[0]);
+                             argc > 0 ? argv[0] : "mbun", args[code_at - 1]);
                 return 9;
             }
             // argv omits the script slot in eval mode: bun builds argv as
@@ -407,20 +523,33 @@ int main(int argc, char* argv[]) {
                 // exactly <args>. Only the FIRST one is consumed — with
                 // `-- --` the second `--` is a real argument.
                 // ref: regression 17294.
-                auto rest{std::span{args}.subspan(2)};
+                auto rest{std::span{args}.subspan(code_at + 1)};
                 if (!rest.empty() && rest[0] == "--") rest = rest.subspan(1);
                 for (std::string_view a : rest) jsArgv.emplace_back(a);
             }
             mbun::jsc::runtime::set_argv(std::move(jsArgv));
-            std::string code{args[1]};
-            // `-p`/`--print` prints the expression result.
-            if (eval_flag_prints(args[0])) {
-                code = "console.log((() => (" + code + "))())";
+            std::string code{args[code_at]};
+            // `-p`/`--print` prints the result.
+            //
+            // node lib/internal/process/execution.js evalScript compiles
+            // `return eval(<source>)` inside the CJS module wrapper and prints
+            // what that returns — a DIRECT eval, so the printed value is the
+            // SCRIPT COMPLETION VALUE and the source may be statements
+            // (`const`, `if`, a loop), not just an expression.
+            //
+            // Wrapping the source in an arrow-function expression body instead
+            // made every statement a syntax error: `mbun -pe "const a = 1; a"`
+            // died with "error: Unexpected const". The corpus reaches this
+            // through common.spawnPromisified(process.execPath, ['-pe', ...])
+            // and asserts the child's stderr is empty
+            // (test-timers-{timeout,immediate,interval}-promisified).
+            if (prints) {
+                code = "console.log(eval(" + js_quote(args[code_at]) + "))";
             }
             // node/bun expose the ORIGINAL eval source as process._eval
             // (run-eval.test.ts). Set it on the same first line so source-map
             // line numbers are unchanged; args[1] is the pre-wrap source.
-            code = "process._eval=" + js_quote(args[1]) + ";" + code;
+            code = "process._eval=" + js_quote(args[code_at]) + ";" + code;
             // run_eval() prepends node's addBuiltinLibsToObject shim, so both
             // this path and the `node`-argv0 emulation get the builtin globals.
             return mbun::jsc::runtime::run_eval(code);
@@ -433,6 +562,7 @@ int main(int argc, char* argv[]) {
             // Skip run-flags placed after `run` (e.g. `mbun run --bun file.js`);
             // they are stripped before the command but not after the subcommand.
             RunFlags flags{globalFlags};
+            mbun::cli::TsconfigOverrideArg runTsconfig{globalTsconfig};
             std::size_t i = 1;
             while (i < args.size()) {
                 if (const std::size_t n{take_max_http_header_size_flag(args, i)}; n > 0) {
@@ -457,6 +587,24 @@ int main(int argc, char* argv[]) {
                 if (const std::size_t n{take_valued_flag(args, i, "--user-agent",
                                                          mbun::jsc::runtime::set_user_agent)};
                     n > 0) {
+                    args.erase(args.begin() + static_cast<std::ptrdiff_t>(i),
+                               args.begin() + static_cast<std::ptrdiff_t>(i + n));
+                    continue;
+                }
+                if (const std::size_t n{take_valued_flag(args, i, "--fetch-preconnect",
+                                                         mbun::jsc::runtime::add_fetch_preconnect)};
+                    n > 0) {
+                    args.erase(args.begin() + static_cast<std::ptrdiff_t>(i),
+                               args.begin() + static_cast<std::ptrdiff_t>(i + n));
+                    continue;
+                }
+                if (const std::size_t n{
+                        mbun::cli::take_tsconfig_override(args, i, runTsconfig)};
+                    n > 0) {
+                    if (!runTsconfig.parseError.empty()) {
+                        std::println(std::cerr, "error: {}", runTsconfig.parseError);
+                        return 1;
+                    }
                     args.erase(args.begin() + static_cast<std::ptrdiff_t>(i),
                                args.begin() + static_cast<std::ptrdiff_t>(i + n));
                     continue;
@@ -519,6 +667,7 @@ int main(int argc, char* argv[]) {
                 if (!is_skippable_run_flag(args[i])) break;
                 ++i;
             }
+            if (runTsconfig.value && !apply_tsconfig_override(*runTsconfig.value)) return 1;
             // `bun run` with no target prints run's help + the script list
             // (run_command.rs:2456-2466), it is NOT an error.
             if (i >= args.size()) {
@@ -544,6 +693,7 @@ int main(int argc, char* argv[]) {
         // bin_dirs_only=true and allow_fast_run_for_extensions=true here, so an
         // existing file wins outright (no script lookup).
         if (looks_like_script(args[0]) || is_markdown(args[0])) {
+            if (!applyGlobalTsconfig()) return 1;
             return exec_run_target(args[0], std::span{args}.subspan(1), globalFlags,
                                    /*allowFastRunForExtensions=*/true, /*binDirsOnly=*/true);
         }
@@ -565,13 +715,19 @@ int main(int argc, char* argv[]) {
         std::print("{}", USAGE);
         return 0;
     case Action::Test:
-        return run_test(std::span{args}.subspan(1));
+        return run_test(std::span{args}.subspan(1),
+                        globalTsconfig.value
+                            ? std::optional<std::string_view>{*globalTsconfig.value}
+                            : std::nullopt);
     case Action::Install:
         return run_install(std::span{args}.subspan(1));
     case Action::Add:
         return run_add(std::span{args}.subspan(1));
     case Action::Build:
-        return run_build(std::span{args}.subspan(1));
+        return run_build(std::span{args}.subspan(1),
+                         globalTsconfig.value
+                             ? std::optional<std::string_view>{*globalTsconfig.value}
+                             : std::nullopt);
     case Action::Exec:
         return run_exec(parsed.argument);
     case Action::Publish:
@@ -585,6 +741,7 @@ int main(int argc, char* argv[]) {
         // runs node_modules/.bin/eslint, and only when nothing matches does it
         // report `Script not found` + exit 1 (cli/mod.rs:1469-1481 → exec_with_cfg,
         // run_command.rs:2726-2790). --if-present makes the miss silent/0.
+        if (!applyGlobalTsconfig()) return 1;
         return exec_run_target(args[0], std::span{args}.subspan(1), globalFlags,
                                /*allowFastRunForExtensions=*/true, /*binDirsOnly=*/true);
     }

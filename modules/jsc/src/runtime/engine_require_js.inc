@@ -306,6 +306,25 @@ globalThis.__mbun_esm_namespace = function (m, forceCommonJSDefault) {
   return ns;
 };
 globalThis.__mbun_dyn_import = function (req, spec, options) {
+  // js_parser lowers `import(x)` to `__mbun_dyn_import(require, x)` — it captures
+  // the module's require BY NAME, so a CJS module that declares its own `require`
+  // in an enclosing scope hands us that binding instead of the wrapper parameter.
+  // emscripten's node preamble does exactly this, and `var` hoists the shadow over
+  // the whole function, so the name is still undefined when the import runs:
+  //   if (ENVIRONMENT_IS_NODE) {
+  //     let { createRequire: e } = await import("module"); … var require = e(t);
+  //   }
+  // Every emscripten-built package hits it (@electric-sql/pglite, pg-gateway).
+  // Fall back to a cwd-rooted require — same shape as builtins/s3.cppm's
+  // `G.require || (s => G.__mbun_require_native(s, "."))`. Bare specifiers (what
+  // the shadowing preamble always asks for: "module", "fs", "path") resolve
+  // identically; only a relative specifier from such a scope loses its base dir,
+  // which today throws outright.
+  if (typeof req !== "function") {
+    req = typeof globalThis.__mbun_make_require === "function"
+      ? globalThis.__mbun_make_require(".")
+      : globalThis.require;
+  }
   const load = function () {
   // A `data:` URL carries its own source — there is nothing to fetch, so bun
   // decodes and compiles it eagerly and a malformed payload (bad base64) throws

@@ -31,17 +31,134 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
 (function () {
   const G = globalThis;
 
-  // `internal/event_target` and the engine's native Web Event can be separate
-  // realms during builtin initialization. NodeEventTarget's dispatch path is
-  // strict about its own Event brand, so install a post-loader bridge that
-  // converts a native Web Event into the matching internal event only at that
-  // boundary. The hook is invoked after the top-level require is installed.
+  // `internal/bootstrap/realm` — mbun's implementation of the id.
+  //
+  // node's file of that name is its per-realm BOOTSTRAP: on load it reassigns
+  // `process.binding` and `Error.prepareStackTrace` over whatever the host
+  // already installed. Nothing asks for it on purpose — `internal/util/inspect`
+  // needs one symbol from it (`BuiltinModule`) and inspect sits on the
+  // transitive path of most of `lib/internal/**` — so simply making the
+  // vendored tree reachable was enough to take mbun's `process.binding` away
+  // (measured: process-binding.test.ts, "The value of \"err\" is out of range").
+  //
+  // So mbun owns the id: the resolver never offers node's copy for it (see
+  // internal_module_is_mbun_owned_ in runtime/engine.inc) and this table entry
+  // is the single answer, on every path and from every directory. It exports
+  // the same `BuiltinModule` surface node's consumers use, computed from mbun's
+  // OWN builtin table, and mutates nothing.
   try {
-    Object.defineProperty(G, "__mbunPatchNodeEventTarget", {
-      value: function patchNodeEventTarget(req) {
-        if (typeof req !== "function" || G.__mbunNodeEventTargetPatched) return;
-        let internal;
-        try { internal = req("internal/event_target"); } catch (e) { return; }
+    const M = G.__mbunNativeModules;
+    if (M && !M["internal/bootstrap/realm"]) {
+      // node keeps four ids requirable only WITH the `node:` scheme
+      // (lib/internal/bootstrap/realm.js schemelessBlockList).
+      const schemeOnly = ["test", "test/reporters", "sqlite", "quic"];
+      const exists = (id) => typeof id === "string" &&
+        (Object.prototype.hasOwnProperty.call(M, id) ||
+         Object.prototype.hasOwnProperty.call(M, "node:" + id));
+      const BuiltinModule = {
+        // `map` is read as a Map (has/get) by node's loader and by inspect.
+        map: { has: (id) => exists(id), get: (id) => M[id] || M["node:" + id] },
+        exists,
+        canBeRequiredByUsers: (id) => exists(id) && !id.startsWith("internal/"),
+        canBeRequiredWithoutScheme: (id) =>
+          exists(id) && !id.startsWith("internal/") && schemeOnly.indexOf(id) === -1,
+        normalizeRequirableId(id) {
+          if (typeof id === "string" && id.startsWith("node:")) {
+            const n = id.slice(5);
+            return BuiltinModule.canBeRequiredByUsers(n) ? n : "";
+          }
+          return BuiltinModule.canBeRequiredWithoutScheme(id) ? id : "";
+        },
+        isBuiltin: (id) => BuiltinModule.normalizeRequirableId(id) !== "",
+        getSchemeOnlyModuleNames: () => schemeOnly.filter(exists),
+        getCanBeRequiredByUsersWithoutSchemeList: () =>
+          Object.keys(M).filter((id) => BuiltinModule.canBeRequiredWithoutScheme(id)),
+        getAllBuiltinModuleIds: () =>
+          Object.keys(M).filter((id) => !id.startsWith("node:")),
+        // mbun's table has no "internal ids are hidden until a flag exposes
+        // them" phase, so the two mutators node's pre_execution calls are
+        // already satisfied.
+        allowRequireByUsers() {},
+        setRealmAllowRequireByUsers() {},
+        exposeInternals() {},
+      };
+      M["internal/bootstrap/realm"] = { BuiltinModule };
+    }
+  } catch (e) {}
+
+  // `internal/event_target` and the engine's native Web Event can be separate
+  // realms: NodeEventTarget's dispatch path is strict about its own Event
+  // brand, so a native Web Event handed to it is rejected. Convert at exactly
+  // that boundary.
+  //
+  // This used to be a startup bridge that require()d `internal/event_target`
+  // (and `internal/abort_controller`, whose AbortController/AbortSignal it then
+  // republished as the globals). That was the identity hazard in person: it
+  // brought node's copies up in EVERY process where the vendored tree happened
+  // to be reachable, and made node's AbortSignal the process-wide one — so a
+  // platform AbortSignal then failed its own EventTarget brand check
+  // ('The "emitter" argument must be of type EventEmitter or EventTarget.
+  // Received [object AbortSignal]'), which is how widening the resolver's reach
+  // in W44 broke four corpus files.
+  //
+  // So the patch is now a REACTION, not a load: the loader calls it from the
+  // `internal/event_target` identity suffix (runtime/module_loading.inc) with
+  // that module's own exports, and only if something actually required it.
+  // A process that never touches node's event_target pays nothing and keeps
+  // exactly one EventTarget — its own. AbortController/AbortSignal are handled
+  // the same way, in the `internal/abort_controller` suffix, which republishes
+  // the platform pair as node's exports rather than the other way round.
+  try {
+    Object.defineProperty(G, "__mbunAdoptNodeEventTarget", {
+      value: function adoptNodeEventTarget(internal) {
+        if (G.__mbunNodeEventTargetPatched) return;
+        // node's `kEvents` is the private Symbol its EventTarget keys its
+        // listener map on, and `--expose-internals` tests read it directly to
+        // assert a listener was REMOVED (test-events-on-async-iterator's
+        // abortListenerRemovedAfterComplete: `signal[kEvents].get('abort').size`).
+        // Those tests used to see it for the wrong reason -- the startup bridge
+        // had replaced the global AbortSignal with node's, so they were
+        // inspecting node's second implementation. With one AbortSignal per
+        // process the symbol has to be answerable on mbun's own.
+        //
+        // It is a lazy PROJECTION, not bookkeeping: mbun's EventTarget already
+        // keeps its listeners in `kListeners` (a Map of type -> records) and
+        // mbun's AbortSignal in `_l`, so the map node's shape describes can be
+        // built on read from state that already exists. Nothing is wrapped and
+        // nothing is recorded, so add/removeEventListener stay untouched on
+        // every path -- the accessor costs exactly one property definition, and
+        // only in a process that actually loaded node's internal/event_target.
+        //
+        // node deletes a type key once its last listener goes, and the tests
+        // rely on that: they accept either `get(type)` being absent or its
+        // `.size` being 0. Empty types are therefore omitted rather than
+        // reported as empty.
+        try {
+          const kEvents = internal && internal.kEvents;
+          if (typeof kEvents === "symbol") {
+            const asMap = (pairs) => {
+              const m = new Map();
+              for (const p of pairs) if (p[1] > 0) m.set(p[0], { size: p[1] });
+              return m;
+            };
+            const define = (proto, read) => {
+              if (!proto || Object.getOwnPropertyDescriptor(proto, kEvents)) return;
+              Object.defineProperty(proto, kEvents, {
+                get() { return asMap(read(this)); },
+                configurable: true, enumerable: false,
+              });
+            };
+            define(G.AbortSignal && G.AbortSignal.prototype, (s) =>
+              s && Array.isArray(s._l) ? [["abort", s._l.length]] : []);
+            define(G.EventTarget && G.EventTarget.prototype, (t) => {
+              const listeners = t && t[kListeners];
+              if (!listeners || typeof listeners.forEach !== "function") return [];
+              const out = [];
+              listeners.forEach((list, type) => { out.push([type, list ? list.length : 0]); });
+              return out;
+            });
+          }
+        } catch (e) {}
         const NativeEvent = G.Event;
         const InternalEvent = internal && internal.Event;
         const NodeEventTarget = internal && internal.NodeEventTarget;
@@ -65,20 +182,48 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
         Object.defineProperty(G, "__mbunNodeEventTargetPatched", {
           value: true, writable: false, configurable: true, enumerable: false,
         });
-        let abortController;
-        try { abortController = req("internal/abort_controller"); } catch (e) { return; }
-        if (abortController && typeof abortController.AbortController === "function" &&
-            typeof abortController.AbortSignal === "function") {
-          Object.defineProperty(G, "AbortController", {
-            value: abortController.AbortController, writable: true, configurable: true, enumerable: false,
-          });
-          Object.defineProperty(G, "AbortSignal", {
-            value: abortController.AbortSignal, writable: true, configurable: true, enumerable: false,
-          });
-        }
       },
       writable: false, configurable: true, enumerable: false,
     });
+  } catch (e) {}
+
+  // `AbortSignal.any` argument validation, node-exact.
+  //
+  // node's own AbortSignal.any() runs its arguments through the WebIDL
+  // `sequence<AbortSignal>` converter, so a bad argument is an
+  // ERR_INVALID_ARG_TYPE reading "signals[1] is not of type AbortSignal."
+  // (lib/internal/abort_controller.js). The platform AbortSignal throws a plain
+  // TypeError with no `code`. That gap used to be invisible inside the node
+  // corpus for one bad reason: the startup event-target bridge republished
+  // node's AbortSignal as the global there, so node's validation came along
+  // with node's second implementation. With one AbortSignal in the process the
+  // validation has to live on it — same shape as the RegExp diagnostic below:
+  // keep the platform behaviour, normalize only the node-visible diagnostic.
+  try {
+    const AS = G.AbortSignal;
+    if (typeof AS === "function" && typeof AS.any === "function" && !AS.any.__mbunNodeValidated) {
+      const nativeAny = AS.any;
+      const argType = (msg) => { const e = new TypeError(msg); e.code = "ERR_INVALID_ARG_TYPE"; return e; };
+      const anyCompat = function any(signals) {
+        if (signals === null || signals === undefined ||
+            typeof signals[Symbol.iterator] !== "function") {
+          throw argType("signals is not iterable.");
+        }
+        const arr = Array.from(signals);
+        for (let i = 0; i < arr.length; i++) {
+          if (!(arr[i] instanceof AS)) {
+            throw argType("signals[" + i + "] is not of type AbortSignal.");
+          }
+        }
+        return Reflect.apply(nativeAny, this, [arr]);
+      };
+      Object.defineProperty(anyCompat, "name", { value: "any", configurable: true });
+      Object.defineProperty(anyCompat, "length", { value: 1, configurable: true });
+      Object.defineProperty(anyCompat, "__mbunNodeValidated", { value: true });
+      Object.defineProperty(AS, "any", {
+        value: anyCompat, writable: true, configurable: true, enumerable: false,
+      });
+    }
   } catch (e) {}
 
   // JSC's RegExp constructor omits the offending flags from its SyntaxError,
@@ -595,6 +740,13 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
             throw e;
           }
           if (typeof execPath !== "string") throw errInvalidArgType("execPath", "string", execPath);
+          // execve(2) takes a NUL-terminated path, so an embedded NUL would
+          // silently exec a DIFFERENT (prefix) file. bun rejects it up front
+          // (BunProcess.cpp: execPath.contains(u'\0') -> ERR_INVALID_ARG_VALUE);
+          // node's JS layer omits the check and its C++ half truncates. Reject.
+          if (execPath.indexOf("\u0000") !== -1) {
+            throw argValueError("execPath", execPath, "must be a string without null bytes");
+          }
           if (!Array.isArray(args)) throw errInvalidArgType("args", "Array", args);
           for (let i = 0; i < args.length; i++) {
             const arg = args[i];
@@ -1318,8 +1470,20 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
             const e = new Error();
             e.name = "Trace";
             const frames = tracedStack(e).split("\n").slice(1).join("\n");
+            // node tags the warning with the thread that left: the main thread
+            // gets `(node:<pid>)`, a worker `(node:<pid>, thread:<tid>)`
+            // (src/node_errors.cc PrintErrorString callers). mbun runs a worker
+            // as a child process, so the tid comes from worker_threads rather
+            // than from a thread id this process could ask the OS for.
+            let tid = "";
+            try {
+                const wt = G.__mbunNativeModules &&
+                           (G.__mbunNativeModules["worker_threads"] ||
+                            G.__mbunNativeModules["node:worker_threads"]);
+                if (wt && wt.isMainThread === false) tid = ", thread:" + wt.threadId;
+            } catch (e) {}
             const head = "(" + ((proc.release && proc.release.name) || "node") + ":" + proc.pid +
-                         ") WARNING: Exited the environment with code " +
+                         tid + ") WARNING: Exited the environment with code " +
                          (code === undefined || code === null ? (proc.exitCode || 0) : code);
             proc.stderr.write(frames ? head + "\n" + frames + "\n" : head + "\n");
           } catch (e) {}
@@ -1402,6 +1566,355 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
           return out;
         };
         const enabled = (name) => enabledNames().includes(name);
+        // node's TRACE_EVENT macros are handed a COMPOUND category string
+        // ("node,node.fs,node.fs.sync"): the event is recorded when any
+        // comma-separated component is enabled, and the compound string is
+        // written to the file verbatim (src/tracing/trace_event.h).
+        const groupEnabled = (cat) => {
+          if (enabled(cat)) return true;
+          if (cat.indexOf(",") < 0) return false;
+          for (const part of cat.split(",")) if (enabled(part)) return true;
+          return false;
+        };
+        const emit = (ph, cat, name, id, data) => {
+          const event = { ph, cat, name, args: data === undefined ? {} : { data } };
+          if (id !== undefined && id !== null) event.id = "0x" + Number(id).toString(16);
+          record(event);
+        };
+        const CAT_ASYNC = "node,node.async_hooks";
+        const CAT_CONSOLE = "node,node.console";
+        const CAT_ENV = "node,node.environment";
+        const CAT_TP_ASYNC = "node,node.threadpoolwork,node.threadpoolwork.async";
+        const CAT_TP_SYNC = "node,node.threadpoolwork,node.threadpoolwork.sync";
+        let timersInstrumented = false, consoleInstrumented = false, poolInstrumented = false;
+        let nextAsyncId = 2;
+        const TIMER_SPAN = Symbol("mbunTraceTimerSpan");
+
+        // node.async_hooks Timeout spans. The engine's async_hooks ids are
+        // stubs, so the ids are synthesised; node's shape is a 'b' at init
+        // carrying args.data.{executionAsyncId,triggerAsyncId} and an 'e' when
+        // the handle is destroyed (callback fired, or cleared).
+        const installTimers = () => {
+          if (timersInstrumented) return;
+          timersInstrumented = true;
+          const copyOwn = (from, to) => {
+            for (const key of Reflect.ownKeys(from)) {
+              if (key === "prototype") continue;
+              const d = Object.getOwnPropertyDescriptor(from, key);
+              if (d) { try { Object.defineProperty(to, key, d); } catch (e) {} }
+            }
+            return to;
+          };
+          const wrapSet = (original, isInterval) => {
+            if (typeof original !== "function") return original;
+            const wrapped = function (callback, delay) {
+              const rest = Array.prototype.slice.call(arguments, 2);
+              let span = null;
+              if (typeof callback === "function" && (groupEnabled(CAT_ASYNC) || groupEnabled(CAT_ENV))) {
+                if (groupEnabled(CAT_ASYNC)) {
+                  const asyncId = nextAsyncId++;
+                  span = { id: asyncId, open: true };
+                  emit("b", CAT_ASYNC, "Timeout", asyncId, { executionAsyncId: 1, triggerAsyncId: 1 });
+                }
+                const inner = callback;
+                callback = function () {
+                  // node runs every expired timer callback inside its
+                  // RunTimers phase (src/env.cc RunTimers). This call IS that
+                  // phase for this runtime, so the span is sited on it rather
+                  // than asserted after the fact.
+                  const envTrace = groupEnabled(CAT_ENV);
+                  if (envTrace) emit("b", CAT_ENV, "RunTimers");
+                  try { return inner.apply(this, arguments); }
+                  finally {
+                    if (envTrace) emit("e", CAT_ENV, "RunTimers");
+                    if (span && !isInterval && span.open) { span.open = false; emit("e", CAT_ASYNC, "Timeout", span.id); }
+                  }
+                };
+              }
+              const timer = original.apply(this, [callback, delay].concat(rest));
+              if (span && timer && typeof timer === "object") { try { timer[TIMER_SPAN] = span; } catch (e) {} }
+              return timer;
+            };
+            return copyOwn(original, wrapped);
+          };
+          const wrapClear = (original) => {
+            if (typeof original !== "function") return original;
+            const wrapped = function (timer) {
+              if (timer && typeof timer === "object") {
+                const span = timer[TIMER_SPAN];
+                if (span && span.open) { span.open = false; emit("e", CAT_ASYNC, "Timeout", span.id); }
+              }
+              return original.apply(this, arguments);
+            };
+            return copyOwn(original, wrapped);
+          };
+          try {
+            G.setTimeout = wrapSet(G.setTimeout, false);
+            G.setInterval = wrapSet(G.setInterval, true);
+            G.clearTimeout = wrapClear(G.clearTimeout);
+            G.clearInterval = wrapClear(G.clearInterval);
+          } catch (e) {}
+        };
+
+        // node.console: the counter/timer console methods emit counter ('C')
+        // and 'b'/'n'/'e' spans (node lib/internal/console/constructor.js).
+        // The counts and live labels are tracked here because the engine's
+        // console does not expose its own.
+        const installConsole = () => {
+          if (consoleInstrumented) return;
+          consoleInstrumented = true;
+          const con = G.console;
+          if (!con) return;
+          const counts = new Map();
+          const labels = new Set();
+          const oCount = con.count, oReset = con.countReset;
+          const oTime = con.time, oTimeLog = con.timeLog, oTimeEnd = con.timeEnd;
+          try {
+            if (typeof oCount === "function") con.count = function count(label) {
+              const key = String(label === undefined ? "default" : label);
+              const value = (counts.get(key) || 0) + 1;
+              counts.set(key, value);
+              if (groupEnabled(CAT_CONSOLE)) emit("C", CAT_CONSOLE, "count::" + key, 0, value);
+              return oCount.apply(this, arguments);
+            };
+            if (typeof oReset === "function") con.countReset = function countReset(label) {
+              const key = String(label === undefined ? "default" : label);
+              if (counts.has(key)) {
+                counts.delete(key);
+                if (groupEnabled(CAT_CONSOLE)) emit("C", CAT_CONSOLE, "count::" + key, 0, 0);
+              }
+              return oReset.apply(this, arguments);
+            };
+            if (typeof oTime === "function") con.time = function time(label) {
+              const key = String(label === undefined ? "default" : label);
+              if (!labels.has(key)) {
+                labels.add(key);
+                if (groupEnabled(CAT_CONSOLE)) emit("b", CAT_CONSOLE, "time::" + key, 0);
+              }
+              return oTime.apply(this, arguments);
+            };
+            if (typeof oTimeLog === "function") con.timeLog = function timeLog(label) {
+              const key = String(label === undefined ? "default" : label);
+              if (labels.has(key) && groupEnabled(CAT_CONSOLE)) emit("n", CAT_CONSOLE, "time::" + key, 0);
+              return oTimeLog.apply(this, arguments);
+            };
+            if (typeof oTimeEnd === "function") con.timeEnd = function timeEnd(label) {
+              const key = String(label === undefined ? "default" : label);
+              if (labels.delete(key) && groupEnabled(CAT_CONSOLE)) emit("e", CAT_CONSOLE, "time::" + key, 0);
+              return oTimeEnd.apply(this, arguments);
+            };
+          } catch (e) {}
+        };
+
+        // node.threadpoolwork: zlib and crypto hand work to libuv's threadpool.
+        // The engine has no JS-visible completion hook on its own pool, so the
+        // async 'b' goes out at submit time and the sync pair plus the async
+        // 'e' when the user callback runs.
+        const installThreadpool = () => {
+          if (poolInstrumented) return;
+          poolInstrumented = true;
+          const wrap = (original, traceName) => function () {
+            const args = Array.prototype.slice.call(arguments);
+            const cb = args[args.length - 1];
+            if (typeof cb !== "function") return original.apply(this, args);
+            const async_ = groupEnabled(CAT_TP_ASYNC), sync_ = groupEnabled(CAT_TP_SYNC);
+            if (!async_ && !sync_) return original.apply(this, args);
+            if (async_) emit("b", CAT_TP_ASYNC, traceName);
+            args[args.length - 1] = function () {
+              if (sync_) { emit("b", CAT_TP_SYNC, traceName); emit("e", CAT_TP_SYNC, traceName); }
+              if (async_) emit("e", CAT_TP_ASYNC, traceName);
+              return cb.apply(this, arguments);
+            };
+            try { return original.apply(this, args); }
+            catch (e) { if (async_) emit("e", CAT_TP_ASYNC, traceName); throw e; }
+          };
+          const req = (m) => { try { return G.require ? G.require(m) : null; } catch (e) { return null; } };
+          const zlib = req("zlib");
+          if (zlib) for (const m of ["deflate", "gzip", "deflateRaw", "unzip", "inflate", "gunzip",
+                                     "inflateRaw", "brotliCompress", "brotliDecompress",
+                                     "zstdCompress", "zstdDecompress"]) {
+            if (typeof zlib[m] === "function") { try { zlib[m] = wrap(zlib[m], "zlib"); } catch (e) {} }
+          }
+          const cryptoMod = req("crypto");
+          if (cryptoMod && typeof cryptoMod.hkdf === "function") {
+            try { cryptoMod.hkdf = wrap(cryptoMod.hkdf, "crypto"); } catch (e) {}
+          }
+        };
+
+        // node.environment: node emits one span per event-loop phase from
+        // src/env.cc. Only the phases this runtime can actually SITE are
+        // emitted -- each one below is attached to the real moment it happens,
+        // never asserted at exit. node's RunAndClearNativeImmediates and
+        // RunCleanup have no counterpart here (no native-immediate queue, no
+        // cleanup-hook phase), so they are simply absent: the category reports
+        // less than node's, but everything it does report occurred.
+        let envInstrumented = false;
+        const installEnvironment = () => {
+          if (envInstrumented) return;
+          envInstrumented = true;
+          // The environment is up and about to run user code; the matching 'e'
+          // goes out at flush, when it is genuinely being torn down.
+          emit("b", CAT_ENV, "Environment");
+          const wrapImmediate = (original) => {
+            if (typeof original !== "function") return original;
+            const wrapped = function (callback) {
+              if (typeof callback !== "function") return original.apply(this, arguments);
+              const rest = Array.prototype.slice.call(arguments, 1);
+              const inner = callback;
+              const traced = function () {
+                // node runs immediate callbacks inside CheckImmediate.
+                const on = groupEnabled(CAT_ENV);
+                if (on) emit("b", CAT_ENV, "CheckImmediate");
+                try { return inner.apply(this, arguments); }
+                finally { if (on) emit("e", CAT_ENV, "CheckImmediate"); }
+              };
+              return original.apply(this, [traced].concat(rest));
+            };
+            for (const key of Reflect.ownKeys(original)) {
+              if (key === "prototype") continue;
+              const d = Object.getOwnPropertyDescriptor(original, key);
+              if (d) { try { Object.defineProperty(wrapped, key, d); } catch (e) {} }
+            }
+            return wrapped;
+          };
+          try { G.setImmediate = wrapImmediate(G.setImmediate); } catch (e) {}
+          // Fires only when the loop actually drains, which is exactly when
+          // node reaches its BeforeExit phase.
+          try {
+            if (typeof proc.on === "function") proc.on("beforeExit", () => {
+              if (groupEnabled(CAT_ENV)) { emit("b", CAT_ENV, "BeforeExit"); emit("e", CAT_ENV, "BeforeExit"); }
+            });
+          } catch (e) {}
+          // Timers are what carry the RunTimers span, so make sure they are
+          // wrapped even when node.async_hooks was never asked for.
+          installTimers();
+        };
+
+        // node.fs / node.fs_dir: node traces these at its C++ fs binding, one
+        // span per underlying syscall, so a single readFile shows up as
+        // open+fstat+read+close. mbun's fs goes straight to native code with no
+        // binding layer to hook, so the module's own methods are wrapped and
+        // the syscall names come from node's own tables
+        // (src/node_file.cc FS_SYNC_TRACE_BEGIN / FS_ASYNC_TRACE_BEGIN).
+        const CAT_FS_SYNC = "node,node.fs,node.fs.sync";
+        const CAT_FS_ASYNC = "node,node.fs,node.fs.async";
+        const CAT_FS_DIR_ASYNC = "node,node.fs_dir,node.fs_dir.async";
+        let fsInstrumented = false;
+        let inTraceWriter = false;
+        const FS_SYNC_OPS = {
+          accessSync: ["access"], appendFileSync: ["open", "write", "close"], chmodSync: ["chmod"],
+          chownSync: ["chown"], closeSync: ["close"], copyFileSync: ["copyfile"],
+          fchmodSync: ["fchmod"], fchownSync: ["fchown"], fdatasyncSync: ["fdatasync"],
+          fstatSync: ["fstat"], fsyncSync: ["fsync"], ftruncateSync: ["ftruncate"],
+          futimesSync: ["futimes"], lchownSync: ["lchown"], linkSync: ["link"],
+          lstatSync: ["lstat"], lutimesSync: ["lutimes"], mkdirSync: ["mkdir"],
+          mkdtempSync: ["mkdtemp"], openSync: ["open"],
+          readFileSync: ["open", "fstat", "read", "close"], readSync: ["read"],
+          readdirSync: ["readdir"], readlinkSync: ["readlink"], realpathSync: ["realpath"],
+          renameSync: ["rename"], rmdirSync: ["rmdir"], statSync: ["stat"],
+          symlinkSync: ["symlink"], truncateSync: ["ftruncate"], unlinkSync: ["unlink"],
+          utimesSync: ["utimes"], writeFileSync: ["open", "write", "close"], writeSync: ["write"],
+        };
+        const FS_ASYNC_OPS = {
+          access: ["access"], appendFile: ["open", "write", "close"], chmod: ["chmod"],
+          chown: ["chown"], close: ["close"], copyFile: ["copyfile"], fchmod: ["fchmod"],
+          fchown: ["fchown"], fdatasync: ["fdatasync"], fstat: ["fstat"], fsync: ["fsync"],
+          ftruncate: ["ftruncate"], futimes: ["futime"], lchown: ["lchown"], link: ["link"],
+          lstat: ["lstat"], lutimes: ["lutime"], mkdir: ["mkdir"], mkdtemp: ["mkdtemp"],
+          open: ["open"], read: ["read"], readFile: ["open", "fstat", "read", "close"],
+          readdir: ["scandir"], readlink: ["readlink"], realpath: ["realpath"],
+          rename: ["rename"], rmdir: ["rmdir"], stat: ["stat"], symlink: ["symlink"],
+          truncate: ["ftruncate"], unlink: ["unlink"], utimes: ["utime"], write: ["write"],
+          writeFile: ["open", "write", "close"],
+        };
+        const installFs = () => {
+          if (fsInstrumented) return;
+          fsInstrumented = true;
+          const M = G.__mbunNativeModules;
+          const fsMod = M && (M["fs"] || M["node:fs"]);
+          if (!fsMod) return;
+          // Several fs entry points carry own properties the corpus calls
+          // through -- realpathSync.native, exists.__promisify__ -- so the
+          // wrapper has to inherit them or wrapping silently deletes API.
+          const carryOwn = (original, wrapped) => {
+            for (const key of Reflect.ownKeys(original)) {
+              if (key === "prototype") continue;
+              const d = Object.getOwnPropertyDescriptor(original, key);
+              if (d) { try { Object.defineProperty(wrapped, key, d); } catch (e) {} }
+            }
+            return wrapped;
+          };
+          const wrapSync = (original, names) => carryOwn(original, function () {
+            if (inTraceWriter || !groupEnabled(CAT_FS_SYNC)) return original.apply(this, arguments);
+            for (let i = 0; i < names.length; i++) emit("B", CAT_FS_SYNC, "fs.sync." + names[i]);
+            try { return original.apply(this, arguments); }
+            finally { for (let i = names.length - 1; i >= 0; i--) emit("E", CAT_FS_SYNC, "fs.sync." + names[i]); }
+          });
+          const wrapAsync = (original, names) => carryOwn(original, function () {
+            const args = Array.prototype.slice.call(arguments);
+            const cb = args[args.length - 1];
+            if (inTraceWriter || !groupEnabled(CAT_FS_ASYNC) || typeof cb !== "function")
+              return original.apply(this, args);
+            const end = () => { for (let i = names.length - 1; i >= 0; i--) emit("e", CAT_FS_ASYNC, names[i]); };
+            for (let i = 0; i < names.length; i++) emit("b", CAT_FS_ASYNC, names[i]);
+            let done = false;
+            args[args.length - 1] = function () {
+              if (!done) { done = true; end(); }
+              return cb.apply(this, arguments);
+            };
+            try { return original.apply(this, args); }
+            catch (e) { if (!done) { done = true; end(); } throw e; }
+          });
+          for (const method in FS_SYNC_OPS) {
+            const original = fsMod[method];
+            if (typeof original === "function") { try { fsMod[method] = wrapSync(original, FS_SYNC_OPS[method]); } catch (e) {} }
+          }
+          for (const method in FS_ASYNC_OPS) {
+            const original = fsMod[method];
+            if (typeof original === "function") { try { fsMod[method] = wrapAsync(original, FS_ASYNC_OPS[method]); } catch (e) {} }
+          }
+          // fs.realpathSync.native and fs.realpath.native are separate
+          // functions hanging off the ones just wrapped. node routes them to
+          // the same syscall and traces them under the same "realpath" name
+          // (src/node_file.cc), and carryOwn only carries the UNwrapped
+          // original across -- so they have to be wrapped in their own right.
+          const wrapNative = (holder, wrap) => {
+            if (!holder || typeof holder.native !== "function") return;
+            const wrapped = wrap(holder.native, ["realpath"]);
+            try { holder.native = wrapped; } catch (e) {}
+            if (holder.native !== wrapped) {
+              try {
+                Object.defineProperty(holder, "native",
+                                      { value: wrapped, writable: true, enumerable: true, configurable: true });
+              } catch (e) {}
+            }
+          };
+          wrapNative(fsMod.realpathSync, wrapSync);
+          wrapNative(fsMod.realpath, wrapAsync);
+          const oOpendir = fsMod.opendir;
+          if (typeof oOpendir === "function") {
+            try {
+              fsMod.opendir = function opendir() {
+                if (groupEnabled(CAT_FS_DIR_ASYNC)) {
+                  emit("b", CAT_FS_DIR_ASYNC, "opendir"); emit("e", CAT_FS_DIR_ASYNC, "opendir");
+                }
+                return oOpendir.apply(this, arguments);
+              };
+            } catch (e) {}
+          }
+        };
+
+        // Re-run on every enable so a category turned on at run time by
+        // trace_events.createTracing(...).enable() installs its emitters too.
+        // Each installer is one-shot, so untraced (and unrelated-category)
+        // processes pay nothing.
+        const installInstrumentation = () => {
+          if (groupEnabled(CAT_ASYNC)) installTimers();
+          if (groupEnabled(CAT_CONSOLE)) installConsole();
+          if (groupEnabled(CAT_ENV)) installEnvironment();
+          if (groupEnabled(CAT_TP_ASYNC) || groupEnabled(CAT_TP_SYNC)) installThreadpool();
+          if (groupEnabled(CAT_FS_SYNC) || groupEnabled(CAT_FS_ASYNC) || groupEnabled(CAT_FS_DIR_ASYNC)) installFs();
+        };
         const updateBuffers = () => {
           for (const [name, buffer] of buffers) buffer[0] = enabled(name) ? 1 : 0;
           for (const handler of handlers) { try { handler(); } catch (e) {} }
@@ -1424,6 +1937,7 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
           }
           if (delta > 0) writesTrace = true;
           updateBuffers();
+          if (delta > 0) installInstrumentation();
         };
         const record = (event) => {
           events.push(Object.assign({ pid: proc.pid || 0, tid: 1, ts: Date.now() * 1000 }, event));
@@ -1500,23 +2014,68 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
         const flush = () => {
           if (flushed || !writesTrace) return;
           flushed = true;
+          // flush() runs from the 'exit' listener, i.e. inside the phase node
+          // calls AtExit -- so this span is sited on the real teardown, and it
+          // closes the Environment span opened when the environment came up.
+          if (envInstrumented && groupEnabled(CAT_ENV)) {
+            emit("b", CAT_ENV, "AtExit"); emit("e", CAT_ENV, "AtExit");
+            emit("e", CAT_ENV, "Environment");
+          }
           const file = String(pattern || "node_trace.${rotation}.log")
             .replace(/\$\{pid\}/g, String(proc.pid || 0))
             .replace(/\$\{rotation\}/g, "1");
+          // The writer's own write() must not land in the file it is writing.
+          inTraceWriter = true;
           try {
             const fs = G.__mbunNativeModules && (G.__mbunNativeModules["fs"] || G.__mbunNativeModules["node:fs"]);
             if (fs && typeof fs.writeFileSync === "function") fs.writeFileSync(file, JSON.stringify({ traceEvents: metadata().concat(events) }));
           } catch (e) {}
+          inTraceWriter = false;
         };
-        return {
+        const result = {
           phases,
           createTracing, getEnabledCategories, getCategoryEnabledBuffer: categoryBuffer,
           isTraceCategoryEnabled: enabled,
+          // The pair node's TRACE_EVENT macros give a module that emits its own
+          // spans: a COMPOUND-category test and a recorder that writes that
+          // compound string verbatim. node:http and node:net call these from
+          // node's own trace sites rather than being wrapped from out here,
+          // because the moments node marks (a ServerResponse being constructed,
+          // a connect request completing) are not reachable from the outside.
+          groupEnabled,
+          emitGroup: (ph, cat, name, id, data) => {
+            if (groupEnabled(cat)) emit(ph, cat, name, id, data);
+          },
+          // The TRACE_EVENT_*1/*2 forms, whose key/value pairs land DIRECTLY in
+          // `args` rather than under `args.data` (node src/tracing/trace_event.h
+          // AddTraceEvent) -- test-trace-events-net-abstract-socket reads
+          // `trace.args.path_type` with no `.data` in between.
+          emitGroupArgs: (ph, cat, name, id, args) => {
+            if (!groupEnabled(cat)) return;
+            const event = { ph, cat, name, args: args === undefined ? {} : args };
+            if (id !== undefined && id !== null) event.id = "0x" + Number(id).toString(16);
+            record(event);
+          },
           enableCategories: (categories) => changeCategories(categories, 1),
           disableCategories: (categories) => changeCategories(categories, -1),
           setTraceCategoryStateUpdateHandler: (handler) => { if (typeof handler === "function") handlers.add(handler); },
           trace, flush,
+          // Called from the node:worker_threads Worker constructor. node's
+          // worker records its thread name as __metadata on the worker's own
+          // tid; mbun runs a worker as a child process, so the parent is the
+          // only side that can put the row in this process's trace file.
+          emitWorkerThreadName: (name, workerThreadId) => {
+            if (!writesTrace) return;
+            events.push({
+              pid: proc.pid || 0, tid: workerThreadId + 1, ts: 0, ph: "M", cat: "__metadata",
+              name: "thread_name",
+              args: { name: "[worker " + workerThreadId + "] " +
+                            (typeof name === "string" && name.length ? name : "WorkerThread") },
+            });
+          },
         };
+        if (writesTrace) installInstrumentation();
+        return result;
       })();
       Object.defineProperty(G, "__mbunTraceEvents", { value: traceEvents, configurable: true });
       const traceModule = {
@@ -1948,6 +2507,9 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
         try {
           const cap = p && p._mbunUncaughtCaptureCallback;
           if (typeof cap === "function") { cap(err); return true; }
+          // node:repl's capture callback — not an 'uncaughtException' listener.
+          const replCapture = G.__mbunReplUncaughtCapture;
+          if (typeof replCapture === "function" && replCapture(err) === true) return true;
           if (p && typeof p.listenerCount === "function" && p.listenerCount("uncaughtException") > 0) {
             p.emit("uncaughtException", err, origin || "uncaughtException");
             return true;
@@ -2239,18 +2801,21 @@ inline constexpr std::string_view kNodeProcessExtraJS = R"JS(
           return true;
         },
       };
-      for (const name of Object.keys(defs)) {
-        if (name in G) continue;
-        Object.defineProperty(G, name, {
-          configurable: true,
-          enumerable: false,
-          get() { return hasFlag() ? defs[name] : undefined; },
-          set(v) {
-            Object.defineProperty(G, name, {
-              value: v, writable: true, configurable: true, enumerable: false,
-            });
-          },
-        });
+      // Defined ONLY under the flag, and the presence of the property is the
+      // observable -- not just its value. A lazy `get(){ return hasFlag() ? … }`
+      // accessor is always an OWN PROPERTY, and the REPL completes globals from
+      // ObjectGetOwnPropertyNames(globalThis) (node repl.js
+      // filteredOwnPropertyNames keeps every identifier-shaped own name,
+      // enumerable or not), so a flagless process still offered
+      // `isOneByteString` for the input `I` -- one extra entry in the middle of
+      // test-repl-tab-complete's "works with builtin values" list.
+      if (hasFlag()) {
+        for (const name of Object.keys(defs)) {
+          if (name in G) continue;
+          Object.defineProperty(G, name, {
+            value: defs[name], writable: true, configurable: true, enumerable: false,
+          });
+        }
       }
     } catch (e) {}
   } catch (e) {}

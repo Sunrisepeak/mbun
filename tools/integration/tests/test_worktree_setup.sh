@@ -94,4 +94,21 @@ if (cd "$main" && bash "$script" "$tmp/wt2" feature/z no-such-ref >/dev/null 2>&
 fi
 pass "bad start-point rejected"
 
+# --- the package cache is seeded, so the first build skips a 293MB download ---
+# Two W46 lanes each lost ~30 minutes to that download on a fresh worktree.
+mkdir -p "$main/.mcpp/data/pkg" "$main/.mcpp/gen"
+echo payload >"$main/.mcpp/data/pkg/blob"
+echo "rule cc" >"$main/.mcpp/gen/build.ninja"
+out=$(cd "$main" && bash "$script" "$tmp/wt3" feature/seed 2>&1)
+[ -f "$tmp/wt3/.mcpp/data/pkg/blob" ] \
+  && pass "fresh worktree gets the package cache" || fail "no .mcpp seeded: $out"
+[ ! -e "$tmp/wt3/.mcpp/gen/build.ninja" ] \
+  && pass "donor build graph is dropped from the seed" || fail "kept a build.ninja holding donor paths"
+
+# A worktree that already has packages is never disturbed.
+rm -rf "$tmp/wt3/.mcpp"; mkdir -p "$tmp/wt3/.mcpp"; echo mine >"$tmp/wt3/.mcpp/marker"
+out=$(cd "$main" && bash "$script" "$tmp/wt3" feature/seed 2>&1)
+[ "$(cat "$tmp/wt3/.mcpp/marker")" = mine ] && [ ! -e "$tmp/wt3/.mcpp/data/pkg/blob" ] \
+  && pass "an existing package cache is left alone" || fail "overwrote a lane's own .mcpp"
+
 echo "test_worktree_setup: ok"

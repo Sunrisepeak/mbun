@@ -1189,6 +1189,47 @@ inline constexpr std::string_view kNodeStreamPipelineJS = R"JS(
   def(["stream/promises"], Stream.promises);
   def(["stream/consumers"], R.require("internal/stream.consumers"));
 
+  // Node bootstrap uses internal/fs/sync_write_stream when fd 1/2 names a
+  // regular file. The native bootstrap has to publish process.stdout/stderr
+  // before node:stream exists, so upgrade only that FILE case now that the
+  // real Writable state machine is available. Keep the bootstrap writer as
+  // the byte-exact fd seam and leave TTY/PIPE/TCP objects untouched.
+  const installFileStdio = (name, fd) => {
+    const current = process && process[name];
+    if (!current || current instanceof Stream.Writable) return;
+    let isFile = false;
+    try {
+      const fs = M["fs"] || M["node:fs"];
+      isFile = !!(fs && fs.fstatSync(fd).isFile());
+    } catch (e) {}
+    if (!isFile) return;
+
+    let stdio;
+    stdio = new Stream.Writable({
+      autoDestroy: true,
+      write(chunk, encoding, callback) {
+        try { current.write(chunk); callback(); }
+        catch (error) { callback(error); }
+      },
+      destroy(error, callback) {
+        stdio.fd = null;
+        callback(error);
+      },
+    });
+    stdio.fd = fd;
+    stdio.readable = false;
+    stdio.autoClose = false;
+    stdio.isTTY = current.isTTY;
+    stdio._type = "fs";
+    stdio.flush = typeof current.flush === "function" ? current.flush.bind(current) : (() => {});
+    stdio.destroySoon = stdio.destroy;
+    process[name] = stdio;
+    const consoleSlot = name === "stdout" ? "_stdout" : "_stderr";
+    if (G.console && G.console[consoleSlot] === current) G.console[consoleSlot] = stdio;
+  };
+  installFileStdio("stdout", 1);
+  installFileStdio("stderr", 2);
+
   // crypto's Hash/Hmac (builtins/markdown_web.cppm) are defined inside the
   // master builtins IIFE, where `Transform` lexically resolves to the bootstrap
   // load-order stub, so their prototype chain was linked before node:stream

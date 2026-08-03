@@ -565,6 +565,23 @@ private:
             pendingClassDecs_.clear();  // safety: never leak onto a later class
             return s;
         }
+        // `async function f(){}` in statement position is an
+        // AsyncFunctionDeclaration (spec: HoistableDeclaration), NOT an
+        // expression statement. The distinction is load-bearing: a declaration
+        // ENDS the statement, so the next token starts a fresh statement, while
+        // an expression statement keeps parsing postfix. Fall through to the
+        // expression path and `async function g(){}` followed by a
+        // statement-leading `[` is read as a computed member access — which then
+        // rejects a perfectly legal trailing comma (`[a,]`) with "Unexpected ]".
+        // `async` is not reserved, so telling this from `async(function(){})`
+        // needs the caller's lookahead, and a newline between `async` and
+        // `function` breaks the declaration (no ASI hazard: [no LineTerminator
+        // here] is part of the production).
+        if (ident_is_("async") && peek_kind_(1) == Token::Function &&
+            !tok_at_(idx_ + 1).newlineBefore) {
+            advance_();  // async
+            return parse_function_(/*isDecl=*/true, /*isAsync=*/true);
+        }
         Token k = curk_();
         switch (k) {
         case Token::Semicolon: {

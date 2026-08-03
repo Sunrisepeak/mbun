@@ -227,6 +227,7 @@
         set_native_fn(ctx_, cryptoAsymNative, "ecdhConvertKey", 3, node_asym_ecdh_convert_host);
         set_native_fn(ctx_, cryptoAsymNative, "okpDerive", 2, node_asym_okp_derive_host);
         set_native_fn(ctx_, cryptoAsymNative, "kmac", 5, node_asym_kmac_host);
+        set_native_fn(ctx_, cryptoAsymNative, "argon2", 9, node_asym_argon2_host);
         set_native_fn(ctx_, cryptoAsymNative, "keyType", 3, node_asym_key_type_host);
         set_native_fn(ctx_, cryptoAsymNative, "keyExport", 7, node_asym_key_export_host);
         set_native_fn(ctx_, cryptoAsymNative, "jwkExport", 3, node_asym_jwk_export_host);
@@ -252,6 +253,17 @@
         // executable's baked `--compile-exec-argv` flags survive; the JS layer
         // (node_process_extra) only fills in an empty array when it is missing.
         set_prop(ctx_, process, "execArgv", build_string_array_(gExecArgv));
+        // The normalized parse-time path is process infrastructure used only by
+        // Worker/fork's internal spawn. Keep it distinct from process.execArgv,
+        // whose original token spelling and order are public Node API.
+        if (!gTsconfigOverride.empty()) {
+            JSStringRef name{JSStringCreateWithUTF8CString("__mbunTsconfigOverride")};
+            JSObjectSetProperty(ctx_, process, name, make_string(ctx_, gTsconfigOverride),
+                                kJSPropertyAttributeDontEnum | kJSPropertyAttributeReadOnly |
+                                    kJSPropertyAttributeDontDelete,
+                                nullptr);
+            JSStringRelease(name);
+        }
         // `--title=<name>` among the runtime's own flags renames the process.
         // ref: bun src/cli/Arguments.rs (--title) — the JS layer below only
         // defaults this when nothing set it.
@@ -982,12 +994,21 @@
         set_fn(ctx_, htn, "getMaxHeaderSize", http_get_max_header_size_cb);
         set_fn(ctx_, htn, "setMaxHeaderSize", http_set_max_header_size_cb);
         set_fn(ctx_, htn, "userAgent", http_get_user_agent_cb);
+        set_fn(ctx_, htn, "preconnectUrls", http_get_preconnect_urls_cb);
         set_prop(ctx_, global, "__mbunHttpNative", htn);
         // CAP-S3: AWS SigV4 signing for Bun.S3Client (builtins/s3.cppm calls
         // __mbunS3Native.sign; algorithm is mbun.s3_signing, crypto is mbun.crypto).
         JSObjectRef s3n{JSObjectMake(ctx_, nullptr, nullptr)};
         set_fn(ctx_, s3n, "sign", s3_sign_cb);
         set_prop(ctx_, global, "__mbunS3Native", s3n);
+        // node's module compile cache (compile_cache.inc). node:module's
+        // enableCompileCache/getCompileCacheDir/flushCompileCache are thin
+        // wrappers over these; the cache itself is owned by the loader.
+        JSObjectRef ccn{JSObjectMake(ctx_, nullptr, nullptr)};
+        set_fn(ctx_, ccn, "enable", compile_cache_enable_cb);
+        set_fn(ctx_, ccn, "getDir", compile_cache_dir_cb);
+        set_fn(ctx_, ccn, "flush", compile_cache_flush_cb);
+        set_prop(ctx_, global, "__mbunCompileCacheNative", ccn);
         // Binary-safe subprocess/pipe ops (base64 across the JS boundary) for
         // Bun.spawn(stdin:"pipe"), Bun.spawnSync binary stdio, and Bun.stdin.
         JSObjectRef pn{JSObjectMake(ctx_, nullptr, nullptr)};

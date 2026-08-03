@@ -1,0 +1,10 @@
+compat/node/test/parallel/test-permission-child-process-cli.js
+compat/node/test/parallel/test-permission-config-file.mjs
+compat/node/test/parallel/test-permission-fs-internal-module-stat.js
+compat/node/test/parallel/test-permission-fs-read.js
+compat/node/test/parallel/test-permission-fs-traversal-path.js
+compat/node/test/parallel/test-permission-fs-write.js
+compat/node/test/parallel/test-permission-net-fetch.js
+compat/node/test/parallel/test-permission-net-udp.js
+compat/node/test/parallel/test-permission-processbinding.js
+compat/node/test/parallel/test-permission-sqlite-load-extension.js

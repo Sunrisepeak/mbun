@@ -5,6 +5,243 @@ session that is interrupted (usage limit, crash, restart) can pick up from the
 file rather than from memory. **If you are a fresh session reading this, start
 here.**
 
+## 2026-08-03 — TWO COORDINATOR FAILURES, both from not consulting the record
+
+Both cost a W48 lane real budget, and both are the same mistake: **asking lanes to consult a
+record I did not consult myself.**
+
+**1. Brief `check_struck.py` BEFORE writing a brief, not after.** W48's C1 brief said
+`cli/install` "has never had a lane". `struck.tsv` records that **wave 65 measured all 73
+`cli/install` files end to end**, landed a ~200-line unified install/add argument parser, gained
+**+0 files**, and wrote the explicit conclusion *"do not re-run this vein expecting files; the
+next blocker is per-file feature work."* The W48 lane reproduced that conclusion exactly, at the
+cost of its whole budget. The struck file exists precisely so a vein is retired once, and the
+coordinator is the one who must read it when choosing targets.
+
+For the record, what that group actually has: the only item with more than one file behind it is
+the **security scanner** (absent entirely — 3 manifest files plus 2 matrix files), and the only
+broad correctness item is **workspace-member dependency collection** — `bun install` at a
+workspace root never reads members' `dependencies`/`devDependencies`, so a monorepo installs
+0 packages. That second one is a real defect worth its own lane, but it is an assertion-level
+lane, not a file-count lane: each dependent file needs a second feature behind it.
+
+**2. Gate lists must live in the lane's own worktree, never bare `/tmp`.** A W48 lane reported
+that "the corpus runner mutates the list file passed to `--list`". It does not — the runner
+writes only inside `--out`, and `read_list()` only reads; I checked before propagating it. The
+real cause is that **five concurrent lanes were putting gate lists in shared `/tmp` paths** and
+overwriting each other, which is how a 36-line list came back as 1301 lines and silently scored
+the wrong set. Correcting this mattered twice over: the hazard is real, and the misdiagnosis
+would have made every future lane pay for defensive copies against a bug that does not exist.
+
+## 2026-08-03 — MANIFEST RULE: an entry must have `ran > 0` AND `failed > 0`
+
+Sorting candidate files by "fewest failing assertions first" is **degenerate**, and it cost a W48
+lane its entire budget. A file that is fully skipped upstream has **zero** failing assertions, so
+the sort puts unreachable files at the very top. The generator excluded the `blocked-external`,
+`no-tests` and `ahead-of-reference` classifications but not `all-skipped`, and the resulting
+`js/third_party` manifest captured **15 of the 21 skip-gated files in the whole subtree** — files
+gated by `describe.skip` / `describe.skipIf(!credentials)` / `it.skip` in the vendored corpus
+itself, which no runtime change can reach and which rule 1 forbids editing.
+
+So: **a manifest entry must have `ran > 0` and `failed > 0`**, not merely a non-green
+classification. Check the built manifest's classification histogram before dispatching — one
+command, and it would have caught this. Two other bun manifests the same wave were clean (18/18)
+and nearly clean (16/18), so the failure is silent unless you look.
+
+Corollary for `js/third_party` specifically: its real denominator is the **ungated** set. Of 60
+reachable files, 44 are green and 16 fail for 16 unrelated causes — a broad sweep area, not a
+single-root-cause lane. And the whole reachable set scores in ~80 seconds, so it is cheap, not
+slow; the slowness was one memory-leak stress test.
+
+## 2026-08-03 — CHECKPOINT FORMAT: every wave comment carries the running total and an ETA
+
+User directive: **"每次 comment 记录真实的推进数量 以及 总进度也一起在表格里 方便观察 以及 后面
+备注 预估多长时间后能 100% 兼容 bun 和 node"**. So every wave's PR comment must contain, as
+tables rather than prose:
+
+1. **Per-lane: goal, delivered, lane-hours, files/hour.** Delivered is the integrator's own
+   verified number, never the lane's self-report.
+2. **The running total against both corpora** — baseline, now, Δ, the audited runnable
+   denominator, % of runnable, and files remaining. Label it as **accounting, not a fresh full
+   run**: full-corpus runs are suspended, so the carried total is the last full measurement plus
+   every per-file gain and loss verified since on a frozen binary. Denominators never shrink.
+3. **The wave-by-wave trend** (files and files/lane-hour), so a falling rate is visible instead
+   of asserted.
+4. **An ETA to 100%**, with the arithmetic shown and the two honest caveats: the rate declines
+   as dense clusters are consumed, and part of the remainder is **architecture-gated rather than
+   effort-gated**. Keep the blocker table current — as of W46: worker threads/SAB (~10 files),
+   JSC's readonly-assign message dropping the property name (4), the prebuilt's execution-time-
+   limit callback never firing (4), `ContextifyScript`/`ModuleWrap` being V8-shaped (ESM + live
+   test runner), nghttp2 (≥2), and unvendored acorn (6 internals).
+
+W46's numbers, as the template: Node 3,239/3,898 runnable (83.1%), Bun 1,063/1,804 (58.9%),
+combined 4,302/5,702 (75.4%), 1,400 remaining, ~165 coordinated wall-hours to exhaust what is
+reachable on today's architecture.
+
+## 2026-08-03 — W45: the module-identity block is GONE. Next bottleneck: `internalBinding('modules')`
+
+The W44 entry below says porting node's `lib/internal/**` is blocked. **That is now out of
+date** — read it for the mechanism, then read this.
+
+**234 of 297 vendored `internal/*` modules now load and evaluate from an entry outside
+`compat/node`, up from zero.** Measured by `require()`-ing all 297 from `/tmp`. Newly
+reachable, i.e. portable by a future lane: all of `internal/streams/*` and
+`internal/webstreams/*`, all 33 of `internal/crypto/*`, `internal/fs/*`, `internal/url`,
+`internal/http`, `internal/http2/{core,compat,util}`, `internal/dns/*`, `internal/readline/*`,
+`internal/worker/*`, `internal/util{,/inspect,/comparisons,/parse_args}`, `internal/errors`,
+`internal/assert/*`, and `internal/test_runner/{mock/*,assert,coverage,snapshot,utils,tag_filter}`
+plus its reporters.
+
+**What the fix actually was, because the obvious design was wrong.** The proposed
+per-module-id allow-list ("the vendored fallback may answer only for ids mbun has no builtin
+for") would have changed *nothing*: `require_impl` already calls `builtin_module()` before the
+resolver (`module_loading.inc:412`), so a builtin was never shadowable, and the three ids that
+actually broke are not builtins. The real cause was self-inflicted — a startup bridge
+(`__mbunPatchNodeEventTarget`, called unconditionally from `engine.inc:269`) required node's
+`internal/event_target` and `internal/abort_controller` and **republished node's
+`AbortController`/`AbortSignal` as the process globals**. All 28 baseline internal-module
+fallbacks were its transitive graph; widening the resolver merely made it fire in bun tests
+and workers too. Separately, `internal/bootstrap/realm.js` reassigns `process.binding` and
+`Error.prepareStackTrace` **merely by being evaluated**, so making the tree reachable was
+enough to take `process.binding` away.
+
+The shape that works: a **per-id owner table consulted by every path** — including the
+requesting-file walk, so an id resolves identically inside and outside `compat/node`; that
+path-independence is exactly what W44's reverted commit lacked. Plus an mbun-owned
+`internal/bootstrap/realm` shim that mutates nothing, and the event-target bridge rewritten as
+a *reaction* to that module loading rather than a load of it. Fallbacks: 28 → 0.
+
+**It cost one file, correctly.** `test-abortsignal-any.mjs` was passing only because node's
+second `AbortSignal` had replaced mbun's platform one wholesale — the surrender the work
+exists to end. Residual gap: composite-signal abort ordering (`01234` vs mbun's `41230`),
+which needs node's dependant-signal registry in mbun's platform `AbortSignal`. Its own lane.
+
+### A STRUCTURAL CEILING, measured: workers are processes, and ~10 corpus files cannot pass
+
+This matters for the 100% goal specifically, so it is stated here rather than buried in a
+lane report. **An mbun `Worker` is a separate process, not a thread**, and JSC allocates
+`SharedArrayBuffer` backing stores itself, so mbun cannot back one with `MAP_SHARED` — a SAB
+crossing the worker boundary is a **copy**. W46's worker lane enumerated what that costs, file
+by file, out of the 17 still red in `test-worker-*`:
+
+- genuinely shared memory: `beforeexit-throw-exit`, `message-channel-sharedarraybuffer`,
+  `workerdata-sharedarraybuffer`, `http2-generic-streams-terminate`, `stack-overflow-stack-size`
+- cross-process `Atomics.wait`/`notify` on top of that (JSC's wait list is per-process, not a
+  futex): `messaging-errors-timeout`, `cwd-race-condition`
+- shared WASM memory: `message-port-wasm-threads`
+- one process-wide `environ` (`SHARE_ENV` written in the worker, visible in the parent):
+  `process-env-shared`
+- one shared fd table — the parent `fstat()`s an fd *number* the worker opened:
+  `track-unmanaged-fds`
+
+Three more (`cli-options`, `message-not-serializable`, `cwd-race-condition`) are **harness**-gated
+rather than thread-gated: they need `--expose-internals` on the *parent*, and the corpus runner
+deliberately does not emulate `// Flags:`.
+
+So 100% of `test-worker-*` is not reachable by fixing worker bugs. It requires either changing
+mbun's worker model to real threads — a campaign-scale decision with its own performance and
+isolation consequences — or accepting a documented ceiling here. **Do not size future worker
+lanes as if those ten files were in play.** The 4 that are genuinely reachable and unattempted
+are `data-url` (exit code 13 for an unsettled top-level await in an ESM entry — runtime-wide,
+not worker-specific), `message-port-transfer-filehandle`, `messaging` (needs globally-sequential
+threadId allocation plus cross-process BroadcastChannel) and `message-type-unknown`.
+
+### CORRECTION from W46: "loadable" is not "portable"
+
+W46 sized four lanes as port-shaped on the strength of the numbers above, and two of them
+came in at +1 and +2 against +8 and +10. The premise was too broad, and the correction is
+worth more than those files:
+
+**A vendored internal that now loads can still be useless, because it bottoms out in an
+`internalBinding` mbun does not have.** `internal/http2/core.js` is the clean example — it
+loads, and then reaches `internalBinding('http2')`/nghttp2, which mbun has no equivalent of;
+its sibling `internal/http2/compat.js` is pure JS over the core stream API and *is* portable.
+Two `test-http2-*` files are unreachable until mbun's http2 **is** node's, which is a
+campaign-scale lane, not a wave-scale one. The same distinction applies to crypto (argon2 was
+a missing *bridge* over an OpenSSL primitive that was already there — cheap; the PQC families
+are the same shape) and to the test runner (only 1 of 21 files was a load failure at all; the
+other 20 are behavioural gaps in mbun's own runner).
+
+**So before sizing a lane as a port, check what the vendored module bottoms out in**, not just
+whether it loads. The reach probe answers the first question; only reading the module answers
+the second.
+
+### The next bottleneck, measured rather than guessed
+
+The remaining 63 are **not resolution failures**:
+
+- **`internalBinding('modules')` — 23 modules**, gating the entire live test runner
+  (`internal/test_runner/{harness,runner,test,reporter/spec}`), `internal/modules/esm/*`,
+  `internal/modules/helpers`, `internal/main/*`. Highest-leverage next lane by a wide margin.
+- `diagnostics_channel` (5), `blob` (3), `webstorage`/`sea`/`block_list` (2 each), `v8`,
+  `report`, `watchdog`, `locks`, `ffi`, `internal_only_v8`; `fs.legacyMainResolve` (2);
+  `ContextifyScript.prototype` (3 — `internal/vm`, `internal/vm/module`,
+  `internal/modules/cjs/loader`).
+- **`internal/deps/acorn/**` is not vendored at all** — 6 modules, including
+  `internal/repl/completion`. The W43 REPL lane's hand-written reverse scanner cannot be
+  replaced by a port until acorn is vendored.
+- `internal/bootstrap/**` is deliberately mbun-owned; only `realm`'s `BuiltinModule` surface
+  is provided, so a consumer needing more must extend the shim.
+
+### Two measurement rules this wave paid for
+
+- **Attribute against a pre-wave baseline, never against the composed head.** Diffing a
+  single-lane binary against a round of the composed head reports every *other* lane's gains
+  as that lane's regressions. It produced 8 confident false alarms in one report.
+- **Any change to a surface bun also implements** (`console`, `util.inspect`, `Bun.*`) **needs
+  a bun gate, not just the node subsystem group.** A lane ran three node gates, all clean, and
+  still regressed a green bun file; the node/bun split is invisible from inside the node corpus.
+- `NODE_PATH=<repo>/compat/node/lib` reproduces a widened internal-resolution reach **on an
+  already-built binary**, turning a build-cycle experiment into a 90-second one.
+
+## 2026-08-03 — W44: porting node's `lib/internal/**` is blocked by MODULE IDENTITY
+
+The single most important thing this wave learned, because it caps the campaign's
+highest-yield lane shape.
+
+The ledger says port-shaped lanes outyield fix-shaped ones roughly 2:1, and W44
+confirmed it again: the compile-cache lane **ported** `compat/node/src/compile_cache.cc`
+and delivered **15 files in 49 minutes**, the best rate in the ledger. So lanes keep
+reaching for node's vendored `lib/internal/**` — and keep finding it unreachable from
+outside `compat/node`, because the internal-module walk starts at the *requesting* file.
+Lane after lane then hand-writes a stub beside a real implementation (W44's `t.mock.timers`
+was a literal no-op next to node's complete `mock_timers.js`).
+
+W44's test-runner lane widened the walk to retry from the entry script, cwd and executable.
+It worked for the tests it targeted and **broke worker startup**, because an mbun worker is
+a separate process: its `fromDir` is outside the vendored tree, so `internal/errors`,
+`internal/util`, `internal/validators`, `internal/event_target`, `internal/abort_controller`,
+`internal/worker/js_transferable` and eight more resolved to node's copies **as a second
+implementation beside mbun's builtins**. Measured by fallback count per run: 28 before,
+~500 with the change, 28 with it reverted. The visible symptoms were an `AbortSignal`
+failing an `EventTarget` brand check and two worker files going red — i.e. the failure
+surfaces nowhere near the resolver.
+
+The narrowed version (gate the fallback to `internal/test_runner/`) restores the worker
+files and **delivers nothing**: the ported module dies on its own transitive
+`require('internal/errors')`, which the prefix does not cover. It was reverted outright
+rather than kept as dead code with a comment claiming a capability it lacks.
+
+**So the real work is not a resolver tweak.** It is making `internal/<x>` name ONE
+implementation — mbun's builtin and node's vendored copy must be the same module object,
+not two — before any lane can port from `lib/internal/**` outside the corpus. Until that
+exists, treat "port it from node's lib" as available only to code that already lives under
+`compat/node`, and size lanes accordingly. This is a strong candidate for the next wave's
+lane 0, because it unblocks the shape with the best measured throughput in the campaign.
+
+Cheap check for anything touching module resolution, found the same day:
+`MBUN_DEBUG_INTERNAL_MODULES=1` prints every internal-module fallback, so a line count
+before/after localises this class of regression in two commands, with no bisect build.
+
+### The other W44 finding: infrastructure was eating the wave
+
+57% of lane wall clock was not lane work — 199 minutes queued on the build lock (cap of 1,
+on a box idling at load 2.0 with 49 GB free; raised to 2, waits fell from 245 s to ~1 min)
+and 120 minutes on a staged `libstdc++.a` from the wrong GCC (now auto-repaired in
+`build_lock.sh`, with a retry on that exact link signature). Disk was at 100% before the
+wave started, which would have failed every measurement with an error that reads like a
+runner bug. **Check disk headroom and the staged archive before dispatching a wave.**
+
 ## 2026-07-31 08:30 — CORE RULE: JS is the thinnest possible interface layer
 
 User directive: **"js 只做最薄的接口层,能用 C++ 实现的都用 C++ 实现,保证性能"**,

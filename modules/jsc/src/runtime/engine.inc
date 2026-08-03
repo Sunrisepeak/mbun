@@ -158,8 +158,55 @@ public:
         JSStringRelease(url);
         JSStringRelease(script);
         if (ok) return 0;
-        std::println(std::cerr, "{}: {}", srcUrl, describe_exception_(exc));
+        // node reports a failed --check through its ordinary uncaught-exception
+        // printer (lib/internal/main/check_syntax.js re-throws the parse error),
+        // which is a FIVE-part frame: `<file>:<line>`, the offending source
+        // line, a caret, a blank line, then the error on a line of its own.
+        // test-cli-syntax-piped-bad matches /^SyntaxError:/m, so the error text
+        // cannot share a line with the filename.
+        const double line{number_property_(exc, "line", 1)};
+        const double column{number_property_(exc, "column", 0)};
+        std::println(std::cerr, "{}:{}", srcUrl, static_cast<long long>(line));
+        if (const auto text{source_line_(source, static_cast<long long>(line))}; text) {
+            std::println(std::cerr, "{}", *text);
+            const long long caret{static_cast<long long>(column)};
+            std::println(std::cerr, "{}^",
+                         std::string(caret > 1 ? static_cast<std::size_t>(caret - 1) : 0, ' '));
+        }
+        std::println(std::cerr, "");
+        std::println(std::cerr, "{}", describe_exception_(exc));
         return 1;
+    }
+
+    // The 1-based `line`th line of `source`, or nothing when it is out of range.
+    static std::optional<std::string_view> source_line_(std::string_view source, long long line) {
+        if (line < 1) return std::nullopt;
+        std::size_t start{0};
+        for (long long n{1}; n < line; ++n) {
+            const std::size_t nl{source.find('\n', start)};
+            if (nl == std::string_view::npos) return std::nullopt;
+            start = nl + 1;
+        }
+        if (start > source.size()) return std::nullopt;
+        std::size_t end{source.find('\n', start)};
+        if (end == std::string_view::npos) end = source.size();
+        if (end > start && source[end - 1] == '\r') --end;
+        return source.substr(start, end - start);
+    }
+
+    // A numeric own property of an exception object (JSC puts `line`/`column`
+    // on its SyntaxError instances), or `fallback` when it is absent.
+    double number_property_(JSValueRef value, const char* name, double fallback) {
+        if (value == nullptr || !JSValueIsObject(ctx_, value)) return fallback;
+        JSValueRef ignored{nullptr};
+        JSObjectRef object{JSValueToObject(ctx_, value, &ignored)};
+        if (object == nullptr) return fallback;
+        JSStringRef key{JSStringCreateWithUTF8CString(name)};
+        JSValueRef prop{JSObjectGetProperty(ctx_, object, key, &ignored)};
+        JSStringRelease(key);
+        if (prop == nullptr || !JSValueIsNumber(ctx_, prop)) return fallback;
+        const double n{JSValueToNumber(ctx_, prop, &ignored)};
+        return std::isfinite(n) ? n : fallback;
     }
 
     // Evaluate source and return the string coercion of its result (for reading
@@ -199,6 +246,13 @@ public:
     // can require() local helpers and see Bun.*/node globals.
     std::expected<void, std::string> install_cjs_env(const std::string& dir,
                                                      const std::string& file) {
+        // Bun parses an explicit override while constructing the runtime's
+        // transpiler, before user code. Missing/read/malformed diagnostics are
+        // global log errors, not a reason to abort command execution. Cache the
+        // null result so later imports do not print the diagnostic twice.
+        if (!gTsconfigOverride.empty()) {
+            (void)load_tsconfig_(std::filesystem::path{gTsconfigOverride});
+        }
         const bool pendingDeprecation{
             std::find(gExecArgv.begin(), gExecArgv.end(), "--pending-deprecation") != gExecArgv.end()};
         std::string js{"globalThis.__dirname = " + json_quote_(dir) + ";\n" +
@@ -256,14 +310,12 @@ public:
         if (auto r{eval_void(js)}; !r) {
             return r;
         }
-        // Node's internal/event_target module loads only after the builtin image
-        // is assembled. Let the node-process partition repair its
-        // NodeEventTarget/Event realm boundary once top-level require exists.
-        if (auto r{eval_void(
-                "if (typeof globalThis.__mbunPatchNodeEventTarget === 'function') "
-                "globalThis.__mbunPatchNodeEventTarget(globalThis.require);")}; !r) {
-            return r;
-        }
+        // (The NodeEventTarget/Event realm repair used to be forced here, by
+        // require()ing node's internal/event_target as soon as top-level
+        // require existed. It is now driven from the module's own identity
+        // suffix in module_loading.inc, so it happens if and only if something
+        // actually loads that module -- see __mbunAdoptNodeEventTarget in
+        // js_builtins:node_process_extra for why the difference matters.)
         // Finish the entry Module from C++: `paths` reuses the loader's own
         // transliteration of Module._nodeModulePaths, and the entry becomes the
         // root of the parent chain so top-level require()s land in
@@ -682,6 +734,17 @@ public:
                                       "globalThis.__mbun_uncaught(__mbun_entry_err);"
                                       "else throw __mbun_entry_err;}"
                                       "globalThis.__mbunRunTicks&&globalThis.__mbunRunTicks();"};
+        // The compile cache covers the ENTRY too -- node caches the main module
+        // like any other. mbun's entry does not go through require_impl (it is
+        // evaluated here, in module scope), so the same lookup/save pair the
+        // loader uses is applied around this evaluation. Keyed on the file's own
+        // source, exactly as in module_loading.inc, so entry and require() agree
+        // on the record for a given file.
+        std::optional<std::uint32_t> entryCacheRecord;
+        if (CompileCacheHandler::get().enabled()) {
+            entryCacheRecord = CompileCacheHandler::get().get_or_insert(
+                source, absPath, CachedCodeType::kCommonJS);
+        }
         // A top-level-await entry (flagged by the transpiler) goes straight to the
         // async wrapper: in script mode `await (expr)` would otherwise PARSE as a
         // call to an `await` identifier and fail at run time, after side effects.
@@ -727,6 +790,12 @@ public:
             if (auto r2{eval_void(wrapped, absPath)}; !r2) {
                 return fail_run_(r.error());  // report the original parse error
             }
+            // Same point as the synchronous branch below: the entry compiled
+            // (as an async wrapper), so its record can be kept or initialized.
+            if (entryCacheRecord) {
+                CompileCacheHandler::get().maybe_save(*entryCacheRecord, source,
+                                                      /*rejected=*/false);
+            }
             const bool settled{pump_event_loop("globalThis.__mbun_run_done")};
             if (auto err{eval_to_string(
                     "globalThis.__mbun_run_err===undefined?'':String(globalThis.__mbun_run_err)")};
@@ -765,6 +834,14 @@ public:
             // invocation both bun files use, so dialect dispatch alone does
             // NOT separate them.
         } else {
+            // The entry compiled, so its compile-cache record is usable (or gets
+            // initialized). An entry that failed to parse returned above and is
+            // never recorded, which is what keeps a broken file out of the cache
+            // directory.
+            if (entryCacheRecord) {
+                CompileCacheHandler::get().maybe_save(*entryCacheRecord, source,
+                                                      /*rejected=*/false);
+            }
             // Top level ran synchronously to completion. Node/bun keep the process
             // alive until the event loop drains: pending setTimeout/setInterval
             // callbacks, in-flight network ops (fetch/sockets), and live child
@@ -1099,75 +1176,158 @@ public:
         return out;
     }
 
-    // Node's own `internal/*` modules live under the vendored node source's
-    // `lib/` tree, not in a user `node_modules/` directory. The test runner can
-    // be launched from a temporary cwd, so the normal cwd-based package walk
-    // cannot find them. When an internal request originates from a file in the
-    // vendored tree, add that tree's `lib` directory as a resolver root.
-    static std::vector<std::string> node_paths_for_(std::string_view spec,
-                                                    const std::string& fromDir) {
-        std::vector<std::string> out{node_paths_from_env()};
-        if (!spec.starts_with("internal/")) return out;
+    // ── who owns `internal/<x>` ──────────────────────────────────────────────
+    //
+    // `internal/<x>` must name exactly ONE implementation, whoever asks and from
+    // wherever. There are two producers for that name — mbun's builtin table
+    // (`globalThis.__mbunNativeModules`, consulted first by require_impl) and
+    // node's vendored `compat/node/lib` — and the whole class of bug this
+    // registry exists to prevent is the two of them BOTH answering, in different
+    // parts of one process. module_loading.inc documents the symptom side (fresh
+    // `Symbol`s, second module-level caches); this is the resolution side.
+    //
+    // `kMbunOwnedInternalPrefixes` names the ids whose single implementation is
+    // mbun's. For those the vendored `lib` root is never offered — not by the
+    // walk from the requesting file either, so an id on this list resolves the
+    // same way from inside `compat/node` as from anywhere else. That is the
+    // property the previous attempt (b31c36a, reverted in 6ba7466) lacked: it
+    // widened reach without a per-id owner, so widening the reach also widened
+    // the set of ids node answered for, and node's copies started shadowing
+    // mbun's implementations in worker and bun-test processes.
+    //
+    // The one entry, and why it is the whole list:
+    //
+    //   internal/bootstrap/**  — node's per-realm BOOTSTRAP, not a library.
+    //     `internal/bootstrap/realm.js` REASSIGNS `process.binding` and
+    //     `Error.prepareStackTrace` at top level, on load. It is not requested
+    //     directly by anything mbun runs: `internal/util/inspect` pulls it in
+    //     for one symbol (`BuiltinModule`), and inspect is on the transitive
+    //     path of most of `lib/internal/**`. So merely making the vendored tree
+    //     reachable from a bun test was enough to replace mbun's
+    //     `process.binding` — measured: process-binding.test.ts fails with
+    //     "The value of \"err\" is out of range. Received 5". mbun answers this
+    //     id from its builtin table instead (see the `internal/bootstrap/realm`
+    //     shim in js_builtins:node_process_extra), which exports the same
+    //     `BuiltinModule` surface over mbun's own builtin list and mutates
+    //     nothing.
+    //
+    // A new entry belongs here when node's file, merely by being evaluated,
+    // takes over something mbun already owns. A module that only DEFINES a
+    // parallel class does not: that is fixed at the export boundary, next to the
+    // other identity suffixes in module_loading.inc, so node's implementation
+    // still runs and only the identity is unified.
+    static bool internal_module_is_mbun_owned_(std::string_view spec) {
+        return spec.starts_with("internal/bootstrap/");
+    }
 
+    // Append the vendored `lib` root found by walking up from `start`. A
+    // checkout of node itself has `lib/` at its root; mbun vendors the same tree
+    // at `compat/node/lib`, so both spellings are probed at every level.
+    // Returns true once a root was found (or was already present).
+    static bool append_node_lib_root_(std::vector<std::string>& out,
+                                      const std::filesystem::path& start) {
         std::error_code ec;
-        std::filesystem::path dir{fromDir};
-        if (dir.empty()) return out;
+        std::filesystem::path dir{start};
+        if (dir.empty()) return false;
         if (!dir.is_absolute()) dir = std::filesystem::absolute(dir, ec);
-        if (ec) return out;
+        if (ec) return false;
         dir = dir.lexically_normal();
         for (int depth{0}; depth < 64; ++depth) {
-            const std::filesystem::path lib{dir / "lib"};
-            if (std::filesystem::is_directory(lib / "internal", ec)) {
-                const std::string root{lib.lexically_normal().string()};
-                if (std::ranges::find(out, root) == out.end()) out.emplace_back(root);
-                return out;
+            for (const std::filesystem::path lib :
+                 {dir / "lib", dir / "compat" / "node" / "lib"}) {
+                ec.clear();
+                if (std::filesystem::is_directory(lib / "internal", ec)) {
+                    const std::string root{lib.lexically_normal().string()};
+                    if (std::ranges::find(out, root) == out.end()) out.emplace_back(root);
+                    return true;
+                }
             }
             const std::filesystem::path parent{dir.parent_path()};
             if (parent == dir || parent.empty()) break;
             dir = parent;
         }
+        return false;
+    }
+
+    // Node's own `internal/*` modules live under the vendored node source's
+    // `lib/` tree, not in a user `node_modules/` directory. The test runner can
+    // be launched from a temporary cwd, so the normal cwd-based package walk
+    // cannot find them. When an internal request originates from a file in the
+    // vendored tree, add that tree's `lib` directory as a resolver root.
+    //
+    // The walk starts at the REQUESTING file, so on its own it only ever
+    // succeeds for code that already lives inside the vendored tree. Everything
+    // else — an mbun builtin bridging to node's lib, a user script, a worker
+    // (a separate process whose entry is elsewhere), a fixture in a temp dir —
+    // got "cannot find package 'internal'" for a module mbun ships, which is why
+    // lanes keep hand-writing stubs beside a complete vendored implementation.
+    // So when the walk from the requesting file finds nothing, retry it from the
+    // entry script, the cwd and the executable.
+    //
+    // Reach is widened for exactly the ids mbun does NOT own; see
+    // internal_module_is_mbun_owned_ above for the gate and why it has to apply
+    // to the requesting-file walk too rather than only to the fallbacks.
+    static std::vector<std::string> node_paths_for_(std::string_view spec,
+                                                    const std::string& fromDir) {
+        std::vector<std::string> out{node_paths_from_env()};
+        if (!spec.starts_with("internal/")) return out;
+        if (internal_module_is_mbun_owned_(spec)) return out;
+
+        if (append_node_lib_root_(out, std::filesystem::path{fromDir})) return out;
+
+        // Fallbacks, in the order that keeps the vendored tree of the program
+        // being run ahead of the one next to the binary.
+        std::error_code ec;
+        if (gArgv.size() > 1 && !gArgv[1].empty()) {
+            if (append_node_lib_root_(out, std::filesystem::path{gArgv[1]}.parent_path())) {
+                return out;
+            }
+        }
+        if (const std::filesystem::path cwd{std::filesystem::current_path(ec)};
+            !ec && append_node_lib_root_(out, cwd)) {
+            return out;
+        }
+        if (const std::string exe{exe_path()}; !exe.empty()) {
+            (void)append_node_lib_root_(out, std::filesystem::path{exe}.parent_path());
+        }
         return out;
     }
 
+    const mbun::resolver::TsconfigPaths* load_tsconfig_(const std::filesystem::path& config) {
+        const std::string cfg{config.lexically_normal().string()};
+        if (auto it{tsconfigCache_.find(cfg)}; it != tsconfigCache_.end()) {
+            return it->second ? &*it->second : nullptr;
+        }
+
+        auto loaded{mbun::resolver::load_tsconfig_override(os_fs(), cfg)};
+        std::optional<mbun::resolver::TsconfigPaths> parsed{std::move(loaded.config)};
+        if (!parsed && cfg == gTsconfigOverride && !loaded.error.empty()) {
+            std::println(std::cerr, "error: {}", loaded.error);
+        }
+        auto& slot{tsconfigCache_[cfg]};
+        slot = std::move(parsed);
+        return slot ? &*slot : nullptr;
+    }
+
     const mbun::resolver::TsconfigPaths* find_tsconfig_(const std::string& fromDir) {
-        std::error_code ec;
-        std::filesystem::path d{fromDir};
-        for (int depth = 0; depth < 64; ++depth) {
-            const std::string cfg{(d / "tsconfig.json").string()};
-            if (auto it{tsconfigCache_.find(cfg)}; it != tsconfigCache_.end()) {
-                return it->second ? &*it->second : nullptr;
-            }
-            if (std::filesystem::is_regular_file(d / "tsconfig.json", ec)) {
-                std::optional<mbun::resolver::TsconfigPaths> parsed;
-                if (auto content{read_file(cfg)}) {
-                    parsed = mbun::resolver::parse_tsconfig(*content, d.string());
-                    // Follow `extends`: when this config declares no paths of its own
-                    // but extends another, inherit the parent's baseDir + entries
-                    // (a nested config that only `extends` a parent otherwise loses
-                    // the parent's path aliases like "harness"). Bounded chain walk.
-                    std::filesystem::path base{d};
-                    for (int hop = 0; parsed && parsed->entries.empty() &&
-                                      !parsed->extends_from.empty() && hop < 16; ++hop) {
-                        std::string ext{parsed->extends_from};
-                        if (!ext.ends_with(".json")) ext += "/tsconfig.json";
-                        std::filesystem::path parentCfg{(base / ext).lexically_normal()};
-                        std::error_code pec;
-                        if (!std::filesystem::is_regular_file(parentCfg, pec)) break;
-                        auto pcontent{read_file(parentCfg.string())};
-                        if (!pcontent) break;
-                        base = parentCfg.parent_path();
-                        parsed = mbun::resolver::parse_tsconfig(*pcontent, base.string());
-                    }
-                }
-                auto& slot{tsconfigCache_[cfg]};
-                slot = std::move(parsed);
-                return slot ? &*slot : nullptr;
-            }
-            std::filesystem::path parent{d.parent_path()};
-            if (parent == d || parent.empty()) {
-                break;
-            }
-            d = std::move(parent);
+        // An explicit CLI config is process resolution context: it wins for
+        // every importing directory and uses its own absolute path as the cache
+        // key. With no override, retain the existing nearest-config walk.
+        if (!gTsconfigOverride.empty()) {
+            return load_tsconfig_(std::filesystem::path{gTsconfigOverride});
+        }
+
+        std::error_code ec{};
+        std::filesystem::path dir{fromDir};
+        for (int depth{0}; depth < 64; ++depth) {
+            const std::filesystem::path config{dir / "tsconfig.json"};
+            const std::string cacheKey{config.lexically_normal().string()};
+            if (tsconfigCache_.contains(cacheKey)) return load_tsconfig_(config);
+            ec.clear();
+            if (std::filesystem::is_regular_file(config, ec)) return load_tsconfig_(config);
+            std::filesystem::path parent{dir.parent_path()};
+            if (parent == dir || parent.empty()) break;
+            dir = std::move(parent);
         }
         return nullptr;
     }

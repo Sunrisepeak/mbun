@@ -48,8 +48,20 @@ Flags:
 
 std::vector<std::string> gCliPreloads{};
 
+// Worker/fork are processes in this runtime. They inherit the parent's raw
+// execArgv for Node compatibility, but a relative --tsconfig-override in that
+// public array must not be reinterpreted after the parent has chdir()ed. Their
+// spawn boundary passes the already-normalized absolute path out of band; main
+// consumes it before JS exists and records that it is authoritative here.
+std::optional<std::string> gInheritedTsconfigOverride{};
+
 void set_cli_preloads(std::vector<std::string> preloads) {
     gCliPreloads = std::move(preloads);
+}
+
+void set_inherited_tsconfig_override(std::string path) {
+    gInheritedTsconfigOverride = path;
+    mbun::jsc::runtime::set_tsconfig_override(std::move(path));
 }
 
 // A bare path argument that looks like a runnable script (bun-style `bun x.js`).
@@ -139,7 +151,7 @@ bool has_node_test_flag(std::span<const std::string_view> args) {
         // A value-taking Node flag owns the next token, so `--require preload
         // --test` remains a test-runner invocation rather than treating the
         // preload path as a script.
-        if (a.find('=') == std::string_view::npos && mbun::cli::node_flag_takes_value(a) &&
+        if (a.find('=') == std::string_view::npos && mbun::cli::exec_argv_flag_takes_value(a) &&
             i + 1 < args.size()) ++i;
     }
     return false;
@@ -228,7 +240,8 @@ std::string resolve_entry_path(std::string_view script) {
 int report_run_target_not_found(std::string_view target);
 
 // Run a JS file with process.argv = [runtime, script, ...args] (Node/bun order).
-int run_script(std::string_view script, std::span<const std::string_view> scriptArgs) {
+int run_script(std::string_view script, std::span<const std::string_view> scriptArgs,
+               std::optional<std::string_view> argvScript = std::nullopt) {
     // Best-effort, NON-FATAL bunfig.toml validation (ref bun
     // src/bunfig/arguments.rs load_config): emit a config error to stderr but
     // still run the script (exit unaffected). Parser + "expected string" type
@@ -283,7 +296,7 @@ int run_script(std::string_view script, std::span<const std::string_view> script
     std::vector<std::string> jsArgv;
     jsArgv.reserve(scriptArgs.size() + 2);
     jsArgv.emplace_back("mbun");
-    jsArgv.emplace_back(entry);
+    jsArgv.emplace_back(argvScript.value_or(entry));
     for (std::string_view a : scriptArgs) jsArgv.emplace_back(a);
     mbun::jsc::runtime::set_argv(std::move(jsArgv));
     return mbun::jsc::runtime::run_file(entry);
@@ -989,12 +1002,19 @@ void write_junit_report(const std::filesystem::path& outfile,
 // `mbun test [file|dir|filter]...`: discover the test files, run each through
 // mbun.jsc.test_runner, and print a bun-style per-file report + aggregate
 // summary. Returns the process exit code (0 all pass, 1 any fail / load error).
-int run_test(std::span<const std::string_view> args) {
+bool apply_tsconfig_override(std::string value);
+
+int run_test(std::span<const std::string_view> args,
+             std::optional<std::string_view> inheritedTsconfig = std::nullopt) {
     mbun::cli::TestFlags flags { mbun::cli::parse_test(args) };
     if (!flags.parseError.empty()) {
         std::println(std::cerr, "error: {}", flags.parseError);
         return 1;
     }
+    if (!flags.tsconfigOverride && inheritedTsconfig) {
+        flags.tsconfigOverride = std::string{*inheritedTsconfig};
+    }
+    if (flags.tsconfigOverride && !apply_tsconfig_override(*flags.tsconfigOverride)) return 1;
 
     // bunfig.toml's [test] block supplies defaults the command line overrides
     // (ref: bun-ref/src/bunfig/bunfig.rs — load_config runs before Arguments'
@@ -1171,6 +1191,11 @@ int run_test(std::span<const std::string_view> args) {
         // all — not even its path header (test_command.rs:1340 gates the header
         // on the reporter, and only-failures suppresses it).
         if (!flags.onlyFailures || !body.empty()) {
+            // bun separates each file block with a blank line — including the
+            // first one, so stderr opens with "\n" right under the stdout banner
+            // (test_command.rs printFileHeader). Snapshot suites that diff raw
+            // stderr (test-failing.test.ts) depend on that leading newline.
+            std::println(std::cerr, "");
             std::println(std::cerr, "{}:", title);
             if (!body.empty()) std::println(std::cerr, "{}", body);
         }
@@ -1277,6 +1302,12 @@ int run_install(std::span<const std::string_view> args) {
     if (!result) {
         std::println(std::cerr, "error: {}", result.error().message);
         return 1;
+    }
+    // Non-fatal install diagnostics go out on stderr with bun's `warn:` prefix,
+    // the same channel and wording its Log uses for a warning-level message
+    // (runTasks.rs:498 logs an optional dependency's failed GET this way).
+    for (const std::string& warning : result->warnings) {
+        std::println(std::cerr, "warn: {}", warning);
     }
     // bun prints "Saved lockfile" on stderr when it writes bun.lock
     // (PackageManagerDirectories.rs save_lockfile).
@@ -1534,6 +1565,11 @@ int run_add(std::span<const std::string_view> args) {
         return 1;
     }
 
+    // bun times the install and prints the elapsed figure after the summary
+    // line ("1 package installed [46.00ms]", install_with_manager.rs printer);
+    // the corpus strips it with /\s*\[[0-9.]+m?s\]\s*$/, which only matches when
+    // the suffix is actually there.
+    const auto addStarted{std::chrono::steady_clock::now()};
     auto result{mbun::install::command::install_project(packageJsonPath->parent_path(), {})};
     if (!result) {
         std::println(std::cerr, "error: {}", result.error().message);
@@ -1545,6 +1581,7 @@ int run_add(std::span<const std::string_view> args) {
     // bare version under `--exact` (EditOptions::exact_versions, fed from
     // `manager.options.enable.exact_versions()` at :563/:575).
     std::vector<editor::NewDependency> resolved;
+    std::vector<std::string> installedLines;
     for (const auto& request : requests) {
         if (!request.isDistTag) continue;
         const auto match{std::ranges::find_if(result->packages, [&](const std::string& entry) {
@@ -1555,6 +1592,10 @@ int run_add(std::span<const std::string_view> args) {
         })};
         if (match == result->packages.end()) continue;
         const std::string version{match->substr(match->rfind('@') + 1)};
+        // The `installed` line reports the CONCRETE version that landed in
+        // node_modules, not the range package.json ends up carrying — bun
+        // prints `installed BaR@0.0.2` while writing `"BaR": "^0.0.2"`.
+        installedLines.push_back(std::format("{}@{}", request.name, version));
         resolved.push_back(editor::NewDependency{
             request.name, flags.exact ? version : std::format("^{}", version)});
     }
@@ -1567,12 +1608,27 @@ int run_add(std::span<const std::string_view> args) {
         }
     }
 
-    std::println("mbun add v{}\n", mbun::cli::VERSION);
-    for (const auto& dep : resolved) {
-        std::println("installed {}@{}", dep.name, dep.version);
+    // `add` saves the lockfile through the same writer `install` does, so it
+    // announces it the same way: bun's save_lockfile prints "Saved lockfile" on
+    // stderr for every subcommand that writes one, not just `install`
+    // (PackageManagerDirectories.rs save_lockfile is reached from the shared
+    // install_with_manager tail). Only `install` was echoing it here, so a
+    // successful `mbun add` wrote bun.lock silently.
+    for (const std::string& warning : result->warnings) {
+        std::println(std::cerr, "warn: {}", warning);
     }
-    std::println("\n{} package{} installed", result->installed,
-                 result->installed == 1 ? "" : "s");
+    if (result->savedLockfile) {
+        std::println(std::cerr, "Saved lockfile");
+    }
+    std::println("mbun add v{}\n", mbun::cli::VERSION);
+    for (const std::string& line : installedLines) {
+        std::println("installed {}", line);
+    }
+    const double addElapsedMs{
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - addStarted)
+            .count()};
+    std::println("\n{} package{} installed [{:.2f}ms]", result->installed,
+                 result->installed == 1 ? "" : "s", addElapsedMs);
     return 0;
 }
 
@@ -1953,7 +2009,8 @@ int emit_compiled_executable(const mbun::cli::BuildFlags& flags, const std::stri
     return 0;
 }
 
-int run_build(std::span<const std::string_view> buildArgs) {
+int run_build(std::span<const std::string_view> buildArgs,
+              std::optional<std::string_view> inheritedTsconfig = std::nullopt) {
     const auto start{std::chrono::steady_clock::now()};
     auto flags{mbun::cli::parse_build(buildArgs)};
 
@@ -1964,6 +2021,27 @@ int run_build(std::span<const std::string_view> buildArgs) {
     if (!flags.parseError.empty()) {
         std::println(std::cerr, "error: {}", flags.parseError);
         return 1;
+    }
+
+    if (!flags.tsconfigOverride && inheritedTsconfig) {
+        flags.tsconfigOverride = std::string{*inheritedTsconfig};
+    }
+    std::optional<mbun::resolver::TsconfigPaths> explicitTsconfig{};
+    if (flags.tsconfigOverride) {
+        std::error_code ec{};
+        const std::filesystem::path cwd{std::filesystem::current_path(ec)};
+        if (ec) {
+            std::println(std::cerr, "error: Could not resolve --tsconfig-override");
+            return 1;
+        }
+        const std::string path{
+            mbun::cli::resolve_tsconfig_override_path(*flags.tsconfigOverride, cwd)};
+        auto loaded{mbun::resolver::load_tsconfig_override(build_os_fs(), path)};
+        if (!loaded.config) {
+            std::println(std::cerr, "error: {}", loaded.error);
+            return 1;
+        }
+        explicitTsconfig = std::move(loaded.config);
     }
 
     // ref: bun src/cli/Arguments.rs :1472-1488 — no entrypoints prints the banner,
@@ -2093,7 +2171,11 @@ int run_build(std::span<const std::string_view> buildArgs) {
     for (const std::string& entryPoint : entryPoints) {
         auto built{mbun::bundler::build_bundle(
             {entryPoint}, mbun::bundler::Files{},
-            {.sourcemap = wantSourcemap, .fs = &fs, .jsx = jsx, .defines = defines})};
+            {.sourcemap = wantSourcemap,
+             .fs = &fs,
+             .tsconfig = explicitTsconfig ? &*explicitTsconfig : nullptr,
+             .jsx = jsx,
+             .defines = defines})};
         if (!built) {
             std::println(std::cerr, "error: {}", built.error().message);
             return 1;
@@ -2347,6 +2429,31 @@ void apply_cwd_flag(std::string_view dir) {
         std::println(std::cerr, "error: Could not change directory to \"{}\"", dir);
         std::exit(1);
     }
+}
+
+// Resolve --tsconfig-override at the CLI parsing boundary. The runtime must
+// receive one stable absolute config path; resolving later from an importing
+// module would incorrectly make the option depend on that modules directory.
+bool apply_tsconfig_override(std::string value) {
+    // A Worker/fork child still carries the parent's RAW process.execArgv. Its
+    // one-hop internal handoff is the normalized parse-time path and therefore
+    // wins over re-parsing that relative public spelling in the child's cwd.
+    if (gInheritedTsconfigOverride) return true;
+
+    std::error_code ec{};
+    const std::filesystem::path cwd{std::filesystem::current_path(ec)};
+    if (ec) {
+        std::println(std::cerr, "error: Could not resolve --tsconfig-override");
+        return false;
+    }
+    value = mbun::cli::resolve_tsconfig_override_path(value, cwd);
+    // Bun's runtime resolver logs an explicit missing/read/malformed config but
+    // keeps resolving with no config. Do not validate here: doing so prevented
+    // run/eval/test/node/repl user code from executing at all. Engine::
+    // load_tsconfig_ owns the one-time diagnostic when resolution first needs
+    // the config. Build deliberately retains its eager fatal check below.
+    mbun::jsc::runtime::set_tsconfig_override(std::move(value));
+    return true;
 }
 
 // `--loader .ext:name` / `-l .ext:name`: install a process-wide extension→loader
@@ -2964,7 +3071,44 @@ int run_embedded_program(const mbun::bundler::standalone_exe::Program& program,
 // is cosmetic. `-i` also forces the REPL when stdin is NOT a tty, which is the
 // only way the corpus can drive it (17 test-repl-* files spawn `mbun -i` /
 // `mbun --interactive` with piped stdio).
+bool apply_node_frontend_options(std::span<const std::string_view> args) {
+    mbun::cli::TsconfigOverrideArg tsconfig{};
+    for (std::size_t i{}; i < args.size(); ++i) {
+        const std::string_view a{args[i]};
+        if (a == "-e" || a == "--eval" || a == "-p" || a == "--print" || a == "-pe" ||
+            a == "-ep") {
+            break;
+        }
+        if (!a.starts_with("-") || a == "-") break;
+        if (const std::size_t n{mbun::cli::take_tsconfig_override(args, i, tsconfig)}; n > 0) {
+            if (!tsconfig.parseError.empty()) {
+                std::println(std::cerr, "error: {}", tsconfig.parseError);
+                return false;
+            }
+            i += n - 1;
+            continue;
+        }
+        if (a == "--cwd" && i + 1 < args.size()) {
+            apply_cwd_flag(args[++i]);
+            continue;
+        }
+        if (a.starts_with("--cwd=")) {
+            apply_cwd_flag(a.substr(6));
+            continue;
+        }
+        if (a.find('=') == std::string_view::npos && mbun::cli::node_flag_takes_value(a) &&
+            i + 1 < args.size()) {
+            ++i;
+        }
+    }
+
+    // As in Bun's full option-table parse, cwd is applied before the raw
+    // tsconfig value is joined regardless of their command-line order.
+    return !tsconfig.value || apply_tsconfig_override(*tsconfig.value);
+}
+
 int exec_interactive(std::span<const std::string_view> args) {
+    if (!apply_node_frontend_options(args)) return 1;
     // node lib/internal/main/repl.js: `--input-type` selects a module kind for
     // the entry point, and a REPL has none — node prints this on stderr and
     // exits kInvalidCommandLineArgument (9). test-repl-unsupported-option
@@ -3055,7 +3199,15 @@ bool take_interactive_flag(std::vector<std::string_view>& args) {
             continue;
         }
         if (a == "-e" || a == "--eval" || a == "-p" || a == "--print") { i += 2; continue; }
-        if (a.starts_with("-") && a != "-") { ++i; continue; }
+        if (a.starts_with("-") && a != "-") {
+            if (a.find('=') == std::string_view::npos &&
+                mbun::cli::exec_argv_flag_takes_value(a) && i + 1 < args.size()) {
+                i += 2;
+            } else {
+                ++i;
+            }
+            continue;
+        }
         break;
     }
     return interactive;
@@ -3073,6 +3225,7 @@ bool take_interactive_flag(std::vector<std::string_view>& args) {
 // WARN_ON_UNRECOGNIZED_FLAG) — node-mode must not reject node's own flags.
 int exec_as_if_node(std::span<const std::string_view> args) {
     mbun::cli::run::set_pretend_to_be_node(true);
+    if (!apply_node_frontend_options(args)) return 1;
 
     std::vector<std::string> preloads{};
     std::size_t i{0};
@@ -3133,7 +3286,7 @@ int exec_as_if_node(std::span<const std::string_view> args) {
         // (its `=value` rides along in the same token). A separate value token is
         // skipped only for flags known to take one, so boolean flags do not
         // accidentally swallow the script path.
-        if (a.find('=') == std::string_view::npos && mbun::cli::node_flag_takes_value(a) &&
+        if (a.find('=') == std::string_view::npos && mbun::cli::exec_argv_flag_takes_value(a) &&
             i + 1 < args.size()) {
             ++i;  // consume the value token
         }
@@ -3156,7 +3309,24 @@ int exec_as_if_node(std::span<const std::string_view> args) {
         std::filesystem::path abs{std::filesystem::current_path(ec) / target};
         if (!ec) target = abs.lexically_normal().string();
     }
-    return run_script(target, args.subspan(i + 1));
+
+    // RunAsNodeCommand still boots through Bun's normal module resolver. For a
+    // missing extensionless positional that resolver tries the ESM entry order
+    // from resolver/options.rs before reporting not-found. Keep this completion
+    // at the node-shim dispatch point: ordinary `bun run` must retain its
+    // package-script/.bin lookup, while node mode must never enter either one.
+    //
+    // Only the load path gains the suffix. Bun preserves the spelling supplied
+    // by the user in process.argv[1], which as-node.test.ts pins explicitly.
+    std::string loadTarget{target};
+    mbun::resolver::Options entryOptions{};
+    entryOptions.kind = mbun::resolver::ResolveKind::Import;
+    entryOptions.extension_order = {
+        ".tsx", ".jsx", ".mts", ".ts", ".mjs", ".js", ".cts", ".cjs", ".json"};
+    mbun::resolver::Resolver entryResolver{build_os_fs(), std::move(entryOptions)};
+    const auto resolved{entryResolver.resolve(target, std::filesystem::current_path().string())};
+    if (resolved.status == mbun::resolver::ResolveStatus::Success) loadTarget = resolved.path;
+    return run_script(loadTarget, args.subspan(i + 1), target);
 }
 
 } // namespace mbun::app

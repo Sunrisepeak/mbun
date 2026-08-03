@@ -72,6 +72,10 @@ export struct Options {
     // parents. Default false (node's default, and what the isolated-linker
     // layouts below need).
     bool preserve_symlinks{false};
+    // Optional caller-pinned LOAD_AS_FILE order. Empty retains the resolver's
+    // project/node_modules defaults; RunAsNodeCommand supplies Bun's main-entry
+    // order without changing ordinary import resolution.
+    std::vector<std::string_view> extension_order;
 };
 
 // ReResolve: `path` is a bare specifier (e.g. a package.json "imports" target
@@ -119,19 +123,44 @@ class JsonParser {
 public:
     explicit JsonParser(std::string_view text) : s_{text} {}
 
-    std::optional<JsonValue> parse() {
+    std::optional<JsonValue> parse(bool requireEof = false) {
         skip_ws();
         auto v{parse_value()};
         if (!v) {
             return std::nullopt;
         }
         skip_ws();
-        return v;  // trailing content tolerated (package.json is well-formed)
+        if (requireEof && i_ < s_.size()) {
+            fail("end of file");
+            return std::nullopt;
+        }
+        return v;  // package.json probing retains its historical tolerance
     }
+
+    const std::string& error() const { return error_; }
+    std::size_t error_offset() const { return error_offset_; }
 
 private:
     std::string_view s_;
     std::size_t i_{0};
+    std::string error_;
+    std::size_t error_offset_{0};
+
+    void fail(std::string_view expected) {
+        if (!error_.empty()) return;
+        error_offset_ = i_;
+        if (i_ >= s_.size()) {
+            error_ = std::format("Expected {} but found end of file", expected);
+            return;
+        }
+        std::size_t end{i_};
+        while (end < s_.size() && !std::isspace(static_cast<unsigned char>(s_[end])) &&
+               s_[end] != ',' && s_[end] != '}' && s_[end] != ']') {
+            ++end;
+        }
+        if (end == i_) ++end;
+        error_ = std::format("Expected {} but found \"{}\"", expected, s_.substr(i_, end - i_));
+    }
 
     void skip_ws() {
         while (i_ < s_.size()) {
@@ -160,6 +189,7 @@ private:
     std::optional<JsonValue> parse_value() {
         skip_ws();
         if (i_ >= s_.size()) {
+            fail("value");
             return std::nullopt;
         }
         const char c{s_[i_]};
@@ -191,6 +221,7 @@ private:
 
     std::optional<JsonValue> parse_literal(std::string_view lit, JsonValue val) {
         if (s_.substr(i_, lit.size()) != lit) {
+            fail(lit);
             return std::nullopt;
         }
         i_ += lit.size();
@@ -211,6 +242,7 @@ private:
             }
         }
         if (i_ == start) {
+            fail("value");
             return std::nullopt;
         }
         JsonValue v;
@@ -221,6 +253,7 @@ private:
 
     std::optional<std::string> parse_string() {
         if (i_ >= s_.size() || s_[i_] != '"') {
+            fail("string");
             return std::nullopt;
         }
         ++i_;
@@ -232,6 +265,7 @@ private:
             }
             if (c == '\\') {
                 if (i_ >= s_.size()) {
+                    fail("escape sequence");
                     return std::nullopt;
                 }
                 const char e{s_[i_++]};
@@ -246,6 +280,7 @@ private:
                     case 'f': out += '\f'; break;
                     case 'u': {
                         if (i_ + 4 > s_.size()) {
+                            fail("four hexadecimal digits");
                             return std::nullopt;
                         }
                         unsigned cp{0};
@@ -262,6 +297,7 @@ private:
                 out += c;
             }
         }
+        fail("closing quote");
         return std::nullopt;  // unterminated
     }
 
@@ -295,6 +331,7 @@ private:
             v.array.push_back(std::move(*el));
             skip_ws();
             if (i_ >= s_.size()) {
+                fail("',' or ']'");
                 return std::nullopt;
             }
             if (s_[i_] == ',') {
@@ -310,6 +347,7 @@ private:
                 ++i_;
                 return v;
             }
+            fail("',' or ']'");
             return std::nullopt;
         }
     }
@@ -331,6 +369,7 @@ private:
             }
             skip_ws();
             if (i_ >= s_.size() || s_[i_] != ':') {
+                fail("':'");
                 return std::nullopt;
             }
             ++i_;
@@ -341,6 +380,7 @@ private:
             v.object.emplace_back(std::move(*key), std::move(*val));
             skip_ws();
             if (i_ >= s_.size()) {
+                fail("',' or '}'");
                 return std::nullopt;
             }
             if (s_[i_] == ',') {
@@ -356,6 +396,7 @@ private:
                 ++i_;
                 return v;
             }
+            fail("',' or '}'");
             return std::nullopt;
         }
     }
@@ -386,11 +427,17 @@ std::string join_target(std::string_view baseDir, std::string_view rel) {
 // baseUrl (relative to `configDir`) + compilerOptions.paths. `extends` is not
 // followed (paths that matter for the vendored bun test suite are declared in the
 // leaf tsconfig). Returns nullopt only if the JSON is unparseable.
-export std::optional<TsconfigPaths> parse_tsconfig(std::string_view json,
-                                                   std::string_view configDir) {
+std::optional<TsconfigPaths> parse_tsconfig_impl(std::string_view json,
+                                                 std::string_view configDir,
+                                                 std::string* error,
+                                                 std::size_t* errorOffset) {
     JsonParser parser{json};
-    auto root{parser.parse()};
+    auto root{parser.parse(/*requireEof=*/true)};
     if (!root || root->kind != JsonValue::Kind::Object) {
+        if (error != nullptr) {
+            *error = parser.error().empty() ? "Expected object" : parser.error();
+        }
+        if (errorOffset != nullptr) *errorOffset = parser.error_offset();
         return std::nullopt;
     }
     const JsonValue* co{root->find("compilerOptions")};
@@ -425,6 +472,65 @@ export std::optional<TsconfigPaths> parse_tsconfig(std::string_view json,
     return ts;
 }
 
+export std::optional<TsconfigPaths> parse_tsconfig(std::string_view json,
+                                                   std::string_view configDir) {
+    return parse_tsconfig_impl(json, configDir, nullptr, nullptr);
+}
+
+export struct TsconfigLoadResult {
+    std::optional<TsconfigPaths> config;
+    std::string error;
+};
+
+// Load an explicitly requested config. Unlike the nearest-tsconfig probe, an
+// explicit path is a user assertion: missing/unreadable/malformed input must be
+// reported rather than cached as an indistinguishable null result.
+export TsconfigLoadResult load_tsconfig_override(const FileSystem& fs,
+                                                  std::string_view configPath) {
+    const std::string path{paths::normalize(configPath)};
+    if (!fs.file_exists || !fs.file_exists(path)) {
+        return {.error = std::format("Cannot find tsconfig file \"{}\"", path)};
+    }
+    if (!fs.read_file) {
+        return {.error = std::format("Cannot read file \"{}\"", path)};
+    }
+    auto content{fs.read_file(path)};
+    if (!content) return {.error = std::format("Cannot read file \"{}\"", path)};
+
+    std::string parseError;
+    std::size_t errorOffset{0};
+    auto parsed{parse_tsconfig_impl(*content, paths::dirname(path), &parseError, &errorOffset)};
+    if (!parsed) {
+        std::size_t line{1};
+        std::size_t column{1};
+        for (std::size_t i{0}; i < errorOffset && i < content->size(); ++i) {
+            if ((*content)[i] == '\n') {
+                ++line;
+                column = 1;
+            } else {
+                ++column;
+            }
+        }
+        return {.error = std::format("{}\n    at {}:{}:{}", parseError, path, line, column)};
+    }
+
+    // Preserve the runtime's existing bounded extends behavior. A leaf with its
+    // own paths wins; otherwise inherit the first parent that supplies them.
+    std::string current{path};
+    for (int hop{0}; parsed->entries.empty() && !parsed->extends_from.empty() && hop < 16; ++hop) {
+        std::string parentSpec{parsed->extends_from};
+        if (!parentSpec.ends_with(".json")) parentSpec += "/tsconfig.json";
+        current = paths::join({paths::dirname(current), parentSpec});
+        if (!fs.file_exists(current)) break;
+        auto parentContent{fs.read_file(current)};
+        if (!parentContent) break;
+        auto parent{parse_tsconfig(*parentContent, paths::dirname(current))};
+        if (!parent) break;
+        parsed = std::move(parent);
+    }
+    return {.config = std::move(parsed)};
+}
+
 // ---------------------------------------------------------------------------
 // Resolver
 // ---------------------------------------------------------------------------
@@ -455,6 +561,13 @@ public:
 
         // package.json "imports" — internal "#" specifiers.
         if (specifier.front() == '#') {
+            // TypeScript path aliases may deliberately use the same prefix
+            // (for example "#/*"). Bun applies a matching tsconfig path before
+            // falling back to package.json imports; an unmatched alias still
+            // retains the package-imports error and resolution contract below.
+            if (opts_.tsconfig != nullptr) {
+                if (auto r{resolve_tsconfig_paths(specifier)}) return ok(*r);
+            }
             return resolve_imports(specifier, fromDir);
         }
 
@@ -531,7 +644,8 @@ private:
     // Bun selects the node_modules order when the path being searched passes
     // through a node_modules directory. The resolver works in normalized
     // forward-slash paths, so the needle is "/node_modules/".
-    static std::span<const std::string_view> extensions_for(std::string_view path) {
+    std::span<const std::string_view> extensions_for(std::string_view path) const {
+        if (!opts_.extension_order.empty()) return opts_.extension_order;
         if (path.find("/node_modules/") != std::string_view::npos) {
             return kExtensionsNodeModules;
         }
@@ -853,8 +967,21 @@ private:
             }
         }
         while (true) {
-            // skip a node_modules segment as its own parent (node walks dirs, not
-            // node_modules-of-node_modules); simplest: just probe every dir.
+            // node NODE_MODULES_PATHS drops any ancestor whose own last segment
+            // is "node_modules", so `<x>/node_modules/node_modules/<name>` is
+            // never a candidate. Probing it anyway used to be harmless (such a
+            // directory is not a package), but LOAD_AS_FILE below would now
+            // reach the decoy file test/fixtures/node_modules/node_modules/bar.js.
+            const std::string_view lastSeg{dir.data() + dir.find_last_of('/') + 1,
+                                           dir.data() + dir.size()};
+            if (lastSeg == "node_modules") {
+                const std::string up{paths::dirname(dir)};
+                if (up == dir) {
+                    break;
+                }
+                dir = up;
+                continue;
+            }
             const std::string pkgRoot{paths::join({dir, "node_modules", ps.name})};
             const std::string pkgJsonPath{join_target(pkgRoot, "package.json")};
             if (auto pkg{read_package_json(pkgJsonPath)}) {
@@ -868,6 +995,18 @@ private:
                 const std::string target{ps.subpath.empty() ? pkgRoot
                                                             : join_target(pkgRoot, ps.subpath.substr(1))};
                 if (auto r{load_as_file_or_dir(target)}) {
+                    return ok(*r);
+                }
+            }
+            // node LOAD_NODE_MODULES runs LOAD_AS_FILE(DIR/X) alongside
+            // LOAD_AS_DIRECTORY(DIR/X), so a bare specifier is also satisfied by
+            // a plain file sitting directly in node_modules: `require('bar')`
+            // resolves `node_modules/bar.js` (test/fixtures/node_modules/bar.js,
+            // exercised by test-repl-require).
+            {
+                const std::string target{ps.subpath.empty() ? pkgRoot
+                                                            : join_target(pkgRoot, ps.subpath.substr(1))};
+                if (auto r{load_as_file(target)}) {
                     return ok(*r);
                 }
             }

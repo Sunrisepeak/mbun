@@ -56,6 +56,31 @@ inline constexpr std::string_view kNodeReplJS = R"JS(
   const { Console } = req("console");
   const moduleMod = req("module");
   const CJSModule = moduleMod.Module || moduleMod;
+  // Primordial used by node's evaluator scans and RegExp.$1..$9 save/restore
+  // protocol. Capture and uncurry exec before user code can replace it.
+  const RegExpPrototypeExec = Function.prototype.call.bind(RegExp.prototype.exec);
+  const ObjectGetOwnPropertyDescriptor = Object.getOwnPropertyDescriptor;
+  const IntrinsicTypeError = TypeError;
+  const legacyCaptureGetters = new Array(10);
+  const legacyCaptureReadable = new Array(10).fill(true);
+  for (let idx = 1; idx < legacyCaptureGetters.length; idx += 1) {
+    const key = `$${idx}`;
+    const descriptor = ObjectGetOwnPropertyDescriptor(RegExp, key);
+    legacyCaptureGetters[idx] = descriptor && descriptor.get;
+    try {
+      void RegExp[key];
+    } catch (captureError) {
+      // JSC issue #65 is an intrinsic capability failure. Classify it while
+      // the original accessor identity is known, before a user can install a
+      // getter with a spoofed copy of the same error text.
+      if (!(captureError instanceof IntrinsicTypeError) ||
+          captureError.message !==
+            "RegExp.$N getters require RegExp constructor as |this|") {
+        throw captureError;
+      }
+      legacyCaptureReadable[idx] = false;
+    }
+  }
 
   // node internal/errors.js: an E() error carries kIsNodeError, so both
   // defaultPrepareStackTrace and NodeError#toString render the code into the
@@ -344,7 +369,9 @@ inline constexpr std::string_view kNodeReplJS = R"JS(
         lastQuoteContinued = false;
         while (i < n) {
           if (code[i] === "\\") {
-            if (/[\r\n\u2028\u2029]/.test(code[i + 1] || "")) lastQuoteContinued = true;
+            if (RegExpPrototypeExec(/[\r\n\u2028\u2029]/, code[i + 1] || "") !== null) {
+              lastQuoteContinued = true;
+            }
             i += 2;
             continue;
           }
@@ -448,7 +475,8 @@ inline constexpr std::string_view kNodeReplJS = R"JS(
   function isRecoverableError(e, code) {
     // Wrap a leading `{` in parentheses first, exactly as node does, so an
     // incomplete object literal counts as recoverable.
-    if (/^\s*\{/.test(code) && isRecoverableError(e, `(${code}`)) return true;
+    if (RegExpPrototypeExec(/^\s*\{/, code) !== null &&
+        isRecoverableError(e, `(${code}`)) return true;
 
     const err = parseThrows(code);
     if (err === null) return false;
@@ -475,7 +503,8 @@ inline constexpr std::string_view kNodeReplJS = R"JS(
   const startsWithBraceRegExp = /^\s*{/;
   const endsWithSemicolonRegExp = /;\s*$/;
   function isObjectLiteral(code) {
-    return startsWithBraceRegExp.test(code) && !endsWithSemicolonRegExp.test(code);
+    return RegExpPrototypeExec(startsWithBraceRegExp, code) !== null &&
+      RegExpPrototypeExec(endsWithSemicolonRegExp, code) === null;
   }
 
   let nextREPLResourceNumber = 1;
@@ -535,7 +564,28 @@ inline constexpr std::string_view kNodeReplJS = R"JS(
   const REPL_MODE_STRICT = Symbol("repl-strict");
 
   let processNewListenerUseCount = 0;
-  let activeReplServer = null;
+  // The REPL that owns the CURRENT ASYNC CONTEXT. node keeps this in an
+  // AsyncLocalStorage (repl.js `replContext`, entered around every eval), which
+  // is what makes a callback the command scheduled still belong to the REPL
+  // that scheduled it. The plain variable this replaces was restored in a
+  // `finally` and so only spanned the synchronous eval: a
+  // `process.on("uncaughtException", …)` run from a process.nextTick the
+  // command scheduled found no active REPL, skipped ERR_INVALID_REPL_INPUT and
+  // really installed a listener that outlived the REPL
+  // (test-repl-uncaught-exception-async counted it plus the capture below).
+  let replContext = null;
+  function getReplContext() {
+    if (replContext === null) {
+      const ah = M["async_hooks"] || M["node:async_hooks"];
+      replContext = new ah.AsyncLocalStorage();
+    }
+    return replContext;
+  }
+  function currentReplServer() {
+    if (replContext === null) return null;
+    const store = replContext.getStore();
+    return (store && store.replServer) || null;
+  }
   // The most recent REPLServer to run a command — the owner of any async throw
   // its commands scheduled, once every live server has closed.
   let lastEvaluatingServer = null;
@@ -544,51 +594,72 @@ inline constexpr std::string_view kNodeReplJS = R"JS(
   // AsyncLocalStorage + addUncaughtExceptionCaptureCallback; the innermost live
   // server is the same answer for every shape the tests drive.
   const liveServers = [];
-  let installingCapture = false;
   let captureInstalled = false;
-  let captureHandler = null;
+  // Errors that escaped REPLServer.complete(). See setupExceptionCapture.
+  const completionEscapes = new WeakSet();
+  function markCompletionEscape(err) {
+    if (err !== null && (typeof err === "object" || typeof err === "function")) {
+      try { completionEscapes.add(err); } catch { /* frozen/revoked proxy */ }
+    }
+  }
+  function escapedFromCompletion(err) {
+    if (err === null || (typeof err !== "object" && typeof err !== "function")) return false;
+    try { return completionEscapes.has(err); } catch { return false; }
+  }
+  // node registers the REPL's error router through
+  // process.addUncaughtExceptionCaptureCallback (repl.js:195), which is NOT an
+  // 'uncaughtException' listener — the corpus asserts a closed REPL leaves
+  // process.listenerCount('uncaughtException') === 0
+  // (test-repl-uncaught-exception-async, test-repl-uncaught-exception). mbun's
+  // public capture slot is single-occupancy and belongs to node:domain, so the
+  // REPL gets its own seam (__mbunReplUncaughtCapture), consulted by the
+  // runtime's uncaught dispatch right after the capture callback and before any
+  // user listener. Registering it as a listener instead is what left one of the
+  // two residual listeners behind, and it also made the REPL's own router
+  // indistinguishable from a user handler wherever node counts listeners.
   function setupExceptionCapture() {
     if (captureInstalled) return;
     captureInstalled = true;
-    installingCapture = true;
-    try {
-      captureHandler = (err) => {
-        // A REPL that has evaluated something owns the async throws its
-        // commands scheduled, even after it closed: node reaches the same
-        // answer through the AsyncLocalStorage store captured when the command
-        // ran, which a closed REPL still carries. Ending stdin closes the REPL
-        // before a setImmediate scheduled by the last command fires, and
-        // rethrowing there killed the process instead of reporting through the
-        // REPL's output (test-repl-uncaught-exception-after-input-ended).
-        const server = liveServers[liveServers.length - 1] || lastEvaluatingServer;
-        if (server === undefined || server === null) throw err;
-        server._handleError(err);
-      };
-      process.on("uncaughtException", captureHandler);
-    } finally {
-      installingCapture = false;
-    }
+    getReplContext();
+    // defineProperty, not assignment: node's test/common leak check enumerates
+    // globalThis's own properties and fails any test that added one.
+    Object.defineProperty(G, "__mbunReplUncaughtCapture", {
+      configurable: true, enumerable: false, writable: true,
+      value: (err) => {
+      // A REPL that has evaluated something owns the async throws its
+      // commands scheduled, even after it closed: node reaches the same
+      // answer through the AsyncLocalStorage store captured when the command
+      // ran, which a closed REPL still carries. Ending stdin closes the REPL
+      // before a setImmediate scheduled by the last command fires, and
+      // declining there killed the process instead of reporting through the
+      // REPL's output (test-repl-uncaught-exception-after-input-ended).
+      // ...but only for throws the REPL could plausibly own. Completion never
+      // runs inside replContext.run() (node calls the completer straight from
+      // readline), so in node `getStore()` is undefined for an error thrown by
+      // a completion callback and the capture callback declines it — the error
+      // has to reach the process as a genuine uncaught exception and take it
+      // down (test-repl-tab-complete-nested-repls, nodejs/node#21586). The
+      // fallback below has no async context to consult, so the error carries
+      // the answer instead: REPLServer.complete tags whatever escapes it.
+      const server = currentReplServer() ||
+        (escapedFromCompletion(err) ? null
+                                    : liveServers[liveServers.length - 1] || lastEvaluatingServer);
+      if (server === undefined || server === null) return false;
+      // node's capture returns `result !== 'unhandled'`: a REPL whose
+      // handleError declined the error must let it reach the process's own
+      // 'uncaughtException' listeners (test-repl-user-error-handler).
+      return server._handleError(err) !== "unhandled";
+      },
+    });
   }
-  // node registers this capture through process.addUncaughtExceptionCaptureCallback
-  // (repl.js:195), which is NOT an 'uncaughtException' listener. mbun's runtime
-  // only offers the event, so the REPL's own handler has to be discounted
-  // wherever node counts listeners: a standalone REPL otherwise reads its own
-  // capture as a user handler, re-emits every eval error into itself instead of
-  // printing it, and `mbun -i` reported nothing at all for a throw.
+  // Every 'uncaughtException' listener is a user's now that the REPL's own
+  // router is not one (see setupExceptionCapture). A standalone REPL uses this
+  // to decide whether to re-emit an eval error instead of printing it.
   function userUncaughtExceptionListeners() {
-    let n = 0;
-    // Indexed loop, not for-of: this runs on every REPL eval error, including the
-    // one raised by user code that just deleted Array.prototype[Symbol.iterator]
-    // (test-repl-unsafe-array-iteration), and a for-of would re-read it here and
-    // replace the user's TypeError with a crash in the error reporter itself.
-    const ls = process.listeners("uncaughtException");
-    for (let i = 0; i < ls.length; i++) {
-      if (ls[i] !== captureHandler) n++;
-    }
-    return n;
+    return process.listenerCount("uncaughtException");
   }
   function processNewListener(event) {
-    if (event === "uncaughtException" && activeReplServer !== null && !installingCapture) {
+    if (event === "uncaughtException" && currentReplServer() !== null) {
       throw ERR_INVALID_REPL_INPUT(
         "Listeners for `uncaughtException` cannot be used in the REPL");
     }
@@ -609,7 +680,49 @@ inline constexpr std::string_view kNodeReplJS = R"JS(
     /(?:[\w$]+|[\w$]+\.(?:[\w$]+\.)*[\w$]*|\[[^\]]*\](?:\.[\w$]*)*)$/;
   const requireRE = /\brequire\s*\(\s*['"`](([\w@./:-]+\/)?(?:[\w@./:-]*))(?![^'"`])$/;
   const fsAutoCompleteRE = /fs(?:\.promises)?\.\s*[a-z][a-zA-Z]+\(\s*["'](.*)/;
+  // Exclude the versioned names that 'npm' installs.
+  const versionedFileNamesRe = /-\d+\.\d+/;
   const importRE = /\bimport\s*\(\s*['"`](([\w@./:-]+\/)?(?:[\w@./:-]*))(?![^'"`])$/;
+
+  // node's internal/repl/completion.js builds `nodeSchemeBuiltinLibs` ONCE, at
+  // module scope, while `getReplBuiltinLibs()` stays live. That asymmetry is
+  // load-bearing and asserted: pushing a name onto the deprecated mutable
+  // `repl.builtinModules` must grow the completion list by exactly one — the
+  // bare name — and must NOT also produce `node:<name>`
+  // (test-repl-tab-complete-require, test-repl-tab-complete-import). Mapping
+  // the live list twice added both. Built lazily rather than at builtins-image
+  // evaluation time, when the module table is not yet populated.
+  let nodeSchemeBuiltinLibsCache = null;
+  const nodeSchemeBuiltinLibs = () => {
+    if (nodeSchemeBuiltinLibsCache === null) {
+      nodeSchemeBuiltinLibsCache = getReplBuiltinLibs().map((lib) => `node:${lib}`);
+    }
+    return nodeSchemeBuiltinLibsCache.slice();
+  };
+
+  function gracefulReaddir(...args) {
+    try { return fs.readdirSync(...args); } catch { /* Continue regardless of error. */ }
+  }
+
+  // node internal/repl/completion.js completeFSFunctions: inside an fs call's
+  // string literal, complete on directory entries rather than on JS.
+  function completeFSFunctions(match) {
+    let baseName = "";
+    let filePath = match[1];
+    let fileList = gracefulReaddir(filePath, { withFileTypes: true });
+
+    if (!fileList) {
+      baseName = path.basename(filePath);
+      filePath = path.dirname(filePath);
+      fileList = gracefulReaddir(filePath, { withFileTypes: true }) || [];
+    }
+
+    const completions = fileList
+      .filter((dirent) => dirent.name.startsWith(baseName))
+      .map((d) => d.name);
+
+    return [[completions], baseName];
+  }
 
   function isIdentifier(str) {
     if (str === "") return false;
@@ -926,22 +1039,39 @@ inline constexpr std::string_view kNodeReplJS = R"JS(
       completeOn = match[1];
       filter = completeOn;
       const subdir = match[2] || "";
-      completionGroups.push(getReplBuiltinLibs());
-      completionGroups.push(getReplBuiltinLibs().map((lib) => `node:${lib}`));
       if (subdir === "") completionGroups.push([]);
       if (this.allowBlockingCompletions) {
         const extensions = Object.keys(CJSModule._extensions || { ".js": 1 });
         const indexes = extensions.map((extension) => `index${extension}`);
         indexes.push("package.json", "index");
         const replModule = this.context && this.context.module;
-        const paths = ((replModule && replModule.paths) || []).concat(CJSModule.globalPaths || []);
-        const group2 = [];
+        // node picks the search roots from what has been typed so far: a bare
+        // "." or ".." answers with the directory prefixes themselves and reads
+        // nothing, an explicit "./" or "../" reads the cwd, and only a bare
+        // specifier walks module.paths + globalPaths
+        // (test-repl-tab-complete-require's `require('.` case wants exactly
+        // ['./', '../'], not the whole node_modules sweep).
+        let group2 = [];
+        let paths = [];
+        if (completeOn === ".") {
+          group2 = ["./", "../"];
+        } else if (completeOn === "..") {
+          group2 = ["../"];
+        } else if (/^\.\.?\//.test(completeOn)) {
+          paths = [process.cwd()];
+        } else {
+          paths = ((replModule && replModule.paths) || []).concat(CJSModule.globalPaths || []);
+        }
         for (let dir of paths) {
           dir = path.resolve(dir, subdir);
           let dirents;
           try { dirents = fs.readdirSync(dir, { withFileTypes: true }); } catch { continue; }
           for (const dirent of dirents) {
-            if (extensions.includes(path.extname(dirent.name)) || indexes.includes(dirent.name)) {
+            // node's guard here excludes the versioned names 'npm' installs.
+            // mbun's skipped every entry with a requirable extension instead,
+            // which made the `group2.push` below unreachable for files: a
+            // relative `require('./` completed to nothing at all.
+            if (versionedFileNamesRe.test(dirent.name) || dirent.name === ".npm") {
               continue;
             }
             const extension = path.extname(dirent.name);
@@ -965,11 +1095,70 @@ inline constexpr std::string_view kNodeReplJS = R"JS(
         }
         if (group2.length) completionGroups.push(group2);
       }
+      // Last, and in this order: completionGroupsLoaded unshifts, so the group
+      // pushed last comes out nearest the cursor. node pushes the on-disk group
+      // first and then `getReplBuiltinLibs(), nodeSchemeBuiltinLibs`, which
+      // renders as `node:`-prefixed builtins, separator, bare builtins,
+      // separator, files — the exact sequence
+      // test-repl-tab-complete-require indexes off `node:<last builtin>`.
+      completionGroups.push(getReplBuiltinLibs());
+      completionGroups.push(nodeSchemeBuiltinLibs());
     } else if ((match = importRE.exec(line)) !== null) {
       completeOn = match[1];
       filter = completeOn;
-      completionGroups.push(getReplBuiltinLibs().map((lib) => `node:${lib}`));
+      if (this.allowBlockingCompletions) {
+        const subdir = match[2] || "";
+        // node's extensionFormatMap keys — what import() can name directly.
+        const extensions = [".cjs", ".js", ".json", ".mjs", ".wasm"];
+        // Only consulted for bare specifiers loaded out of node_modules.
+        const indexes = extensions.map((ext) => `index${ext}`);
+        indexes.push("package.json");
+
+        let group3 = [];
+        let paths = [];
+        if (completeOn === ".") {
+          group3 = ["./", "../"];
+        } else if (completeOn === "..") {
+          group3 = ["../"];
+        } else if (/^\.\.?\//.test(completeOn)) {
+          paths = [process.cwd()];
+        } else {
+          const replModule = this.context && this.context.module;
+          paths = ((replModule && replModule.paths) || []).slice();
+        }
+
+        for (let dir of paths) {
+          dir = path.resolve(dir, subdir);
+          const isInNodeModules = path.basename(dir) === "node_modules";
+          const dirents = gracefulReaddir(dir, { withFileTypes: true }) || [];
+          for (const dirent of dirents) {
+            const name = dirent.name;
+            // Exclude versioned names that 'npm' installs.
+            if (versionedFileNamesRe.test(name) || name === ".npm") continue;
+            if (!dirent.isDirectory()) {
+              if (extensions.includes(path.extname(name))) group3.push(`${subdir}${name}`);
+              continue;
+            }
+            group3.push(`${subdir}${name}/`);
+            if (!subdir && isInNodeModules) {
+              const absolute = path.resolve(dir, name);
+              const subfiles = gracefulReaddir(absolute) || [];
+              if (subfiles.some((subfile) => indexes.includes(subfile))) {
+                group3.push(`${subdir}${name}`);
+              }
+            }
+          }
+        }
+        if (group3.length) completionGroups.push(group3);
+      }
       completionGroups.push(getReplBuiltinLibs());
+      completionGroups.push(nodeSchemeBuiltinLibs());
+    } else if ((match = fsAutoCompleteRE.exec(line)) !== null &&
+               this.allowBlockingCompletions) {
+      // Completing inside an fs call's path literal: the whole completion is
+      // the directory listing, so it REPLACES completionGroups and leaves
+      // `filter` empty (test-repl-tab-complete-files).
+      ({ 0: completionGroups, 1: completeOn } = completeFSFunctions(match));
     } else if (line.length === 0 || /\w|\.|\$/.test(line[line.length - 1])) {
       const completeTarget =
         line.length === 0 ? line : findExpressionCompleteTarget(line);
@@ -1216,6 +1405,26 @@ inline constexpr std::string_view kNodeReplJS = R"JS(
       setupExceptionCapture();
 
       const savedRegExMatches = ["", "", "", "", "", "", "", "", "", ""];
+      const regExMatchSeparator = "\u0000\u0000\u0000";
+      const regExMatcher = new RegExp(
+        `^${regExMatchSeparator}(.*)${regExMatchSeparator}(.*)` +
+        `${regExMatchSeparator}(.*)${regExMatchSeparator}(.*)` +
+        `${regExMatchSeparator}(.*)${regExMatchSeparator}(.*)` +
+        `${regExMatchSeparator}(.*)${regExMatchSeparator}(.*)` +
+        `${regExMatchSeparator}(.*)$`);
+
+      function saveRegExpMatches() {
+        for (let idx = 1; idx < savedRegExMatches.length; idx += 1) {
+          const key = `$${idx}`;
+          const descriptor = ObjectGetOwnPropertyDescriptor(RegExp, key);
+          if (!legacyCaptureReadable[idx] && descriptor &&
+              descriptor.get === legacyCaptureGetters[idx]) continue;
+          // A replaced getter or data property is user-observable state. Read
+          // it normally and propagate every error it raises, including one
+          // whose message happens to match issue #65.
+          savedRegExMatches[idx] = RegExp[key];
+        }
+      }
 
       eval_ = eval_ || defaultEval;
 
@@ -1290,7 +1499,8 @@ inline constexpr std::string_view kNodeReplJS = R"JS(
         if (err === null) {
           for (;;) {
             try {
-              if (self.replMode === REPL_MODE_STRICT && !/^\s*$/.test(code)) {
+              if (self.replMode === REPL_MODE_STRICT &&
+                  RegExpPrototypeExec(/^\s*$/, code) === null) {
                 code = `'use strict'; void 0;\n${code}`;
               }
               script = new vm.Script(code, { filename: file, displayErrors: false });
@@ -1310,13 +1520,16 @@ inline constexpr std::string_view kNodeReplJS = R"JS(
           }
         }
 
+        // Restore the captures hidden by REPL bookkeeping before user code runs,
+        // matching node's default evaluator protocol.
+        RegExpPrototypeExec(regExMatcher,
+                            savedRegExMatches.join(regExMatchSeparator));
+
         let finished = false;
         function finishExecution(e, r) {
           if (finished) return;
           finished = true;
-          for (let idx = 1; idx < savedRegExMatches.length; idx += 1) {
-            savedRegExMatches[idx] = RegExp[`$${idx}`];
-          }
+          saveRegExpMatches();
           cb(e, r);
         }
 
@@ -1365,15 +1578,13 @@ inline constexpr std::string_view kNodeReplJS = R"JS(
       }
 
       const originalEval = eval_;
+      // node repl.js: `replContext.run({ replServer: self }, …)` around the
+      // evaluator, so everything the command schedules inherits the store.
       self.eval = function REPLEval(code, context, file, cb) {
-        const prev = activeReplServer;
-        activeReplServer = self;
         lastEvaluatingServer = self;
-        try {
+        getReplContext().run({ replServer: self }, function REPLEvalInContext() {
           originalEval.call(self, code, context, file, cb);
-        } finally {
-          activeReplServer = prev;
-        }
+        });
       };
 
       self.clearBufferedCommand();
@@ -1754,12 +1965,19 @@ inline constexpr std::string_view kNodeReplJS = R"JS(
       }
 
       const replModule = new CJSModule("<repl>");
+      // node leaves `filename` null here ("In REPL, parent.filename is null",
+      // loader.js _resolveLookupPaths): that is what makes a relative require
+      // resolve against ['.'] — the cwd, never node_modules — and what makes
+      // the require stack read `<repl>` rather than a synthesised path
+      // (test-repl-require, nodejs/node#30808). Only `paths` is seeded, from
+      // the same "<cwd>/repl" anchor node's _resolveLookupPaths reaches.
+      let anchor;
       try {
-        replModule.filename = path.resolve("repl");
+        anchor = path.resolve("repl");
       } catch {
-        replModule.filename = path.resolve(path.dirname(process.execPath), "repl");
+        anchor = path.resolve(path.dirname(process.execPath), "repl");
       }
-      replModule.paths = CJSModule._nodeModulePaths(replModule.filename);
+      replModule.paths = CJSModule._nodeModulePaths(anchor);
 
       Object.defineProperty(context, "module", {
         configurable: true, writable: true, value: replModule,
@@ -1819,7 +2037,12 @@ inline constexpr std::string_view kNodeReplJS = R"JS(
     }
 
     complete() {
-      Reflect.apply(this.completer, this, arguments);
+      try {
+        Reflect.apply(this.completer, this, arguments);
+      } catch (e) {
+        markCompletionEscape(e);
+        throw e;
+      }
     }
 
     completeOnEditorMode(callback) {
@@ -1847,7 +2070,28 @@ inline constexpr std::string_view kNodeReplJS = R"JS(
   const kStandaloneREPL = Symbol("kStandaloneREPL");
 
   function makeRequireFunction(mod) {
-    const r = (id) => mod.require(id);
+    // node's Module._resolveFilename throws a plain Error carrying `code`,
+    // the "Require stack:" tail and `requireStack` (the parent chain, using
+    // `cursor.filename || cursor.id`). The REPL module has no filename, so the
+    // stack is exactly its id, `<repl>` (test-repl-require). mbun resolves
+    // natively and reports a ResolveMessage instead, so translate it here,
+    // where the requiring module is known.
+    const r = (id) => {
+      try {
+        return mod.require(id);
+      } catch (e) {
+        if (e === null || typeof e !== "object" || e.code !== "MODULE_NOT_FOUND" ||
+            Array.isArray(e.requireStack)) {
+          throw e;
+        }
+        const requireStack = [mod.filename || mod.id];
+        const err = new Error(
+          `Cannot find module '${id}'\nRequire stack:\n- ${requireStack.join("\n- ")}`);
+        err.code = "MODULE_NOT_FOUND";
+        err.requireStack = requireStack;
+        throw err;
+      }
+    };
     r.resolve = (request, options) =>
       CJSModule._resolveFilename(request, mod, false, options);
     r.resolve.paths = (request) => CJSModule._resolveLookupPaths(request, mod);

@@ -1,0 +1,10 @@
+compat/node/test/parallel/test-fs-promises-file-handle-read-worker.js
+compat/node/test/parallel/test-fs-promises.js
+compat/node/test/parallel/test-fs-readdir-ucs2.js
+compat/node/test/parallel/test-fs-access.js
+compat/node/test/parallel/test-fs-existssync-memleak-longpath.js
+compat/node/test/parallel/test-fs-syncwritestream.js
+compat/node/test/parallel/test-fs-filehandle.js
+compat/node/test/parallel/test-fs-promises-readfile.js
+compat/node/test/parallel/test-fs-readdir-stack-overflow.js
+compat/node/test/parallel/test-fs-glob.mjs

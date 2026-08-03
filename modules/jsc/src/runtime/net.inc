@@ -114,6 +114,25 @@ bool net_parse_addr(const std::string& host, std::uint16_t port, sockaddr_in& ou
     }
     return inet_pton(AF_INET, host.c_str(), &out.sin_addr) == 1;
 }
+
+// A NON-wildcard IPv6 literal for the connect(2) side. netn_listen_cb has bound
+// AF_INET6 for such a host since the Bun.serve "::1" fix, but netn_connect_cb
+// stayed AF_INET-only, so nothing could ever dial what it bound: `listen(port,
+// "::1")` was only reachable because the JS layer rewrote the BIND to
+// 127.0.0.1. That rewrite is what makes node's dual-stack pattern (v4 loopback
+// on :p, then v6 loopback on the same :p) collide with EADDRINUSE. The
+// wildcards ("::", "::0", "*") deliberately stay on the v4 INADDR_ANY path in
+// net_parse_addr: as a connect destination they mean the loopback the reactor
+// already used, and re-routing them would move traffic off a listener that is
+// still v4-backed.
+bool net_parse_addr6(const std::string& host, std::uint16_t port, sockaddr_in6& out) {
+    if (host.find(':') == std::string::npos) return false;
+    if (host == "::" || host == "::0" || host == "*") return false;
+    std::memset(&out, 0, sizeof out);
+    out.sin6_family = AF_INET6;
+    out.sin6_port = htons(port);
+    return inet_pton(AF_INET6, host.c_str(), &out.sin6_addr) == 1;
+}
 #endif
 
 // net.listen(host, port) → { fd, port } (port resolved when 0).
@@ -165,8 +184,21 @@ JSValueRef netn_listen_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size_
         return JSValueMakeUndefined(ctx);
     const auto port{static_cast<std::uint16_t>(
         argc > 1 ? JSValueToNumber(ctx, args[1], nullptr) : 0)};
-    const bool ipv6Only{argc > 3 && JSValueToBoolean(ctx, args[3]) && host.find(':') != std::string::npos};
-    if (ipv6Only) {
+    const bool v6OnlyRequested{argc > 3 && JSValueToBoolean(ctx, args[3])};
+    // A NON-wildcard IPv6 literal has to take the AF_INET6 path whether or not
+    // the caller asked for ipv6Only: that flag selects the IPV6_V6ONLY sockopt,
+    // it does not select the address family. Gating the whole branch on it sent
+    // `listen("::1", 0)` into net_parse_addr, whose inet_pton(AF_INET, "::1")
+    // cannot succeed, so it threw "invalid address" -- which the Bun.serve JS
+    // layer reports as "Failed to start server. Is port 0 in use?"
+    // (js/bun/http/serve-listen.test.ts, the tls + "::1" case; the plaintext one
+    // never reached here because it binds through the native epoll transport).
+    // The wildcard forms stay on the v4 path deliberately: `net_parse_addr` maps
+    // them to INADDR_ANY, and flipping the default listener's family is a
+    // separate, much wider behaviour change than fixing an explicit address.
+    const bool ipv6Literal{host.find(':') != std::string::npos && host != "::" &&
+                           host != "::0" && host != "*"};
+    if (ipv6Literal || (v6OnlyRequested && host.find(':') != std::string::npos)) {
         sockaddr_in6 addr{};
         addr.sin6_family = AF_INET6;
         addr.sin6_port = htons(port);
@@ -338,6 +370,59 @@ JSValueRef netn_connect_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size
         return JSValueMakeUndefined(ctx);
     const auto port{static_cast<std::uint16_t>(
         argc > 1 ? JSValueToNumber(ctx, args[1], nullptr) : 0)};
+    // AF_INET6 destination. Kept as a separate, self-contained branch so the
+    // v4 path below stays byte-for-byte what it was: this one connects
+    // NON-blocking with a bounded poll, because unlike the v4 loopback the
+    // corpus dials real global v6 literals (test-net-autoselectfamily reaches
+    // for 2606:4700::…) and a blocking connect(2) to an unroutable address
+    // would sit there past the harness timeout instead of failing the attempt.
+    sockaddr_in6 addr6{};
+    if (net_parse_addr6(host, port, addr6)) {
+        const int fd6{socket(AF_INET6, SOCK_STREAM, 0)};
+        if (fd6 < 0) {
+            const int saved{errno};
+            return fs_throw(ctx, exc, std::string{net_errno_name(saved)} + ": connect to " + host +
+                                          ":" + std::to_string(port) + " failed (" +
+                                          std::strerror(saved) + ")");
+        }
+        net_set_nonblock(fd6);
+        int rc6;
+        do { rc6 = connect(fd6, reinterpret_cast<sockaddr*>(&addr6), sizeof addr6); }
+        while (rc6 != 0 && errno == EINTR);
+        if (rc6 != 0 && errno == EINPROGRESS) {
+            // Default matches node's autoSelectFamilyAttemptTimeout (250ms);
+            // the JS layer passes its own value as argv[4] when it has one.
+            int waitMs{argc > 4 && JSValueIsNumber(ctx, args[4])
+                           ? static_cast<int>(JSValueToNumber(ctx, args[4], nullptr))
+                           : 250};
+            if (waitMs < 10) waitMs = 10;
+            if (waitMs > 10000) waitMs = 10000;
+            pollfd pfd{.fd = fd6, .events = POLLOUT, .revents = 0};
+            int pr;
+            do { pr = poll(&pfd, 1, waitMs); } while (pr < 0 && errno == EINTR);
+            if (pr <= 0) {
+                close(fd6);
+                return fs_throw(ctx, exc, std::string{"ETIMEDOUT: connect to "} + host + ":" +
+                                              std::to_string(port) + " failed (timed out)");
+            }
+            int soerr{0};
+            socklen_t soerrLen{sizeof soerr};
+            getsockopt(fd6, SOL_SOCKET, SO_ERROR, &soerr, &soerrLen);
+            rc6 = soerr == 0 ? 0 : -1;
+            errno = soerr;
+        }
+        if (rc6 != 0) {
+            const int saved{errno};
+            close(fd6);
+            return fs_throw(ctx, exc, std::string{net_errno_name(saved)} + ": connect to " + host +
+                                          ":" + std::to_string(port) + " failed (" +
+                                          std::strerror(saved) + ")");
+        }
+        const int one6{1};
+        setsockopt(fd6, IPPROTO_TCP, TCP_NODELAY, &one6, sizeof one6);
+        net_fds().insert(fd6);
+        return JSValueMakeNumber(ctx, fd6);
+    }
     sockaddr_in addr{};
     if (!net_parse_addr(host, port, addr)) {
         return fs_throw(ctx, exc, "net.connect: invalid address '" + host + "'");
@@ -370,13 +455,42 @@ JSValueRef netn_connect_cb(JSContextRef ctx, JSObjectRef, JSObjectRef, std::size
                                           std::to_string(lport) + " failed (" + std::strerror(saved) + ")");
         }
     }
+    // A caller-supplied attempt timeout (argv[4]) makes this connect bounded and
+    // non-blocking. Happy Eyeballs is the only caller that passes one, and it
+    // needs it: test-net-autoselectfamily dials routable PUBLIC literals
+    // (104.20.22.46) that must fail as an attempt in ~250ms, where a blocking
+    // connect(2) would sit on them until the kernel's SYN retry budget expired
+    // and take the whole file past its harness timeout. With no argv[4] this is
+    // the same blocking connect it has always been.
+    const bool boundedV4{argc > 4 && JSValueIsNumber(ctx, args[4])};
+    if (boundedV4) net_set_nonblock(fd);
     int rc;
     do { rc = connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof addr); }
     while (rc != 0 && errno == EINTR);
+    if (boundedV4 && rc != 0 && errno == EINPROGRESS) {
+        int waitMs{static_cast<int>(JSValueToNumber(ctx, args[4], nullptr))};
+        if (waitMs < 10) waitMs = 10;
+        if (waitMs > 10000) waitMs = 10000;
+        pollfd pfd{.fd = fd, .events = POLLOUT, .revents = 0};
+        int pr;
+        do { pr = poll(&pfd, 1, waitMs); } while (pr < 0 && errno == EINTR);
+        if (pr <= 0) {
+            close(fd);
+            return fs_throw(ctx, exc, std::string{"ETIMEDOUT: connect to "} + host + ":" +
+                                          std::to_string(port) + " failed (timed out)");
+        }
+        int soerr{0};
+        socklen_t soerrLen{sizeof soerr};
+        getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr, &soerrLen);
+        rc = soerr == 0 ? 0 : -1;
+        errno = soerr;
+    }
     if (rc != 0) {
+        const int saved{errno};
         close(fd);
-        return fs_throw(ctx, exc, std::string{"ECONNREFUSED: connect to "} + host + ":" +
-                                      std::to_string(port) + " failed (" + std::strerror(errno) + ")");
+        return fs_throw(ctx, exc, std::string{boundedV4 ? net_errno_name(saved) : "ECONNREFUSED"} +
+                                      ": connect to " + host + ":" + std::to_string(port) +
+                                      " failed (" + std::strerror(saved) + ")");
     }
     const int one{1};
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);

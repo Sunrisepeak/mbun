@@ -61,8 +61,16 @@ void add_env_file(std::string spec) { gEnvFiles.push_back(std::move(spec)); }
 // bunfig `preload`: modules to import before the entry point.
 void set_preloads(std::vector<std::string> paths) { gPreloads = std::move(paths); }
 
+// `--tsconfig-override <path>`: explicit runtime resolver config, already made
+// absolute by the CLI against the option-parse cwd.
+void set_tsconfig_override(std::string path) { gTsconfigOverride = std::move(path); }
+
 // `--user-agent <STR>`: default User-Agent for fetch (bun Arguments.rs:1062).
 void set_user_agent(std::string ua) { gUserAgent = std::move(ua); }
+
+// `--fetch-preconnect <URL>`: repeatable, order-preserving (bun run_command.rs
+// walks the list in argv order).
+void add_fetch_preconnect(std::string url) { gFetchPreconnect.push_back(std::move(url)); }
 
 // Evaluate JS source, returning its numeric value or an error string. Bindings
 // are installed. Used by the smoke test (eval "Bun.semver.order(...)" == -1) and
@@ -255,7 +263,10 @@ int check_syntax(const std::string& code, const std::string& filename, bool modu
     options.cjs = module;
     auto transformed{mbun::js_parser::transpile(code, options)};
     if (!transformed.ok) {
-        std::println(std::cerr, "{}: SyntaxError: {}", filename, transformed.error);
+        // Same frame node prints for a failed --check (see Runtime::check_syntax):
+        // the filename line, a blank line, then the error on its own line.
+        std::println(std::cerr, "{}:1\n", filename);
+        std::println(std::cerr, "SyntaxError: {}", transformed.error);
         return 1;
     }
     return Runtime::instance().check_syntax(transformed.code, filename);

@@ -1030,6 +1030,165 @@ inline constexpr std::string_view kNodeInternalBindingJS = R"JS(
     throwIfPromiseRejected() {},
   });
 
+  // ------------------------------------------------------------ modules ----
+  // node src/node_modules.cc. Ten methods and three constant tables; it gates
+  // 23 of node's remaining unreachable `lib/internal/**` modules, including
+  // internal/modules/{helpers,package_json_reader,run_main} and everything
+  // downstream of them (internal/modules/esm/*, internal/main/*, and the live
+  // test runner).
+  //
+  // The package.json half is a pure-JS re-expression of node's C++ walk: node
+  // caches parsed manifests in a BindingData map and returns a positional
+  // "serialized" array rather than an object, and internal/modules/
+  // package_json_reader.js `deserializePackageJSON` destructures it by INDEX —
+  // so the tuple order [name, main, type, imports, exports, path] is load
+  // bearing, not cosmetic. `imports`/`exports` stay stringified exactly as node
+  // leaves them (the reader JSON.parse's them lazily, keyed on a leading `[`
+  // or `{`), because a pre-parsed object there would be re-parsed as a string.
+  //
+  // The compile-cache half is a rename, not an implementation: the cache is
+  // already native and already shaped like this binding (runtime/
+  // compile_cache.inc documents matching upstream), so these entries forward to
+  // __mbunCompileCacheNative rather than growing a second cache.
+  factories["modules"] = () => {
+    const fs = mod("fs");
+    const path = mod("path");
+    const CC = G.__mbunCompileCacheNative || {};
+
+    // node caches by resolved package.json path for the process lifetime; the
+    // reader above it caches deserialized configs, but getPackageScopeConfig
+    // re-enters this walk per specifier, so without this a deep import tree
+    // re-reads the same manifests once per resolution step.
+    const manifests = new Map();
+
+    // node's PackageConfig::Serialize. `undefined` (not null) is the "no such
+    // package.json" signal deserializePackageJSON tests for; a manifest that
+    // exists but is unparseable is a hard error in node too.
+    const readManifest = (pjsonPath) => {
+      if (manifests.has(pjsonPath)) return manifests.get(pjsonPath);
+      let text;
+      try {
+        text = fs.readFileSync(pjsonPath, "utf8");
+      } catch {
+        manifests.set(pjsonPath, undefined);
+        return undefined;
+      }
+      let json;
+      try {
+        json = JSON.parse(text);
+      } catch (cause) {
+        const e = new SyntaxError(
+          "Invalid package config " + pjsonPath + " while importing: " + cause.message);
+        e.code = "ERR_INVALID_PACKAGE_CONFIG";
+        throw e;
+      }
+      // node only keeps these five fields, and only when they have the type it
+      // expects — a `"main": 5` is dropped, not coerced, so the resolver falls
+      // back to index.js exactly as it would with no `main` at all.
+      const str = (v) => (typeof v === "string" ? v : null);
+      const ser = [
+        str(json.name),
+        str(json.main),
+        json.type === "module" || json.type === "commonjs" ? json.type : "none",
+        json.imports == null ? null :
+          (typeof json.imports === "string" ? json.imports : JSON.stringify(json.imports)),
+        json.exports === undefined ? null :
+          (typeof json.exports === "string" ? json.exports : JSON.stringify(json.exports)),
+        pjsonPath,
+      ];
+      manifests.set(pjsonPath, ser);
+      return ser;
+    };
+
+    // Walk up from a *file* path. node stops at the filesystem root, and
+    // separately refuses to cross out of a node_modules directory in the
+    // URL-based scope walk (below) — the two walks differ, so they are two
+    // functions here rather than one with a flag.
+    const traverseParent = (fromPath) => {
+      let dir = path.resolve(fromPath);
+      for (;;) {
+        const parent = path.dirname(dir);
+        if (parent === dir) return undefined;
+        dir = parent;
+        if (path.basename(dir) === "node_modules") continue;
+        const ser = readManifest(path.join(dir, "package.json"));
+        if (ser !== undefined) return ser;
+      }
+    };
+
+    const fileURLToPathSafe = (u) => {
+      try { return G.__mbunFileURLToPath ? G.__mbunFileURLToPath(u) : req("url").fileURLToPath(u); }
+      catch { return null; }
+    };
+
+    // node's GetPackageScopeConfig: resolve ./package.json against the given
+    // URL and walk up, stopping when the candidate would be the package.json of
+    // a node_modules DIRECTORY itself (".../node_modules/package.json"), which
+    // is the boundary that keeps a scope from leaking into its installer's.
+    const scopeWalk = (resolvedURL) => {
+      let dir = fileURLToPathSafe(resolvedURL);
+      if (dir === null) {
+        const e = new TypeError("Invalid URL: " + resolvedURL);
+        e.code = "ERR_INVALID_URL";
+        throw e;
+      }
+      dir = path.dirname(path.resolve(dir));
+      for (;;) {
+        if (path.basename(dir) === "node_modules") return undefined;
+        const ser = readManifest(path.join(dir, "package.json"));
+        if (ser !== undefined) return ser;
+        const parent = path.dirname(dir);
+        if (parent === dir) return undefined;
+        dir = parent;
+      }
+    };
+
+    return {
+      // (jsonPath, isESM, base, specifier) -> SerializedPackageConfig
+      readPackageJSON: (jsonPath) => readManifest(path.resolve(String(jsonPath))),
+      getNearestParentPackageJSON: (checkPath) => traverseParent(String(checkPath)),
+      // Returns the bare `type` string, or undefined when no manifest is found;
+      // internal/modules/run_main.js treats undefined as "not a module".
+      getNearestParentPackageJSONType: (checkPath) => {
+        const ser = traverseParent(String(checkPath));
+        return ser === undefined ? undefined : ser[2];
+      },
+      // node returns the serialized array when a manifest was found and the
+      // *path it stopped at* (a string) when it was not — package_json_reader
+      // distinguishes the two with ArrayIsArray, so returning [] for "none"
+      // would be read as a real manifest.
+      getPackageScopeConfig: (resolved) => {
+        const ser = scopeWalk(String(resolved));
+        if (ser !== undefined) return ser;
+        const p = fileURLToPathSafe(String(resolved));
+        return p === null ? String(resolved) : path.join(path.dirname(path.resolve(p)), "package.json");
+      },
+      getPackageType: (url) => {
+        const ser = scopeWalk(String(url));
+        return ser === undefined ? undefined : ser[2];
+      },
+
+      enableCompileCache: (dir, portable) =>
+        (CC.enable ? CC.enable(dir === undefined ? "" : dir, !!portable) : [0, "unsupported", ""]),
+      getCompileCacheDir: () => (CC.getDir ? CC.getDir() : undefined),
+      flushCompileCache: () => { if (CC.flush) CC.flush(); },
+      // The per-entry half of the cache is owned by mbun's loader, which caches
+      // by source hash without handing an entry object out to JS. Reporting a
+      // miss is honest and is a state node's own callers already handle; a
+      // throw here would break internal/modules/typescript.js on a path where
+      // caching is only ever an optimisation.
+      getCompileCacheEntry: () => undefined,
+      saveCompileCacheEntry: () => {},
+
+      // Index-keyed by node (helpers.js turns the array into name->index), so
+      // the ORDER is the contract. Matches CompileCacheEnableStatus in
+      // runtime/compile_cache.inc, which is what enableCompileCache returns.
+      compileCacheStatus: ["FAILED", "ENABLED", "ALREADY_ENABLED", "DISABLED"],
+      cachedCodeTypes: { __proto__: null, kCommonJS: 0, kESM: 1, kStrippedTypeScript: 2 },
+      moduleFormats: { __proto__: null, kCommonJS: 0, kModule: 1 },
+    };
+  };
+
   // ----------------------------------------------------- process_methods ----
   // node src/node_process_methods.cc. internal/process/per_thread.js reads the
   // clock through the shared `hrtimeBuffer` (upper/lower 32 bits of seconds +
@@ -1133,7 +1292,7 @@ inline constexpr std::string_view kNodeInternalBindingJS = R"JS(
     const async_id_fields = new Float64Array(4);
     async_id_fields[constants.kAsyncIdCounter] = 1;
     async_id_fields[constants.kDefaultTriggerAsyncId] = -1;
-    return {
+    const binding = {
       constants,
       async_hook_fields: new Uint32Array(9),
       async_id_fields,
@@ -1151,6 +1310,19 @@ inline constexpr std::string_view kNodeInternalBindingJS = R"JS(
       registerDestroyHook() {},
       getPromiseHooks: () => [],
     };
+    // The typed arrays above are the LAST RESORT shape, kept so the binding
+    // still answers on a realm where the async_hooks payload never installed.
+    // When it did, node's src/async_wrap.cc equivalent is that payload, so the
+    // binding must expose its live state rather than a second, disconnected
+    // copy: an id queued through async_wrap.queueDestroyAsyncId has to reach the
+    // destroy hooks async_hooks.createHook() registered (test-async-wrap-
+    // destroyid), and a counter that disagrees with the payload's would hand out
+    // ids the rest of the runtime has already used.
+    const shared = G.__mbunAsyncWrapBinding;
+    if (shared) {
+      for (const key of Object.keys(shared)) binding[key] = shared[key];
+    }
+    return binding;
   };
 
   // -------------------------------------------------------------- timers ----
@@ -1752,7 +1924,48 @@ inline constexpr std::string_view kNodeInternalBindingJS = R"JS(
       EVP_PKEY_ML_DSA_87: undefined, EVP_PKEY_ML_KEM_512: undefined,
       EVP_PKEY_ML_KEM_768: undefined, EVP_PKEY_ML_KEM_1024: undefined,
       kKeyVariantAES_OCB_128: undefined,
-      Argon2Job: undefined,
+      // node src/crypto/crypto_util.h CryptoJobMode + src/crypto/crypto_argon2.h.
+      kCryptoJobAsync: 0, kCryptoJobSync: 1, kCryptoJobWebCrypto: 2,
+      kTypeArgon2d: 0, kTypeArgon2i: 1, kTypeArgon2id: 2,
+      // node src/crypto/crypto_argon2.cc Argon2Job. The C++ original is a
+      // ThreadPoolWork subclass whose `run()` either derives inline (sync) or
+      // schedules onto the threadpool and reports through `ondone`; the observable
+      // contract the corpus drives is exactly that pair, plus the tuple shape
+      // `[err, result]` for the sync arm. mbun's KDF bridge is a synchronous
+      // OpenSSL call, so the async arm defers the REPORT rather than the work —
+      // the difference is invisible to a caller and keeps one code path.
+      //
+      // Errors are values here, not throws: node's JS callers destructure
+      // `{ 0: err, 1: result }` and test `err !== undefined`, so a throwing
+      // run() would escape past them.
+      Argon2Job: class Argon2Job {
+        constructor(mode, message, nonce, parallelism, tagLength, memory, passes,
+                    secret, associatedData, type) {
+          this.mode = mode;
+          this.ondone = undefined;
+          this.args = [type, message, nonce, parallelism, tagLength, memory, passes,
+                       secret, associatedData];
+        }
+        run() {
+          const AN = globalThis.__mbunCryptoAsymNative;
+          let err;
+          let result;
+          try {
+            if (!AN || typeof AN.argon2 !== "function") {
+              throw new Error("Argon2 derivation failed");
+            }
+            result = AN.argon2(...this.args);
+          } catch (e) {
+            err = e;
+            result = undefined;
+          }
+          // kCryptoJobSync
+          if (this.mode === 1) { return [err, result]; }
+          const ondone = this.ondone;
+          queueMicrotask(() => { if (typeof ondone === "function") ondone.call(this, err, result); });
+          return undefined;
+        }
+      },
       KmacJob: undefined,
       // node's C++ SecureContext. mbun's TLS owns its own context, so this is
       // the shape node's internal/tls/common.js drives — enough for that module

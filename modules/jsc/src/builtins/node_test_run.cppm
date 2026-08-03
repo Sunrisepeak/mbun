@@ -275,6 +275,52 @@ inline constexpr std::string_view kNodeTestRunJS = R"JS(
       });
     }
 
+    // PORT-SOURCE: node lib/internal/test_runner/test.js:1448 — with
+    // `--test-force-exit` the root test exits the process as soon as every
+    // known test and hook has finished, "regardless of any remaining ref'ed
+    // handles", and runner.js getRunArgs() passes the flag down to each child
+    // so an isolated file behaves the same way.
+    //
+    // Without it a test that schedules work and then throws keeps its process
+    // alive until that work runs: throws_sync_and_async.js's stray
+    // setTimeout(1000) threw a second, uncatchable error long after the results
+    // were in, and the parent forwarded it into the report
+    // (test-runner-force-exit-failure asserts that error CANNOT appear).
+    //
+    // node has an explicit end-of-run signal (root.postRun); mbun's standalone
+    // runner has the sequential chain instead, so quiescence is "the chain
+    // settled, and settling it neither appended more work nor registered
+    // another top-level test". A stray timer is not on the chain, which is
+    // exactly why this terminates before it fires.
+    const forceExitRequested = () => {
+      try {
+        const argv = G.process.execArgv;
+        return Array.isArray(argv) && argv.indexOf("--test-force-exit") !== -1;
+      } catch (e) { return false; }
+    };
+    // Only ever in a child: the `--test` parent reaches force exit through its
+    // own path (once every reporter has drained, below), and arming this there
+    // too would exit the runner before it had spawned anything.
+    if (isChild && forceExitRequested()) {
+      const settle = () => {
+        const chain = internals.drain();
+        const topLevel = internals.topLevelCount();
+        chain.then(() => {
+          // One macrotask of slack, so work the just-finished step queued (the
+          // root after() hooks) is on the chain before it is inspected.
+          G.setTimeout(() => {
+            if (internals.drain() === chain && internals.topLevelCount() === topLevel) {
+              try { G.process.exit(G.process.exitCode === undefined ? 0 : G.process.exitCode); } catch (e) {}
+              return;
+            }
+            settle();
+          }, 0);
+        }, () => {});
+      };
+      // Never before the entry file has had a turn to register its tests.
+      try { G.setTimeout(settle, 0); } catch (e) {}
+    }
+
     // An Error does not survive structured cloning with its own fields, and the
     // corpus reads `details.error.message` / `.code` / `.failureType` on the
     // parent side — so flatten it into a plain object the parent re-inflates.
@@ -469,9 +515,16 @@ inline constexpr std::string_view kNodeTestRunJS = R"JS(
       // `given` is what the caller wrote (node names the file test with it);
       // `files` is what gets executed.
       const files = given.map((f) => (path.isAbsolute(f) ? f : path.resolve(cwd, f)));
-      // node lib/internal/test_runner/tag_filter.js: an include filter keeps a
-      // test whose flattened tag set matches any filter (`db:*` is a prefix
-      // wildcard); everything untagged is dropped.
+      // PORT-SOURCE: node lib/internal/test_runner/tag_filter.js
+      // evaluateTagFilters(). Filters are LITERAL lowercased tag names and
+      // compose by AND -- `--experimental-test-tag-filter=db
+      // --experimental-test-tag-filter=integration` keeps only a test carrying
+      // both. mbun ORed them and additionally honoured a `db:*` prefix
+      // wildcard; neither exists upstream, so `db:postgres` was treated as a
+      // `db` match and repeated flags widened the selection instead of
+      // narrowing it (test-runner-tag-filter-cli's "repeated ... ANDs
+      // together"). An untagged test has an empty tag set and so fails any
+      // non-empty filter, which is what drops it.
       const tagFilters = options.testTagFilters === undefined ? null
         : (Array.isArray(options.testTagFilters) ? options.testTagFilters : [options.testTagFilters])
             .map((t) => String(t).toLowerCase());
@@ -479,12 +532,9 @@ inline constexpr std::string_view kNodeTestRunJS = R"JS(
         if (tagFilters === null) return true;
         if (!Array.isArray(tags)) return false;
         for (const filter of tagFilters) {
-          for (const tag of tags) {
-            if (tag === filter) return true;
-            if (filter.endsWith(":*") && tag.startsWith(filter.slice(0, -1))) return true;
-          }
+          if (!tags.includes(filter)) return false;
         }
-        return false;
+        return true;
       };
       const namePatterns = options.testNamePatterns === undefined ? null
         : (Array.isArray(options.testNamePatterns) ? options.testNamePatterns : [options.testNamePatterns]).map(toRegExp);
@@ -512,12 +562,25 @@ inline constexpr std::string_view kNodeTestRunJS = R"JS(
             namePatterns !== null && !namePatterns.some((re) => re.test(data.name))) {
           return;
         }
-        if ((type === "test:pass" || type === "test:fail") && skipPatterns !== null &&
-            skipPatterns.some((re) => re.test(data.name))) {
+        // Same invisibility rule as the tag filter below: a skip-patterned test
+        // that still emitted test:start left its `# Subtest: <name>` line in
+        // the TAP output, so `--test-skip-pattern=/flaky/` produced a correct
+        // `# pass 2` over output that still contained "db flaky".
+        if ((type === "test:pass" || type === "test:fail" || type === "test:start" ||
+             type === "test:enqueue" || type === "test:dequeue") &&
+            skipPatterns !== null && skipPatterns.some((re) => re.test(data.name))) {
           return;
         }
+        // A tag-filtered test must be INVISIBLE, not merely unreported: node
+        // never starts it, so it produces no lifecycle event at all. Dropping
+        // only the terminal events still let the TAP reporter print the
+        // `# Subtest: <name>` line it writes on test:start, so a run filtered
+        // to `db` still named `unit only` and `untagged` in its output and the
+        // corpus' `assert.doesNotMatch` checks failed on a run whose PASS COUNT
+        // was already correct.
         if (tagFilters !== null &&
-            (type === "test:pass" || type === "test:fail" || type === "test:complete") &&
+            (type === "test:pass" || type === "test:fail" || type === "test:complete" ||
+             type === "test:start" || type === "test:enqueue" || type === "test:dequeue") &&
             !matchesTags(data.tags)) {
           return;
         }
@@ -724,6 +787,11 @@ inline constexpr std::string_view kNodeTestRunJS = R"JS(
       if (options.only) env.NODE_TEST_ONLY = "1";
       const args = [];
       if (Array.isArray(options.execArgv)) args.push(...options.execArgv);
+      // node runner.js getRunArgs(): forceExit travels to the child, which is
+      // the process that actually has to stop early.
+      if (options.forceExit === true && args.indexOf("--test-force-exit") === -1) {
+        args.push("--test-force-exit");
+      }
       args.push(file);
       if (Array.isArray(options.argv)) args.push(...options.argv);
 
@@ -809,7 +877,21 @@ inline constexpr std::string_view kNodeTestRunJS = R"JS(
         const patterns = [];
         const skipPatterns = [];
         const tagFilters = [];
-        const take = (i, inline) => (inline !== undefined ? inline : flags[i + 1]);
+        // node's C++ option parser (src/node_options.cc) rejects an option
+        // declared as taking a string when the `=` form supplies nothing:
+        // `--experimental-test-tag-filter=` exits non-zero with
+        // "<flag> requires an argument" on stderr rather than running with an
+        // empty filter. mbun pushed the empty string into the filter list, so
+        // the run succeeded and filtered nothing.
+        const take = (i, inline) => {
+            if (inline === "") {
+                const exe = (G.process.argv && G.process.argv[0]) || "mbun";
+                G.process.stderr.write(exe + ": " + flags[i].slice(0, flags[i].indexOf("=")) +
+                                       " requires an argument\n");
+                G.process.exit(9);
+            }
+            return inline !== undefined ? inline : flags[i + 1];
+        };
         for (let i = 0; i < flags.length; i++) {
             const raw = flags[i];
             const eq = raw.indexOf("=");

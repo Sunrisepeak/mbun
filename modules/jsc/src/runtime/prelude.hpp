@@ -152,6 +152,8 @@
 // solely by runtime.cppm, so these definitions exist exactly once.
 #include "napi_core.inc"
 #include "napi_objects.inc"
+#include "napi_binary.inc"
+#include "napi_async.inc"
 
 // ICU per-item zstd decompression hook. Strong extern "C" definition of
 // bun_icu_maybe_decompress binds the weak-undef reference the repacked ICU's
@@ -197,6 +199,7 @@
 #include <openssl/encoder.h>
 #include <openssl/err.h>
 #include <openssl/evp.h>
+#include <openssl/kdf.h>  // node:crypto argon2 (OpenSSL >= 3.2 ARGON2D/I/ID KDF, crypto_asym.inc)
 #include <openssl/objects.h>
 #include <openssl/param_build.h>
 #include <openssl/params.h>

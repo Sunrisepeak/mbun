@@ -68,6 +68,45 @@ warn_if_binary_is_stale() {
   } >&2
 }
 
+# Repair a staged libstdc++.a that did not come from the pinned compiler.
+#
+# mbun.jsc-prebuilt's install() copies the build-dep gcc's lib64/libstdc++.a into
+# `<worktree>/.mcpp/.../bun-webkit/lib/`, and that directory is FIRST on the link
+# line's -L path, so `-l:libstdc++.a` resolves to it rather than to the toolchain's.
+# Which gcc was resolved at staging time is not pinned per worktree, and three gcc
+# versions are installed on this box -- so a worktree can compile with 16.1.0 and
+# link against 13.3.0's archive. The link dies with
+#   undefined reference to std::__cow_string::__cow_string(char const*)
+# on PRISTINE source, from a worktree whose objects, build.ninja and ldflags are
+# byte-identical to one that links fine. It reads like a source bug and is not one.
+# W43's baseline build lost time to it and recorded it as a one-off; it was not --
+# it hit 2 of the 5 worktrees of the very next wave, costing one lane 45 minutes.
+#
+# This lives here rather than only in worktree_setup.sh because `.mcpp` is staged
+# by the FIRST build, which is after setup has already run: the first link in a
+# fresh worktree is exactly the one that fails, so the retry below is what saves it.
+#
+# Returns 0 when nothing needed doing, 1 when it repaired something.
+repair_staged_libstdcxx() {
+  local wt staged gcc_root pinned
+  wt=$(git rev-parse --show-toplevel 2>/dev/null) || return 0
+  staged=$(find "$wt/.mcpp" -path '*bun-webkit/lib/libstdc++.a' 2>/dev/null | head -1 || true)
+  [ -n "$staged" ] || return 0
+  # The pinned compiler is whatever the generated build graph actually invokes.
+  gcc_root=$(grep -ohm1 '/[^ ]*xim-x-gcc/[0-9.]*/bin/g++' "$wt"/target/*/*/build.ninja 2>/dev/null | head -1 || true)
+  gcc_root=${gcc_root%/bin/g++}
+  if [ -z "$gcc_root" ]; then
+    gcc_root=$(ls -d "$HOME"/.mcpp/registry/data/xpkgs/xim-x-gcc/*/ 2>/dev/null | sort -V | tail -1 || true)
+    gcc_root=${gcc_root%/}
+  fi
+  pinned="$gcc_root/lib64/libstdc++.a"
+  [ -n "$gcc_root" ] && [ -f "$pinned" ] || return 0
+  cmp -s "$pinned" "$staged" && return 0
+  cp "$pinned" "$staged" || return 0
+  echo "$0: repaired $staged from the pinned compiler's $pinned" >&2
+  return 1
+}
+
 start=$(date +%s)
 while :; do
   for slot in $(seq 1 "$slots"); do
@@ -79,8 +118,23 @@ while :; do
       echo "pid=$$ wt=$(git rev-parse --show-toplevel 2>/dev/null) at=$(date -Is)" >&"$fd"
       waited=$(( $(date +%s) - start ))
       [ "$waited" -gt 5 ] && echo "$0: acquired build slot $slot after ${waited}s" >&2
-      "$@"
+      repair_staged_libstdcxx || true
+      err_log=$(mktemp)
+      "$@" 2>"$err_log"
       rc=$?
+      cat "$err_log" >&2
+      # The mismatch can only be staged by the build itself, so the first link in
+      # a fresh worktree fails before any pre-check could have seen it. Repair on
+      # that exact signature and retry once; anything else is the caller's bug.
+      if [ "$rc" != 0 ] && grep -q '__cow_string' "$err_log"; then
+        if ! repair_staged_libstdcxx; then
+          echo "$0: retrying the build once against the repaired archive" >&2
+          "$@" 2>"$err_log"
+          rc=$?
+          cat "$err_log" >&2
+        fi
+      fi
+      rm -f "$err_log"
       flock -u "$fd"
       exec {fd}>&-
       [ "$rc" = 0 ] && warn_if_binary_is_stale
