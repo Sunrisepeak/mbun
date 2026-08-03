@@ -1,4 +1,4 @@
-# mbun | [Rewrite Bun in MC++](https://github.com/Sunrisepeak/mbun/pull/1) - Linux coverage: Node 3,136/4,433 (70.7%), Bun 1,042/1,902 (54.8%)
+# mbun | [Rewrite Bun in MC++](https://github.com/Sunrisepeak/mbun/pull/1)
 
 [中文文档](README.zh-CN.md)
 
@@ -116,13 +116,45 @@ still being defined.
 
 ## Compatibility data
 
+Measured 2026-08-03 by the runners in `tools/integration/`, both corpora executed
+in full on **one frozen binary** (`f65f960b7ac7d212…`). Nothing unsupported is
+counted as a pass.
+
 | Target | Result | Rate |
 | --- | ---: | ---: |
-| Node.js native tests (`compat/node/test/parallel`) | 3,136 / 4,433 files pass | 70.7% |
-| Node.js native tests, excluding files that skip themselves | 3,136 / 3,898 files pass | 80.5% |
-| Bun native full corpus (`compat/bun/test`) | 1,042 / 1,902 files fully green | 54.8% |
-| Both corpora combined | 4,178 / 6,335 files | 66.0% |
-| Elysia test suite | 1,522 pass / 3 fail | 99.8% |
+| Node.js native tests (`compat/node/test/parallel`) | 3,267 / 4,433 files pass | 73.7% |
+| Node.js native tests, excluding files that skip themselves | 3,267 / 3,919 files pass | 83.4% |
+| Bun native full corpus (`compat/bun/test`) | 1,076 / 1,902 files fully green | 56.6% |
+| Bun corpus, excluding files with no runnable tests here | 1,076 / 1,806 files fully green | 59.6% |
+| Both corpora combined | 4,343 / 6,335 files | 68.6% |
+| Both corpora combined, runnable only | 4,343 / 5,725 files | 75.9% |
+| Elysia test suite (measured 2026-07-30, not re-run since) | 1,522 pass / 3 fail | 99.8% |
+
+The "excluding" rows are not a softer denominator: a file counts as excluded only
+when it reports no runnable tests on this platform — it skipped itself, it has no
+tests upstream, or it needs a service this machine does not provide. Those
+denominators **grew** this round (Node 3,898 → 3,919) because 21 files that used
+to skip themselves now run.
+
+**What stands between here and 100%, counted rather than estimated.** 514 Node
+files decline to run, and the reasons are not interchangeable:
+
+| Self-skip reason | Files | Nature |
+| --- | ---: | --- |
+| QUIC not enabled | 238 | no `node:quic` subsystem; node's own build disables it by default too |
+| V8 inspector disabled | 180 | needs a CDP backend; JSC speaks the WebInspector protocol instead |
+| missing ESLint | 29 | node's own lint tests; ESLint is not vendored here |
+| no OpenSSL CLI | 10 | crypto build configuration |
+| requires Amaro | 6 | TypeScript loader |
+| Windows-specific | 6 | unreachable on Linux by construction |
+| other (Temporal, debug-only builds, cipher availability) | 45 | assorted |
+
+The two large blocks are priced. QUIC needs no protocol work — node builds it on
+vendored ngtcp2, and the linked OpenSSL 3.5.1 already exports everything that
+backend calls — but it does need node's ~19k-line binding re-expressed against
+JSC. The inspector block has **no per-file gate**: all of it hangs on one global
+capability flag, so no partial slice can score, and flipping it early converts
+skips into failures.
 
 ## Related projects
 
